@@ -15,6 +15,7 @@
 #include "llvm/CodeGen/CodeGenTargetMachineImpl.h"
 #include "llvm/CodeGen/OhmDebugObjectSources.h"
 #include "llvm/CodeGen/OhmLineCertificate.h"
+#include "llvm/DebugInfo/DWARF/OhmRuntimeLocations.h"
 #include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
@@ -573,7 +574,7 @@ bool llvm::ohm::runDebugObjectCache(Module &M, CodeGenTargetMachineImpl &TM,
   Target = I.Namespace + "|" + Target;
   auto Prior = Origin::read(Path, M.getModuleIdentifier(), Target);
   auto Ref = reinterpret_cast<LLVMModuleRef>(&M);
-  Buffer Sources, Map, Proof, Rebased, Certificate;
+  Buffer Sources, Map, Proof, Certificate;
   Signature Next;
   const char *Why = nullptr;
   int Status = ohm_debug_sources_v1(
@@ -582,21 +583,40 @@ bool llvm::ohm::runDebugObjectCache(Module &M, CodeGenTargetMachineImpl &TM,
       Prior ? Prior->Object.data() : nullptr, Prior ? Prior->Object.size() : 0,
       &Sources.Value, &Map.Value, &Proof.Value, &Why);
   if (Prior && Status == 0 && !Map.bytes().empty() && !Proof.bytes().empty() &&
-      ohm_bc_match_v1(Ref, Prior->SignatureBytes.data(),
-                      Prior->SignatureBytes.size(), Map.bytes().data(),
-                      Map.bytes().size(), Proof.bytes().data(),
-                      Proof.bytes().size()) == 1 &&
-      ohm_line_certificate_check_v1(
-          Prior->Certificate.data(), Prior->Certificate.size(),
-          Map.bytes().data(), Map.bytes().size()) == 0 &&
-      ohm_debug_rebase_v1(Map.bytes().data(), Map.bytes().size(),
-                          Prior->Object.data(), Prior->Object.size(),
-                          &Rebased.Value, &Why) == 0 &&
-      Rebased.bytes().starts_with("\x7f"
-                                  "ELF") && I.imagesUnchanged()) {
-    Out << Rebased.bytes();
-    event(M.getModuleIdentifier(), "hit");
-    return false;
+      ohm_line_certificate_check_v1(Prior->Certificate.data(),
+                                    Prior->Certificate.size(),
+                                    Map.bytes().data(), Map.bytes().size()) == 0) {
+    Buffer Rebased;
+    struct ObjectProjection {
+      StringRef Map;
+      StringRef Object;
+      Buffer &Output;
+      const char *&Reason;
+    } Projection{Map.bytes(), Prior->Object, Rebased, Why};
+    auto CheckLocations = [](void *Context, const char *Records, size_t Size) {
+      auto &P = *static_cast<ObjectProjection *>(Context);
+      return int(ohm_debug_rebase_locations_v1(
+                     P.Map.data(), P.Map.size(), Records, Size, P.Object.data(),
+                     P.Object.size(), &P.Output.Value, &P.Reason) == 0);
+    };
+    // The original ELF's line field selects the comparison. As soon as the
+    // old object proves a different runtime word, a plain signature cannot
+    // match. Both paths serialize the live module exactly once.
+    int Match = ohm_bc_match_relocatable_v1(
+        Ref, Prior->SignatureBytes.data(), Prior->SignatureBytes.size(),
+        Map.bytes().data(), Map.bytes().size(), Proof.bytes().data(),
+        Proof.bytes().size(), CheckLocations, &Projection);
+    if ((Match == 2 ||
+         (Match == 1 && ohm_debug_rebase_v1(
+                            Map.bytes().data(), Map.bytes().size(),
+                            Prior->Object.data(), Prior->Object.size(),
+                            &Rebased.Value, &Why) == 0)) &&
+        Rebased.bytes().starts_with("\x7f"
+                                    "ELF") && I.imagesUnchanged()) {
+      Out << Rebased.bytes();
+      event(M.getModuleIdentifier(), "hit");
+      return false;
+    }
   }
   // An unsupported source or IR form always runs the ordinary pipeline.
   if (Sources.bytes().empty() || !ohm_bc_save_v1(Ref, &Next.Data, &Next.Size)) {

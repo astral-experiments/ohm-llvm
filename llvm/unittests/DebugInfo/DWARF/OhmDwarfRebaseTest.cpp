@@ -11,6 +11,7 @@
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/Object/ObjectFile.h"
 #include "llvm/ObjectYAML/yaml2obj.h"
+#include "llvm/Support/LEB128.h"
 #include "gtest/gtest.h"
 
 using namespace llvm;
@@ -34,7 +35,14 @@ std::string unit(StringRef Body) {
   return S;
 }
 
-enum Case { Ordinary, InheritedLine, TruncatedCU };
+enum Case {
+  Ordinary,
+  InheritedLine,
+  TruncatedCU,
+  ResizedLine,
+  NoRoom,
+  InteriorRef
+};
 std::unique_ptr<object::ObjectFile> fixture(SmallString<0> &Storage,
                                             unsigned Decl, unsigned Call,
                                             unsigned Row,
@@ -94,7 +102,21 @@ std::unique_ptr<object::ObjectFile> fixture(SmallString<0> &Storage,
   bytes(Line, {4, 0});
   word(Line, Header.size());
   Line += Header;
-  bytes(Line, {3, static_cast<uint8_t>(Row - 1), 1, 2, 1, 0, 1, 1});
+  const bool Resize =
+      Kind == ResizedLine || Kind == NoRoom || Kind == InteriorRef;
+  unsigned AddressOffset = 0;
+  if (Resize) {
+    bytes(Line, {3});
+    uint8_t Encoded[16];
+    unsigned N = encodeSLEB128(int64_t(Row) - 1, Encoded);
+    Line.append(reinterpret_cast<char *>(Encoded), N);
+    bytes(Line, {1, 0, 9, 2});
+    AddressOffset = 4 + Line.size();
+    Line.append(8, '\0');
+    bytes(Line, {2, 1, 0, 1, 1});
+  } else {
+    bytes(Line, {3, static_cast<uint8_t>(Row - 1), 1, 2, 1, 0, 1, 1});
+  }
   std::string Yaml = R"(!ELF
 FileHeader:
   Class: ELFCLASS64
@@ -114,6 +136,26 @@ Sections:
   Section(".debug_abbrev", Abbrev);
   Section(".debug_info", Info);
   Section(".debug_line", unit(Line));
+  if (Resize) {
+    Yaml +=
+        "  - Name: .rodata.after_line\n    Type: SHT_PROGBITS\n    "
+        "AddressAlign: " +
+        std::to_string(Kind == NoRoom ? 1 : 32) +
+        "\n    Content: '0000000000000000'\n"
+        "  - Name: .rela.debug_line\n    Type: SHT_RELA\n    Link: .symtab\n"
+        "    Info: .debug_line\n    Relocations:\n      - Offset: " +
+        std::to_string(AddressOffset) +
+        "\n        Type: R_X86_64_64\n        Symbol: text_section\n";
+    if (Kind == InteriorRef)
+      Yaml += "  - Name: .rela.rodata.after_line\n    Type: SHT_RELA\n    "
+              "Link: .symtab\n    Info: .rodata.after_line\n"
+              "    Relocations:\n      - Offset: 0\n        Type: "
+              "R_X86_64_64\n        Symbol: line_section\n        Addend: 7\n";
+    Yaml += "Symbols:\n  - Name: text_section\n    StName: 0\n    Type: "
+            "STT_SECTION\n    Section: .text\n"
+            "  - Name: line_section\n    StName: 0\n    Type: STT_SECTION\n    "
+            "Section: .debug_line\n";
+  }
   return yaml::yaml2ObjectFile(
       Storage, Yaml, [](const Twine &Error) { errs() << Error << "\n"; });
 }
@@ -152,6 +194,27 @@ TEST(OhmDwarfRebase, TruncatedDIECannotRewriteFollowingUnitLength) {
   ASSERT_FALSE(static_cast<bool>(R));
   EXPECT_NE(toString(R.takeError()).find("compilation-unit boundary"),
             std::string::npos);
+}
+TEST(OhmDwarfRebase, ResizesAnExplicitLineOperandAndRelocatesAddresses) {
+  SmallString<0> Old, Future;
+  ASSERT_TRUE(fixture(Old, 20, 20, 60, ResizedLine));
+  ASSERT_TRUE(fixture(Future, 20, 20, 90, ResizedLine));
+  auto R = ohm::rebaseDwarf4({Old, "cached"},
+                             {{"/fixture/src/same.rs", {{60, 90}}}});
+  ASSERT_TRUE(bool(R)) << toString(R.takeError());
+  EXPECT_EQ(Future.str(), StringRef(R->Bytes.data(), R->Bytes.size()));
+}
+
+TEST(OhmDwarfRebase, ResizingRequiresStableLayoutAndNoInteriorReferences) {
+  for (Case Kind : {NoRoom, InteriorRef}) {
+    SmallString<0> Old;
+    ASSERT_TRUE(fixture(Old, 20, 20, 60, Kind));
+    auto R = ohm::rebaseDwarf4({Old, "cached"},
+                               {{"/fixture/src/same.rs", {{60, 90}}}});
+    EXPECT_FALSE(bool(R));
+    if (!R)
+      consumeError(R.takeError());
+  }
 }
 TEST(OhmDwarfRebase, RejectsDuplicatePathAndJsonKeys) {
   for (

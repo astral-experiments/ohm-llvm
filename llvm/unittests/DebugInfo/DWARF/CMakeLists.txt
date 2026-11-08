@@ -31,6 +31,7 @@ add_llvm_unittest(DebugInfoDWARFTests
   DWARFLocationExpressionTest.cpp
   DWARFVerifierTest.cpp
   OhmDwarfRebaseTest.cpp
+  OhmRuntimeLocationsTest.cpp
   )
 
 target_link_libraries(DebugInfoDWARFTests PRIVATE LLVMTestingSupport)
