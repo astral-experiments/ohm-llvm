@@ -8,12 +8,16 @@
 
 #include "LiveDebugValues.h"
 
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/CodeGen/LiveDebugValuesPass.h"
+#include "llvm/CodeGen/MachineBasicBlock.h"
 #include "llvm/CodeGen/MachineDominators.h"
 #include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
+#include "llvm/CodeGen/MachineInstr.h"
 #include "llvm/CodeGen/Passes.h"
 #include "llvm/CodeGen/TargetPassConfig.h"
+#include "llvm/IR/Function.h"
 #include "llvm/InitializePasses.h"
 #include "llvm/Pass.h"
 #include "llvm/PassRegistry.h"
@@ -109,10 +113,29 @@ LiveDebugValues::LiveDebugValues() {
   VarLocImpl = std::unique_ptr<LDVImpl>(llvm::makeVarLocBasedLiveDebugValues());
 }
 
+static bool runLiveDebugValues(MachineFunction &MF,
+                               bool ShouldEmitDebugEntryValues) {
+  // Both implementations ignore functions without a subprogram.
+  if (!MF.getFunction().getSubprogram())
+    return false;
+
+  // Debug locations on ordinary instructions do not define variable locations.
+  // Inspect bundle contents too. InstrRef LDV still sorts its substitution
+  // table when no debug instruction refers to a remaining entry.
+  auto HasDebugInstr = [](const MachineBasicBlock &MBB) {
+    return llvm::any_of(MBB.instrs(), [](const MachineInstr &MI) {
+      return MI.isDebugInstr();
+    });
+  };
+  if (MF.DebugValueSubstitutions.empty() && llvm::none_of(MF, HasDebugInstr))
+    return false;
+  return LiveDebugValues().run(MF, ShouldEmitDebugEntryValues);
+}
+
 PreservedAnalyses
 LiveDebugValuesPass::run(MachineFunction &MF,
                          MachineFunctionAnalysisManager &MFAM) {
-  if (!LiveDebugValues().run(MF, ShouldEmitDebugEntryValues))
+  if (!runLiveDebugValues(MF, ShouldEmitDebugEntryValues))
     return PreservedAnalyses::all();
   auto PA = getMachineFunctionPassPreservedAnalyses();
   PA.preserveSet<CFGAnalyses>();
@@ -128,7 +151,7 @@ void LiveDebugValuesPass::printPipeline(
 
 bool LiveDebugValuesLegacy::runOnMachineFunction(MachineFunction &MF) {
   auto *TPC = &getAnalysis<TargetPassConfig>();
-  return LiveDebugValues().run(
+  return runLiveDebugValues(
       MF, TPC->getTM<TargetMachine>().Options.ShouldEmitDebugEntryValues());
 }
 
