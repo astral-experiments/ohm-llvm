@@ -22,6 +22,7 @@
 #include "X86TargetMachine.h"
 #include "llvm/Analysis/BranchProbabilityInfo.h"
 #include "llvm/CodeGen/Analysis.h"
+#include "llvm/Analysis/BranchProbabilityInfo.h"
 #include "llvm/CodeGen/FastISel.h"
 #include "llvm/CodeGen/FunctionLoweringInfo.h"
 #include "llvm/CodeGen/MachineConstantPool.h"
@@ -30,6 +31,7 @@
 #include "llvm/IR/CallingConv.h"
 #include "llvm/IR/DebugInfo.h"
 #include "llvm/IR/DerivedTypes.h"
+#include "llvm/IR/EHPersonalities.h"
 #include "llvm/IR/GetElementPtrTypeIterator.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/Instructions.h"
@@ -38,6 +40,7 @@
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Operator.h"
 #include "llvm/MC/MCAsmInfo.h"
+#include "llvm/MC/MCContext.h"
 #include "llvm/MC/MCSymbol.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Target/TargetOptions.h"
@@ -96,6 +99,10 @@ private:
   bool X86SelectStore(const Instruction *I);
 
   bool X86SelectRet(const Instruction *I);
+
+  bool X86SelectInvoke(const InvokeInst &I);
+  bool X86SelectLandingPad(const LandingPadInst &I);
+  bool supportsDwarfEH() const;
 
   bool X86SelectCmp(const Instruction *I);
 
@@ -3232,7 +3239,7 @@ bool X86FastISel::fastLowerCall(CallLoweringInfo &CLI) {
     return false;
 
   // Functions with no_caller_saved_registers that need special handling.
-  if ((CB && isa<CallInst>(CB) && CB->hasFnAttr("no_caller_saved_registers")))
+  if (CB && CB->hasFnAttr("no_caller_saved_registers"))
     return false;
 
   // Functions with no_callee_saved_registers that need special handling.
@@ -3653,6 +3660,80 @@ bool X86FastISel::fastLowerCall(CallLoweringInfo &CLI) {
   return true;
 }
 
+bool X86FastISel::supportsDwarfEH() const {
+  return Subtarget->is64Bit() && Subtarget->isTargetELF() &&
+         DL.getPointerSizeInBits() == 64 &&
+         TM.getMCAsmInfo().getExceptionHandlingType() ==
+             ExceptionHandling::DwarfCFI &&
+         MF->getFunction().hasPersonalityFn() &&
+         !isScopedEHPersonality(
+             classifyEHPersonality(MF->getFunction().getPersonalityFn()));
+}
+
+bool X86FastISel::X86SelectInvoke(const InvokeInst &I) {
+  const Function *Callee = I.getCalledFunction();
+  const BasicBlock *Unwind = I.getUnwindDest();
+  if (!supportsDwarfEH() || TM.Options.EmitCallSiteInfo ||
+      !Callee || Callee->isIntrinsic() || I.hasOperandBundles() ||
+      I.getMetadata(LLVMContext::MD_pcsections) || !Unwind->isLandingPad())
+    return false;
+
+  MachineInstr *Call = lowerCall(&I);
+  if (!Call)
+    return false;
+  if (I.cannotMerge())
+    Call->setFlag(MachineInstr::NoMerge);
+
+  // An Itanium LSDA identifies the landing pad by the range containing the
+  // throwing call. Install this range only after call lowering succeeds.
+  MachineBasicBlock *MBB = FuncInfo.MBB;
+  MachineBasicBlock *Pad = FuncInfo.getMBB(Unwind);
+  MCSymbol *Begin = MF->getContext().createTempSymbol();
+  MCSymbol *End = MF->getContext().createTempSymbol();
+  BuildMI(*MBB, Call->getIterator(), getCurDebugLoc(),
+          TII.get(TargetOpcode::EH_LABEL))
+      .addSym(Begin);
+  BuildMI(*MBB, std::next(Call->getIterator()), getCurDebugLoc(),
+          TII.get(TargetOpcode::EH_LABEL))
+      .addSym(End);
+  MF->addInvoke(Pad, Begin, End);
+  Pad->setIsEHPad();
+  fastEmitBranch(FuncInfo.getMBB(I.getNormalDest()), getCurDebugLoc());
+  if (FuncInfo.BPI)
+    MBB->addSuccessor(Pad,
+                      FuncInfo.BPI->getEdgeProbability(I.getParent(), Unwind));
+  else
+    MBB->addSuccessorWithoutProb(Pad);
+  MBB->normalizeSuccProbs();
+  return true;
+}
+
+bool X86FastISel::X86SelectLandingPad(const LandingPadInst &I) {
+  const auto *Ty = dyn_cast<StructType>(I.getType());
+  if (!supportsDwarfEH() || I.getMetadata(LLVMContext::MD_pcsections) ||
+      !Ty || Ty->getNumElements() != 2 ||
+      !Ty->getElementType(0)->isPointerTy() ||
+      Ty->getElementType(0)->getPointerAddressSpace() != 0 ||
+      !Ty->getElementType(1)->isIntegerTy(32) ||
+      !FuncInfo.ExceptionPointerVirtReg || !FuncInfo.ExceptionSelectorVirtReg)
+    return false;
+
+  if (!I.use_empty()) {
+    // PrepareEHLandingPad has copied both incoming physical registers into
+    // pointer-sized virtual registers. The selector in this IR type is i32.
+    Register Reg = FuncInfo.ValueMap.lookup(&I);
+    if (!Reg)
+      Reg = FuncInfo.InitializeRegForValue(&I);
+    BuildMI(*FuncInfo.MBB, FuncInfo.InsertPt, MIMD, TII.get(TargetOpcode::COPY),
+            Reg)
+        .addReg(FuncInfo.ExceptionPointerVirtReg);
+    BuildMI(*FuncInfo.MBB, FuncInfo.InsertPt, MIMD, TII.get(TargetOpcode::COPY),
+            Reg + 1)
+        .addReg(FuncInfo.ExceptionSelectorVirtReg, {}, X86::sub_32bit);
+  }
+  return true;
+}
+
 bool
 X86FastISel::fastSelectInstruction(const Instruction *I)  {
   switch (I->getOpcode()) {
@@ -3663,6 +3744,10 @@ X86FastISel::fastSelectInstruction(const Instruction *I)  {
     return X86SelectStore(I);
   case Instruction::Ret:
     return X86SelectRet(I);
+  case Instruction::Invoke:
+    return X86SelectInvoke(cast<InvokeInst>(*I));
+  case Instruction::LandingPad:
+    return X86SelectLandingPad(cast<LandingPadInst>(*I));
   case Instruction::ICmp:
   case Instruction::FCmp:
     return X86SelectCmp(I);
