@@ -14,17 +14,17 @@ using namespace llvm;
 
 TEST(OhmDebugObjectCache, OriginalLoaderEnvironment) {
   EXPECT_TRUE(ohm::allowsDebugObjectCacheLoader(
-      StringLiteral("PATH=/bin\0LD_PRELOAD=\0LD_AUDIT=\0")));
+      StringLiteral::withInnerNUL("PATH=/bin\0LD_PRELOAD=\0LD_AUDIT=\0")));
   EXPECT_TRUE(ohm::allowsDebugObjectCacheLoader(
-      StringLiteral("X=LD_PRELOAD=lib.so\0LD_AUDITOR=lib.so\0")));
+      StringLiteral::withInnerNUL("X=LD_PRELOAD=lib.so\0LD_AUDITOR=lib.so\0")));
   EXPECT_FALSE(ohm::allowsDebugObjectCacheLoader(StringRef()));
   EXPECT_FALSE(ohm::allowsDebugObjectCacheLoader(StringLiteral("PATH=/bin")));
   EXPECT_FALSE(ohm::allowsDebugObjectCacheLoader(
-      StringLiteral("PATH=/bin\0LD_PRELOAD=lib.so\0")));
+      StringLiteral::withInnerNUL("PATH=/bin\0LD_PRELOAD=lib.so\0")));
   EXPECT_FALSE(ohm::allowsDebugObjectCacheLoader(
-      StringLiteral("LD_AUDIT=lib.so\0PATH=/bin\0")));
+      StringLiteral::withInnerNUL("LD_AUDIT=lib.so\0PATH=/bin\0")));
   EXPECT_FALSE(ohm::allowsDebugObjectCacheLoader(
-      StringLiteral("LD_PRELOAD=\0LD_PRELOAD=lib.so\0")));
+      StringLiteral::withInnerNUL("LD_PRELOAD=\0LD_PRELOAD=lib.so\0")));
 }
 
 TEST(OhmDebugObjectCache, AdmissionCountsTheOptimizedModule) {
