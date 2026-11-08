@@ -739,6 +739,13 @@ public:
                                                        StringRef PassName);
 
 private:
+  bool deferLocalSimplification(OptimizationLevel Level,
+                                ThinOrFullLTOPhase Phase) const;
+  ModulePassManager buildO1LocalInlinerPipeline();
+  ModuleInlinerWrapperPass buildInlinerPipelineImpl(OptimizationLevel Level,
+                                                    ThinOrFullLTOPhase Phase,
+                                                    bool DeferLocal);
+
   // O1 pass pipeline
   FunctionPassManager
   buildO1FunctionSimplificationPipeline(OptimizationLevel Level,
