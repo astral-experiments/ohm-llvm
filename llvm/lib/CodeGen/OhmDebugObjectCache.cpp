@@ -38,6 +38,20 @@
 using namespace llvm;
 
 #if defined(__linux__) && defined(__x86_64__)
+std::optional<ohm::DebugObjectImageGeneration>
+llvm::ohm::getDebugObjectImageGeneration() {
+  std::optional<DebugObjectImageGeneration> Generation;
+  ::dl_iterate_phdr(
+      [](dl_phdr_info *I, size_t Size, void *Out) {
+        if (Size >= offsetof(dl_phdr_info, dlpi_subs) + sizeof(I->dlpi_subs))
+          static_cast<decltype(Generation) *>(Out)->emplace(I->dlpi_adds,
+                                                            I->dlpi_subs);
+        return 1;
+      },
+      &Generation);
+  return Generation;
+}
+
 SmallVector<ohm::DebugObjectImage> llvm::ohm::getDebugObjectImages() {
   SmallVector<DebugObjectImage> Images;
   ::dl_iterate_phdr(
@@ -214,6 +228,10 @@ bool contains(ArrayRef<StringRef> Choices, StringRef Value) {
 }
 struct Invocation {
   std::string Root, Entries, Blobs, Cwd, Remap, Namespace;
+  std::optional<ohm::DebugObjectImageGeneration> Generation;
+  bool imagesUnchanged() const {
+    return Generation && Generation == ohm::getDebugObjectImageGeneration();
+  }
   Invocation() {
     if (std::getenv("OHM_DISABLE_DEBUG_OBJECT_CACHE"))
       return;
@@ -325,6 +343,9 @@ struct Invocation {
       return;
     auto Maps = MemoryBuffer::getFileAsStream("/proc/self/maps");
     if (!Maps)
+      return;
+    Generation = ohm::getDebugObjectImageGeneration();
+    if (!Generation)
       return;
     auto Binaries = ohm::getDebugObjectImages();
     if (Binaries.empty() || !Binaries.front().Path.empty())
@@ -537,7 +558,7 @@ bool llvm::ohm::runDebugObjectCache(Module &M, CodeGenTargetMachineImpl &TM,
   if (!Out.str().empty() || !isLargeDebugObjectInput(M))
     return Emit();
   auto &I = invocation();
-  if (I.Root.empty() || !ordinaryModule(M))
+  if (I.Root.empty() || !I.imagesUnchanged() || !ordinaryModule(M))
     return Emit();
   std::string Target =
       TM.getTargetTriple().str() + "|" + TM.getTargetCPU().str() + "|" +
@@ -572,7 +593,7 @@ bool llvm::ohm::runDebugObjectCache(Module &M, CodeGenTargetMachineImpl &TM,
                           Prior->Object.data(), Prior->Object.size(),
                           &Rebased.Value, &Why) == 0 &&
       Rebased.bytes().starts_with("\x7f"
-                                  "ELF")) {
+                                  "ELF") && I.imagesUnchanged()) {
     Out << Rebased.bytes();
     event(M.getModuleIdentifier(), "hit");
     return false;
@@ -587,7 +608,7 @@ bool llvm::ohm::runDebugObjectCache(Module &M, CodeGenTargetMachineImpl &TM,
   Certificate.Value = ohm_line_certificate_end_v1();
   if (Out.str().starts_with("\x7f"
                             "ELF") &&
-      !Certificate.bytes().empty() &&
+      !Certificate.bytes().empty() && I.imagesUnchanged() &&
       Origin::save(Path, {M.getModuleIdentifier(), Target, Sources.bytes(),
                           Next.bytes(), Out.str(), Certificate.bytes()}))
     event(M.getModuleIdentifier(), "committed", Why ? Why : "");
