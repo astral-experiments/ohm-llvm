@@ -16,6 +16,9 @@
 #ifndef LLVM_IR_LEGACYPASSMANAGER_H
 #define LLVM_IR_LEGACYPASSMANAGER_H
 
+#include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/FunctionExtras.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/Support/CBindingWrapping.h"
 #include "llvm/Support/Compiler.h"
 
@@ -47,6 +50,14 @@ public:
   /// may even destroy the pass right away if it is found to be redundant. This
   /// implies that all passes MUST be allocated with 'new'.
   virtual void add(Pass *P) = 0;
+
+  /// Install a one-shot executor for exactly the module pipeline added by
+  /// Build. Other pass-manager kinds, incompatible preceding analyses, and
+  /// additional trailing passes retain their normal execution.
+  using ModuleExecutor = unique_function<bool(Module &, function_ref<bool()>)>;
+  bool addWrappedModulePipeline(ArrayRef<const void *> AllowedPrefix,
+                                function_ref<bool()> Build,
+                                ModuleExecutor Execute);
 };
 
 /// PassManager manages ModulePassManagers

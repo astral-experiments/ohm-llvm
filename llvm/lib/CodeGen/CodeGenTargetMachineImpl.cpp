@@ -11,8 +11,10 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/CodeGen/CodeGenTargetMachineImpl.h"
+#include "OhmDebugObjectCache.h"
 #include "llvm/Analysis/RuntimeLibcallInfo.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
+#include "llvm/Analysis/TargetTransformInfo.h"
 #include "llvm/CodeGen/AsmPrinter.h"
 #include "llvm/CodeGen/BasicTTIImpl.h"
 #include "llvm/CodeGen/MachineModuleInfo.h"
@@ -233,25 +235,46 @@ bool CodeGenTargetMachineImpl::addPassesToEmitFile(
     PassManagerBase &PM, raw_pwrite_stream &Out, raw_pwrite_stream *DwoOut,
     CodeGenFileType FileType, bool DisableVerify,
     MachineModuleInfoWrapperPass *MMIWP) {
-  // Add common CodeGen passes.
-  if (!MMIWP)
-    MMIWP = new MachineModuleInfoWrapperPass(this);
-  TargetPassConfig *PassConfig =
-      addPassesToGenerateCode(*this, PM, DisableVerify, *MMIWP);
-  if (!PassConfig)
-    return true;
-
-  if (TargetPassConfig::willCompleteCodeGenPipeline()) {
-    if (addAsmPrinter(PM, Out, DwoOut, FileType, MMIWP->getMMI().getContext()))
+  const bool CanReuse =
+      !MMIWP && !DwoOut && DisableVerify &&
+      FileType == CodeGenFileType::ObjectFile &&
+      getTargetTriple().getArch() == Triple::x86_64 &&
+      getTargetTriple().isOSBinFormatELF() &&
+      getOptLevel() == CodeGenOptLevel::Less &&
+      Out.get_kind() == raw_ostream::OStreamKind::OK_SVecStream &&
+      Out.tell() == 0 && TargetPassConfig::willCompleteCodeGenPipeline() &&
+      ohm::canUseDebugObjectCache();
+  auto Build = [&] {
+    // Add common CodeGen passes.
+    if (!MMIWP)
+      MMIWP = new MachineModuleInfoWrapperPass(this);
+    TargetPassConfig *PassConfig =
+        addPassesToGenerateCode(*this, PM, DisableVerify, *MMIWP);
+    if (!PassConfig)
       return true;
-  } else {
-    // MIR printing is redundant with -filetype=null.
-    if (FileType != CodeGenFileType::Null)
-      PM.add(createPrintMIRPass(Out));
-  }
 
-  PM.add(createFreeMachineFunctionPass());
-  return false;
+    if (TargetPassConfig::willCompleteCodeGenPipeline()) {
+      if (addAsmPrinter(PM, Out, DwoOut, FileType,
+                        MMIWP->getMMI().getContext()))
+        return true;
+    } else {
+      // MIR printing is redundant with -filetype=null.
+      if (FileType != CodeGenFileType::Null)
+        PM.add(createPrintMIRPass(Out));
+    }
+
+    PM.add(createFreeMachineFunctionPass());
+    return false;
+  };
+  if (!CanReuse)
+    return Build();
+  return PM.addWrappedModulePipeline(
+      {&TargetTransformInfoWrapperPass::ID, &TargetLibraryInfoWrapperPass::ID,
+       &RuntimeLibraryInfoWrapper::ID},
+      Build, [this, &Out](Module &M, function_ref<bool()> Emit) {
+        return ohm::runDebugObjectCache(
+            M, *this, static_cast<raw_svector_ostream &>(Out), Emit);
+      });
 }
 
 /// addPassesToEmitMC - Add passes to the specified pass manager to get

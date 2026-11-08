@@ -21,6 +21,7 @@
 #include "llvm/IR/PassTimingInfo.h"
 #include "llvm/IR/PrintPasses.h"
 #include "llvm/PassInfo.h"
+#include "llvm/Support/SaveAndRestore.h"
 #include "llvm/Support/Chrono.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Compiler.h"
@@ -462,6 +463,25 @@ namespace legacy {
 // PassManagerImpl
 //
 
+// A builder may receive any PassManagerBase, including a forwarding wrapper.
+// Only the actual module manager can attest to the prefix it was given.
+struct ModulePipelineCapture {
+  PassManagerBase *Owner;
+  ArrayRef<const void *> Allowed;
+  ModulePipelineCapture *Previous;
+  PassManagerImpl *Impl = nullptr;
+  bool Eligible = true;
+
+  static thread_local ModulePipelineCapture *Current;
+  static ModulePipelineCapture *find(PassManagerBase *Owner) {
+    for (auto *C = Current; C; C = C->Previous)
+      if (C->Owner == Owner)
+        return C;
+    return nullptr;
+  }
+};
+thread_local ModulePipelineCapture *ModulePipelineCapture::Current = nullptr;
+
 /// PassManagerImpl manages MPPassManagers
 class PassManagerImpl : public Pass,
                         public PMDataManager,
@@ -473,8 +493,25 @@ public:
   explicit PassManagerImpl()
       : Pass(PT_PassManager, ID), PMTopLevelManager(new MPPassManager()) {}
 
-  /// \copydoc PassManager::add()
-  void add(Pass *P) {
+  SmallVector<const void *, 4> InitialAnalyses;
+  bool PrefixIntact = true;
+  PassManagerBase::ModuleExecutor Armed;
+
+  void add(Pass *P, PassManagerBase *Owner) {
+    if (Armed)
+      Armed = nullptr;
+    if (PrefixIntact) {
+      if (auto *C = ModulePipelineCapture::find(Owner)) {
+        C->Impl = this;
+        C->Eligible &= llvm::all_of(InitialAnalyses, [&](const void *ID) {
+          return llvm::is_contained(C->Allowed, ID);
+        });
+        PrefixIntact = false;
+      } else if (P->getAsImmutablePass() && InitialAnalyses.size() < 4)
+        InitialAnalyses.push_back(P->getPassID());
+      else
+        PrefixIntact = false;
+    }
     schedulePass(P);
   }
 
@@ -1688,12 +1725,16 @@ PassManager::~PassManager() {
 }
 
 void PassManager::add(Pass *P) {
-  PM->add(P);
+  PM->add(P, this);
 }
 
 /// run - Execute all of the passes scheduled for execution.  Keep track of
 /// whether any of the passes modifies the module, and if so, return true.
 bool PassManager::run(Module &M) {
+  if (PM->Armed) {
+    auto Execute = std::move(PM->Armed);
+    return Execute(M, [&] { return PM->run(M); });
+  }
   return PM->run(M);
 }
 } // namespace legacy
@@ -1789,3 +1830,19 @@ void FunctionPass::assignPassManager(PMStack &PMS,
 }
 
 legacy::PassManagerBase::~PassManagerBase() = default;
+
+bool legacy::PassManagerBase::addWrappedModulePipeline(
+    ArrayRef<const void *> AllowedPrefix, function_ref<bool()> Build,
+    ModuleExecutor Execute) {
+  if (auto *Outer = legacy::ModulePipelineCapture::find(this)) {
+    Outer->Eligible = false;
+    return Build();
+  }
+  legacy::ModulePipelineCapture Capture{this, AllowedPrefix,
+                                        legacy::ModulePipelineCapture::Current};
+  SaveAndRestore Guard(legacy::ModulePipelineCapture::Current, &Capture);
+  bool Failed = Build();
+  if (!Failed && Capture.Eligible && Capture.Impl)
+    Capture.Impl->Armed = std::move(Execute);
+  return Failed;
+}
