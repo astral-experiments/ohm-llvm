@@ -13,6 +13,7 @@
 #include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
+#include "llvm/Support/CachePruning.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/MD5.h"
 #include "llvm/Support/Path.h"
@@ -20,7 +21,12 @@
 #include "llvm/Support/raw_ostream.h"
 #include "gtest/gtest.h"
 #ifdef __linux__
+#include <csignal>
+#include <fcntl.h>
+#include <sys/resource.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
+#include <unistd.h>
 #endif
 
 using namespace llvm;
@@ -156,4 +162,52 @@ TEST_F(OhmDebugObjectSources,
   EXPECT_EQ(Missing.Status, 2);
   EXPECT_TRUE(Missing.Map.empty());
 }
+#if defined(__linux__) && defined(SYS_renameat2) &&                            \
+    defined(GTEST_HAS_DEATH_TEST)
+TEST_F(OhmDebugObjectSources, PrunesInterruptedSourceBlob) {
+  StringRef Contents = "first\nsecond\n";
+  write(Contents);
+  // The first write reaches the one-byte limit; the next write terminates
+  // the child before RAII cleanup. No partial blob is published.
+  ASSERT_EXIT(
+      {
+        struct rlimit Core {};
+        struct rlimit Size {};
+        Size.rlim_cur = Size.rlim_max = 1;
+        sigset_t Signals;
+        sigemptyset(&Signals);
+        sigaddset(&Signals, SIGXFSZ);
+        if (setrlimit(RLIMIT_CORE, &Core) || setrlimit(RLIMIT_FSIZE, &Size) ||
+            signal(SIGXFSZ, SIG_DFL) == SIG_ERR ||
+            sigprocmask(SIG_UNBLOCK, &Signals, nullptr))
+          _exit(91);
+        (void)run(Contents);
+        _exit(92);
+      },
+      ::testing::KilledBySignal(SIGXFSZ), "");
+
+  std::error_code EC;
+  sys::fs::directory_iterator It(Bank, EC), End;
+  ASSERT_FALSE(EC);
+  ASSERT_NE(It, End);
+  std::string Incomplete = It->path();
+  It.increment(EC);
+  ASSERT_FALSE(EC);
+  EXPECT_EQ(It, End);
+  uint64_t Length;
+  ASSERT_FALSE(sys::fs::file_size(Incomplete, Length));
+  ASSERT_EQ(Length, 1u);
+
+  struct timespec Expired[2] = {{1, 0}, {1, 0}};
+  ASSERT_EQ(utimensat(AT_FDCWD, Incomplete.c_str(), Expired, 0), 0);
+  CachePruningPolicy Policy;
+  Policy.Interval = std::chrono::seconds(0);
+  Policy.Expiration = std::chrono::seconds(1);
+  auto Pruned = pruneCache(Bank, Policy);
+  ASSERT_TRUE(static_cast<bool>(Pruned)) << toString(Pruned.takeError());
+  EXPECT_TRUE(*Pruned);
+  EXPECT_FALSE(sys::fs::exists(Incomplete));
+  EXPECT_FALSE(run(Contents).Manifest.empty());
+}
+#endif
 } // namespace

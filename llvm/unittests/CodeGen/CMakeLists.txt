@@ -30,6 +30,7 @@ add_llvm_unittest(CodeGenTests
   DwarfStringPoolEntryRefTest.cpp
   GCMetadata.cpp
   InstrRefLDVTest.cpp
+  OhmDebugObjectCacheTest.cpp
   OhmDebugObjectSourcesTest.cpp
   OhmLineCertificateTest.cpp
   LowLevelTypeTest.cpp
