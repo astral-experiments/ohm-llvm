@@ -13,6 +13,8 @@
 #include <sys/syscall.h>
 #endif
 #if defined(__linux__) && defined(SYS_renameat2)
+#include "OhmDebugObjectSourceLines.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallString.h"
@@ -28,6 +30,7 @@
 #include "llvm/Support/Path.h"
 #include "llvm/Support/SHA1.h"
 #include "llvm/Support/SHA256.h"
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <cstdio>
@@ -44,6 +47,90 @@
 #include <utility>
 
 using namespace llvm;
+
+bool llvm::ohm::getMandatoryDebugSourceLines(ArrayRef<StringRef> Old,
+                                             ArrayRef<StringRef> New,
+                                             MutableArrayRef<uint32_t> Forward) {
+  // Every path with at most Limit edits stays in this diagonal band. Keep
+  // the original linear insertion-only proof for larger pure insertions.
+  constexpr unsigned Limit = 64;
+  constexpr unsigned Width = 2 * Limit + 3; // A sentinel on each side.
+  constexpr uint8_t Far = Limit + 1;
+  constexpr size_t MaxCells = 4 * 1024 * 1024;
+  if (Old.size() != Forward.size() || Old.empty() || New.empty() ||
+      Old.size() >= MaxCells / Width || New.size() > Old.size() + Limit ||
+      Old.size() > New.size() + Limit)
+    return false;
+  const unsigned M = Old.size(), N = New.size();
+
+  DenseMap<StringRef, unsigned> Symbols;
+  auto Intern = [&](ArrayRef<StringRef> Lines) {
+    std::vector<unsigned> IDs;
+    IDs.reserve(Lines.size());
+    for (StringRef Line : Lines)
+      IDs.push_back(Symbols.try_emplace(Line, Symbols.size()).first->second);
+    return IDs;
+  };
+  auto A = Intern(Old), B = Intern(New);
+  std::vector<uint8_t> Prefix((M + 1) * Width, Far);
+  auto First = [](unsigned I) { return I > Limit ? I - Limit : 0; };
+  auto Last = [N](unsigned I) { return std::min(I + Limit, N); };
+  for (unsigned I = 0; I <= M; ++I) {
+    auto *Row = Prefix.data() + I * Width;
+    for (unsigned J = First(I); J <= Last(I); ++J) {
+      unsigned Col = J + Limit + 1 - I;
+      unsigned Cost = I == 0 && J == 0 ? 0 : Far;
+      if (I) {
+        auto *Prev = Row - Width;
+        Cost = std::min<unsigned>(Cost, Prev[Col + 1] + 1);
+        if (J && A[I - 1] == B[J - 1])
+          Cost = std::min<unsigned>(Cost, Prev[Col]);
+      }
+      if (J)
+        Cost = std::min<unsigned>(Cost, Row[Col - 1] + 1);
+      Row[Col] = Cost;
+    }
+  }
+  const unsigned Best = Prefix[M * Width + N + Limit + 1 - M];
+  if (Best > Limit)
+    return false;
+
+  // Add the shortest prefix and suffix costs around each possible match or
+  // deletion of an old line. An edge is on some shortest path iff these costs
+  // sum to Best. Only a sole match with no possible deletion is compulsory.
+  std::array<uint8_t, Width> Next, Row;
+  Next.fill(Far);
+  for (unsigned I = M + 1; I-- != 0;) {
+    Row.fill(Far);
+    bool MayDelete = false;
+    unsigned Matches = 0, Destination = 0;
+    for (unsigned J = Last(I) + 1; J > First(I);) {
+      --J;
+      unsigned Col = J + Limit + 1 - I;
+      unsigned Before = Prefix[I * Width + Col];
+      unsigned Cost = I == M && J == N ? 0 : Far;
+      if (I < M) {
+        unsigned Delete = Next[Col - 1] + 1;
+        Cost = std::min(Cost, Delete);
+        MayDelete |= Before + Delete == Best;
+        if (J < N && A[I] == B[J]) {
+          Cost = std::min<unsigned>(Cost, Next[Col]);
+          if (Before + Next[Col] == Best) {
+            ++Matches;
+            Destination = J + 1;
+          }
+        }
+      }
+      if (J < N)
+        Cost = std::min<unsigned>(Cost, Row[Col + 1] + 1);
+      Row[Col] = Cost;
+    }
+    if (I < M)
+      Forward[I] = !MayDelete && Matches == 1 ? Destination : 0;
+    Row.swap(Next);
+  }
+  return llvm::any_of(Forward, [](uint32_t Line) { return Line != 0; });
+}
 
 namespace {
 using Key = std::pair<std::string, std::string>;
@@ -66,6 +153,7 @@ struct Snapshot {
 struct Alignment {
   std::vector<uint32_t> Last, Ambiguous;
   uint32_t NewSize = 0;
+  bool Partial = false;
   Hashes OldHash, NewHash;
 };
 struct FD {
@@ -526,6 +614,33 @@ Expected<std::vector<StringRef>> lines(StringRef B) {
     return bad("source line count exceeds representable coordinates");
   return L;
 }
+bool alignInsertions(ArrayRef<StringRef> A, ArrayRef<StringRef> B,
+                     Alignment &R) {
+  if (A.size() >= B.size())
+    return false;
+  size_t J = 0;
+  for (size_t I = 0; I < A.size(); ++I) {
+    while (J < B.size() && A[I] != B[J])
+      ++J;
+    if (J == B.size())
+      return false;
+    R.Last[I] = uint32_t(++J);
+  }
+  // Tight bounds on every possible ordered, byte-identical insertion map.
+  // If these disagree, a source-only diff cannot establish a unique location.
+  J = B.size();
+  for (size_t I = A.size(); I > 0; --I) {
+    while (J && A[I - 1] != B[J - 1])
+      --J;
+    if (!J)
+      return false;
+    if (R.Last[I - 1] != J)
+      R.Ambiguous.push_back(uint32_t(I));
+    R.Last[I - 1] = uint32_t(J--);
+  }
+  std::reverse(R.Ambiguous.begin(), R.Ambiguous.end());
+  return true;
+}
 Expected<std::shared_ptr<const Alignment>> align(StringRef Old, StringRef New) {
   auto A = lines(Old);
   if (!A)
@@ -533,32 +648,18 @@ Expected<std::shared_ptr<const Alignment>> align(StringRef Old, StringRef New) {
   auto B = lines(New);
   if (!B)
     return B.takeError();
-  if (A->size() >= B->size())
-    return bad("changed source is not a strict insertion");
   auto R = std::make_shared<Alignment>();
   R->Last.resize(A->size());
   R->NewSize = B->size();
-  size_t J = 0;
-  for (size_t I = 0; I < A->size(); ++I) {
-    while (J < B->size() && (*A)[I] != (*B)[J])
-      ++J;
-    if (J == B->size())
-      return bad("old source contains a deleted, moved, or replaced line");
-    R->Last[I] = uint32_t(++J);
+  if (!alignInsertions(*A, *B, *R)) {
+    if (!ohm::getMandatoryDebugSourceLines(*A, *B, R->Last))
+      return bad("source has no bounded, unambiguous partial alignment");
+    R->Partial = true;
+    R->Ambiguous.clear();
+    for (size_t I = 0; I < R->Last.size(); ++I)
+      if (R->Last[I] == 0)
+        R->Ambiguous.push_back(I + 1);
   }
-  // Tight bounds on every possible ordered, byte-identical insertion map.
-  // If these disagree, a source-only diff cannot establish a unique location.
-  J = B->size();
-  for (size_t I = A->size(); I > 0; --I) {
-    while (J && (*A)[I - 1] != (*B)[J - 1])
-      --J;
-    if (!J)
-      return bad("source has no reverse embedding");
-    if (R->Last[I - 1] != J)
-      R->Ambiguous.push_back(uint32_t(I));
-    R->Last[I - 1] = uint32_t(J--);
-  }
-  std::reverse(R->Ambiguous.begin(), R->Ambiguous.end());
   R->OldHash = allHashes(Old);
   R->NewHash = allHashes(New);
   return std::shared_ptr<const Alignment>(std::move(R));
@@ -602,7 +703,7 @@ Expected<std::shared_ptr<const Alignment>> proven(int Dir, const File &Old,
   return R;
 }
 using Changes = std::map<Key, std::shared_ptr<const Alignment>>;
-std::string encodeMap(const Changes &C) {
+std::string encodeMap(const Changes &C, bool Explicit) {
   std::string Out;
   raw_string_ostream OS(Out);
   json::OStream J(OS);
@@ -616,7 +717,7 @@ std::string encodeMap(const Changes &C) {
           J.attributeArray("lines", [&] {
             auto &A = *V.second;
             for (size_t I = 0; I < A.Last.size(); ++I)
-              if (A.Last[I] != I + 1)
+              if (A.Last[I] && (Explicit || A.Last[I] != I + 1))
                 J.array([&] {
                   J.value(int64_t(I + 1));
                   J.value(int64_t(A.Last[I]));
@@ -628,7 +729,7 @@ std::string encodeMap(const Changes &C) {
   OS << '\n';
   return Out;
 }
-std::string proof(StringRef Map, const Changes &C) {
+std::string proof(StringRef Map, const Changes &C, bool Explicit) {
   json::Array Files;
   auto values = [](const Hashes &H) {
     return json::Object{{"md5", H.MD5}, {"sha1", H.SHA1}, {"sha256", H.SHA256}};
@@ -637,6 +738,10 @@ std::string proof(StringRef Map, const Changes &C) {
     const auto &A = *V.second;
     json::Array Segments, Ambiguity;
     for (size_t I = 0; I < A.Last.size();) {
+      if (!A.Last[I]) {
+        ++I;
+        continue;
+      }
       size_t J = I + 1;
       while (J < A.Last.size() &&
              uint64_t(A.Last[J]) == uint64_t(A.Last[I]) + J - I)
@@ -651,7 +756,8 @@ std::string proof(StringRef Map, const Changes &C) {
     Files.push_back(json::Object{
         {"directory", V.first.first},
         {"filename", V.first.second},
-        {"ordered_byte_identical_old_lines", int64_t(A.Last.size())},
+        {Explicit ? "old_lines" : "ordered_byte_identical_old_lines",
+         int64_t(A.Last.size())},
         {"new_lines", int64_t(A.NewSize)},
         {"segments", std::move(Segments)},
         {"old", values(A.OldHash)},
@@ -661,7 +767,7 @@ std::string proof(StringRef Map, const Changes &C) {
   }
   std::string Out;
   raw_string_ostream OS(Out);
-  OS << json::Value(json::Object{{"version", 1},
+  OS << json::Value(json::Object{{"version", Explicit ? 2 : 1},
                                  {"map_sha256", hash256(Map)},
                                  {"files", std::move(Files)}})
      << '\n';
@@ -762,9 +868,13 @@ ohm_debug_sources_v1(LLVMModuleRef Ref, const char *Cwd, const char *Prefix,
                    StringRef(static_cast<const char *>(Object), ObjectSize));
   if (!C)
     return miss(toString(C.takeError()), Reason);
-  std::string Bytes = encodeMap(*C);
+  // Version 1 maps omit identity pairs. When any file is partial, version 2
+  // of the source proof requires an explicit map of every retained coordinate.
+  bool Explicit =
+      llvm::any_of(*C, [](const auto &E) { return E.second->Partial; });
+  std::string Bytes = encodeMap(*C, Explicit);
   *Map = buffer(Bytes);
-  *Proof = buffer(proof(Bytes, *C));
+  *Proof = buffer(proof(Bytes, *C, Explicit));
   return 0;
 }
 extern "C" int ohm_debug_rebase_v1(const void *Map, size_t MapSize,

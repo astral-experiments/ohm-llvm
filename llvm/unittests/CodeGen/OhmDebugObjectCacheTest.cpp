@@ -76,3 +76,18 @@ TEST(OhmDebugObjectCache, AdmissionCountsTheOptimizedModule) {
   B.CreateCall(Callee);
   EXPECT_TRUE(ohm::isLargeDebugObjectInput(M));
 }
+
+TEST(OhmDebugObjectCache, AdmissionCountsManyShortBlocks) {
+  LLVMContext C;
+  Module M("many-blocks", C);
+  auto *Ty = FunctionType::get(Type::getVoidTy(C), false);
+  auto AddBlock = [&] {
+    auto *F = Function::Create(Ty, GlobalValue::ExternalLinkage, "f", M);
+    IRBuilder<>(BasicBlock::Create(C, "entry", F)).CreateRetVoid();
+  };
+  for (unsigned I = 0; I < 2047; ++I)
+    AddBlock();
+  EXPECT_FALSE(ohm::isLargeDebugObjectInput(M));
+  AddBlock();
+  EXPECT_TRUE(ohm::isLargeDebugObjectInput(M));
+}
