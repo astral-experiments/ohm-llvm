@@ -10,12 +10,24 @@
 #ifndef LLVM_LIB_CODEGEN_OHMDEBUGOBJECTCACHE_H
 #define LLVM_LIB_CODEGEN_OHMDEBUGOBJECTCACHE_H
 #include "llvm/ADT/STLFunctionalExtras.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/IR/Module.h"
+#include <cstdint>
+#include <string>
 namespace llvm {
 class CodeGenTargetMachineImpl;
 class raw_svector_ostream;
 namespace ohm {
+#if defined(__linux__) && defined(__x86_64__)
+struct DebugObjectImage {
+  std::string Path;
+  uintptr_t Address;
+};
+/// File-backed images in loader order, with an empty pathname for the
+/// executable.
+SmallVector<DebugObjectImage> getDebugObjectImages();
+#endif
 /// Small machine inputs cost less to compile than to certify and retain.
 inline bool isLargeDebugObjectInput(const Module &M) {
   constexpr unsigned MinInstructions = 32 * 1024;

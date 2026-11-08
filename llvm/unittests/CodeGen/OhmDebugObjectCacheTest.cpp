@@ -7,10 +7,27 @@
 //===----------------------------------------------------------------------===//
 
 #include "../../lib/CodeGen/OhmDebugObjectCache.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/IR/IRBuilder.h"
 #include "gtest/gtest.h"
+#if defined(__linux__) && defined(__x86_64__)
+#include <dlfcn.h>
+#endif
 
 using namespace llvm;
+
+#if defined(__linux__) && defined(__x86_64__)
+TEST(OhmDebugObjectCache, IncludesOrdinaryLinkedLibraries) {
+  Dl_info Lib{};
+  ASSERT_NE(::dladdr(::dlsym(RTLD_DEFAULT, "dlopen"), &Lib), 0);
+  ASSERT_NE(Lib.dli_fname, nullptr);
+  auto Images = ohm::getDebugObjectImages();
+  ASSERT_FALSE(Images.empty());
+  EXPECT_TRUE(Images.front().Path.empty());
+  EXPECT_TRUE(llvm::any_of(
+      Images, [&](const auto &I) { return I.Path == Lib.dli_fname; }));
+}
+#endif
 
 TEST(OhmDebugObjectCache, OriginalLoaderEnvironment) {
   EXPECT_TRUE(ohm::allowsDebugObjectCacheLoader(
