@@ -90,4 +90,12 @@ TEST(OhmDebugObjectCache, AdmissionCountsManyShortBlocks) {
   EXPECT_FALSE(ohm::isLargeDebugObjectInput(M));
   AddBlock();
   EXPECT_TRUE(ohm::isLargeDebugObjectInput(M));
+
+  auto Callee = M.getOrInsertFunction("opaque", Ty);
+  IRBuilder<> B(M.begin()->getEntryBlock().getTerminator());
+  for (unsigned I = 0; I < 3 * 2048; ++I)
+    B.CreateCall(Callee);
+  EXPECT_TRUE(ohm::isLargeDebugObjectInput(M));
+  B.CreateCall(Callee);
+  EXPECT_FALSE(ohm::isLargeDebugObjectInput(M));
 }

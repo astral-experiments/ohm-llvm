@@ -39,11 +39,12 @@ inline bool isLargeDebugObjectInput(const Module &M) {
   unsigned Blocks = 0, Instructions = 0;
   for (const Function &F : M)
     for (const BasicBlock &BB : F) {
+      ++Blocks;
       Instructions += BB.size();
-      if (++Blocks >= 2 * 1024 || Instructions >= 32 * 1024)
+      if (Instructions >= 32 * 1024)
         return true;
     }
-  return false;
+  return Blocks >= 2 * 1024 && Instructions <= 4 * Blocks;
 }
 /// The Linux loader consumes its initial environment before constructors can
 /// clear their process-visible variables. A truncated environment is unknown.
