@@ -290,6 +290,12 @@ struct Invocation {
         !sys::path::is_absolute(Incremental) || Opt != "1" || LTO != "off" ||
         Embed != "no" || Debug != "line-tables-only" || Remap.empty())
       return;
+    // An ELF extension can change target passes without changing rustc, its
+    // driver, libLLVM, or the input IR. getenv() loses constructors' unsets.
+    auto InitialEnvironment = MemoryBuffer::getFileAsStream("/proc/self/environ");
+    if (!InitialEnvironment ||
+        !ohm::allowsDebugObjectCacheLoader((*InitialEnvironment)->getBuffer()))
+      return;
     SmallString<256> WD;
     if (sys::fs::current_path(WD))
       return;

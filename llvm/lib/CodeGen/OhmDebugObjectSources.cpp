@@ -244,7 +244,8 @@ Expected<struct stat> storeBlob(int Dir, StringRef Digest, StringRef Bytes) {
   std::string Temp;
   FD F;
   do {
-    Temp = (Twine(".source-") + Twine(getpid()) + "-" +
+    // Standard LLVM pruning also collects unfinished Thin-* cache files.
+    Temp = (Twine("Thin-src") + Twine(getpid()) + "-" +
             Twine(Sequence.fetch_add(1, std::memory_order_relaxed)))
                .str();
     F = FD(openat(Dir, Temp.c_str(),

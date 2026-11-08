@@ -1,4 +1,5 @@
-//===- OhmDebugObjectCache.h - Checked incremental machine objects -*- C++ -*-===//
+//===- OhmDebugObjectCache.h - Checked incremental machine objects -*- C++
+//-*-===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -9,11 +10,26 @@
 #ifndef LLVM_LIB_CODEGEN_OHMDEBUGOBJECTCACHE_H
 #define LLVM_LIB_CODEGEN_OHMDEBUGOBJECTCACHE_H
 #include "llvm/ADT/STLFunctionalExtras.h"
+#include "llvm/ADT/StringRef.h"
 namespace llvm {
 class CodeGenTargetMachineImpl;
 class Module;
 class raw_svector_ostream;
 namespace ohm {
+/// The Linux loader consumes its initial environment before constructors can
+/// clear their process-visible variables. A truncated environment is unknown.
+inline bool allowsDebugObjectCacheLoader(StringRef InitialEnvironment) {
+  if (InitialEnvironment.empty() || InitialEnvironment.back() != '\0')
+    return false;
+  while (!InitialEnvironment.empty()) {
+    auto [Entry, Rest] = InitialEnvironment.split('\0');
+    InitialEnvironment = Rest;
+    auto [Name, Value] = Entry.split('=');
+    if ((Name == "LD_PRELOAD" || Name == "LD_AUDIT") && !Value.empty())
+      return false;
+  }
+  return true;
+}
 bool canUseDebugObjectCache();
 bool runDebugObjectCache(Module &, CodeGenTargetMachineImpl &,
                          raw_svector_ostream &, function_ref<bool()> Emit);
