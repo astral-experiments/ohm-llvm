@@ -245,8 +245,7 @@ std::optional<MemoryBufferRef> elf::readFile(Ctx &ctx, StringRef path) {
   Log(ctx) << path;
   ctx.arg.dependencyFiles.insert(llvm::CachedHashString(path));
 
-  auto mbOrErr = MemoryBuffer::getFile(path, /*IsText=*/false,
-                                       /*RequiresNullTerminator=*/false);
+  auto mbOrErr = ctx.rustTestLink.readFile(path);
   if (auto ec = mbOrErr.getError()) {
     ErrAlways(ctx) << "cannot open " << path << ": " << ec.message();
     return std::nullopt;
@@ -381,6 +380,7 @@ static void addDependentLibrary(Ctx &ctx, StringRef specifier,
                                 const InputFile *f) {
   if (!ctx.arg.dependentLibraries)
     return;
+  ctx.rustTestLink.disable();
   if (std::optional<std::string> s = searchLibraryBaseName(ctx, specifier))
     ctx.driver.addFile(ctx.saver.save(*s), /*withLOption=*/true);
   else if (std::optional<std::string> s = findFromSearchPaths(ctx, specifier))

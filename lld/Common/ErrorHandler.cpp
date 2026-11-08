@@ -247,6 +247,7 @@ void ErrorHandler::warn(const Twine &msg) {
     return;
 
   std::lock_guard<std::mutex> lock(mu);
+  ++warningCount;
   reportDiagnostic(getLocation(msg), Colors::MAGENTA, "warning", msg);
 }
 

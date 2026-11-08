@@ -364,6 +364,10 @@ template <class ELFT> void Writer<ELFT>::run() {
     if (errCount(ctx))
       return;
 
+    ctx.rustTestLink.observeOutput(StringRef(
+        reinterpret_cast<const char *>(buffer->getBufferStart()),
+        buffer->getBufferSize()));
+
     // With -o -, write to lld::outs() (the stdoutOS argument of
     // link()) instead of committing the buffer, which would write to the
     // process's stdout.

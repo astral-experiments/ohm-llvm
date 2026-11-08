@@ -95,6 +95,7 @@ public:
                   bool exitEarly, bool disableOutput);
 
   uint64_t errorCount = 0;
+  uint64_t warningCount = 0;
   uint64_t errorLimit = 20;
   StringRef errorLimitExceededMsg = "too many errors emitted, stopping now";
   StringRef errorHandlingScript;
