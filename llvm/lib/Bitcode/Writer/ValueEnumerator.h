@@ -43,9 +43,18 @@ class ValueSymbolTable;
 
 class ValueEnumerator {
   DebugObjectSourceMap *SourceMap = nullptr;
+  unsigned getRawValueID(const Value *V) const;
 
 public:
   void setSourceMap(DebugObjectSourceMap *Map) { SourceMap = Map; }
+  StringRef callerTail(const ConstantDataSequential *C) const {
+    if (SourceMap && !SourceMap->CallerTails.empty()) {
+      auto I = SourceMap->CallerTails.find(C);
+      if (I != SourceMap->CallerTails.end())
+        return I->second;
+    }
+    return C->getAsString();
+  }
   unsigned debugLine(const Metadata *N, unsigned Line) const {
     return SourceMap ? SourceMap->line(N, Line) : Line;
   }
@@ -164,6 +173,7 @@ public:
              const char *Name) const;
 
   unsigned getValueID(const Value *V) const;
+  unsigned getAggregateOperandID(const Constant *C, unsigned Operand) const;
 
   unsigned getMetadataID(const Metadata *MD) const {
     auto ID = getMetadataOrNullID(MD);
