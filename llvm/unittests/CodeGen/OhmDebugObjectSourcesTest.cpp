@@ -96,6 +96,7 @@ protected:
     return {Status, Take(N), Take(A), Take(B), Why ? Why : ""};
   }
 };
+#if defined(__linux__) && defined(SYS_renameat2)
 TEST(OhmDebugSourceLines, DistinguishesMandatoryOccurrencesFromDuplicates) {
   auto Check = [](ArrayRef<StringRef> Old, ArrayRef<StringRef> New,
                   ArrayRef<uint32_t> Expected) {
@@ -129,6 +130,8 @@ TEST(OhmDebugSourceLines, BoundsTheNumberOfChangedLines) {
   Forward.resize(Old.size());
   EXPECT_FALSE(ohm::getMandatoryDebugSourceLines(Old, New, Forward));
 }
+
+#endif
 
 TEST_F(OhmDebugObjectSources, CapturesOriginAndProvesExactOrderedLines) {
   StringRef Old = "first\nsecond\n", New = "first\ninserted\nsecond\n";
