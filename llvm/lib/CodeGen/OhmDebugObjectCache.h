@@ -11,11 +11,16 @@
 #define LLVM_LIB_CODEGEN_OHMDEBUGOBJECTCACHE_H
 #include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/IR/Module.h"
 namespace llvm {
 class CodeGenTargetMachineImpl;
-class Module;
 class raw_svector_ostream;
 namespace ohm {
+/// Small machine inputs cost less to compile than to certify and retain.
+inline bool isLargeDebugObjectInput(const Module &M) {
+  constexpr unsigned MinInstructions = 32 * 1024;
+  return M.getInstructionCount() >= MinInstructions;
+}
 /// The Linux loader consumes its initial environment before constructors can
 /// clear their process-visible variables. A truncated environment is unknown.
 inline bool allowsDebugObjectCacheLoader(StringRef InitialEnvironment) {

@@ -29,6 +29,7 @@
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <link.h>
+#include <sys/auxv.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
 #include <unistd.h>
@@ -292,7 +293,8 @@ struct Invocation {
       return;
     // An ELF extension can change target passes without changing rustc, its
     // driver, libLLVM, or the input IR. getenv() loses constructors' unsets.
-    auto InitialEnvironment = MemoryBuffer::getFileAsStream("/proc/self/environ");
+    auto InitialEnvironment =
+        MemoryBuffer::getFileAsStream("/proc/self/environ");
     if (!InitialEnvironment ||
         !ohm::allowsDebugObjectCacheLoader((*InitialEnvironment)->getBuffer()))
       return;
@@ -504,7 +506,14 @@ void event(StringRef M, StringRef State, StringRef Reason = {}) {
 
 bool llvm::ohm::canUseDebugObjectCache() {
 #if defined(__linux__) && defined(__x86_64__)
-  return !invocation().Root.empty();
+  // At pipeline construction the Module is not available yet. This cheap
+  // predicate avoids attaching an executor to other ELF compiler clients.
+  static const bool Candidate = [] {
+    const char *Exe = reinterpret_cast<const char *>(::getauxval(AT_EXECFN));
+    return Exe && sys::path::filename(Exe) == "rustc" &&
+           !std::getenv("OHM_DISABLE_DEBUG_OBJECT_CACHE");
+  }();
+  return Candidate;
 #else
   return false;
 #endif
@@ -514,8 +523,12 @@ bool llvm::ohm::runDebugObjectCache(Module &M, CodeGenTargetMachineImpl &TM,
                                     raw_svector_ostream &Out,
                                     function_ref<bool()> Emit) {
 #if defined(__linux__) && defined(__x86_64__)
+  // This precedes all cache filesystem activity, including toolchain identity
+  // reads and the creation of source or object directories.
+  if (!Out.str().empty() || !isLargeDebugObjectInput(M))
+    return Emit();
   auto &I = invocation();
-  if (I.Root.empty() || !Out.str().empty() || !ordinaryModule(M))
+  if (I.Root.empty() || !ordinaryModule(M))
     return Emit();
   std::string Target =
       TM.getTargetTriple().str() + "|" + TM.getTargetCPU().str() + "|" +

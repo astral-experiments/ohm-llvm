@@ -7,6 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "../../lib/CodeGen/OhmDebugObjectCache.h"
+#include "llvm/IR/IRBuilder.h"
 #include "gtest/gtest.h"
 
 using namespace llvm;
@@ -24,4 +25,20 @@ TEST(OhmDebugObjectCache, OriginalLoaderEnvironment) {
       StringLiteral("LD_AUDIT=lib.so\0PATH=/bin\0")));
   EXPECT_FALSE(ohm::allowsDebugObjectCacheLoader(
       StringLiteral("LD_PRELOAD=\0LD_PRELOAD=lib.so\0")));
+}
+
+TEST(OhmDebugObjectCache, AdmissionCountsTheOptimizedModule) {
+  LLVMContext C;
+  Module M("machine-input", C);
+  auto *Ty = FunctionType::get(Type::getVoidTy(C), false);
+  auto *F = Function::Create(Ty, GlobalValue::ExternalLinkage, "body", M);
+  auto Callee = M.getOrInsertFunction("opaque", Ty);
+  IRBuilder<> B(BasicBlock::Create(C, "entry", F));
+  auto *Ret = B.CreateRetVoid();
+  B.SetInsertPoint(Ret);
+  for (unsigned I = 1; I < 32767; ++I)
+    B.CreateCall(Callee);
+  EXPECT_FALSE(ohm::isLargeDebugObjectInput(M));
+  B.CreateCall(Callee);
+  EXPECT_TRUE(ohm::isLargeDebugObjectInput(M));
 }
