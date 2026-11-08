@@ -245,6 +245,136 @@ public:
 };
 char OnTheFlyTest::ID = 0;
 
+struct PrefixAnalysis : ImmutablePass {
+  static char ID;
+  PrefixAnalysis() : ImmutablePass(ID) {}
+};
+char PrefixAnalysis::ID;
+
+TEST(PassManager, WrappedModulePipelineIsOneShot) {
+  LLVMContext C;
+  Module M("one-shot", C);
+  legacy::PassManager PM;
+  PM.add(new PrefixAnalysis);
+  unsigned Calls = 0;
+  ModuleNDNM::run = 0;
+  EXPECT_FALSE(PM.addWrappedModulePipeline(
+      {&PrefixAnalysis::ID},
+      [&] {
+        PM.add(new ModuleNDNM);
+        return false;
+      },
+      [&](Module &Seen, function_ref<bool()>) {
+        EXPECT_EQ(&M, &Seen);
+        ++Calls;
+        return true;
+      }));
+  EXPECT_TRUE(PM.run(M));
+  EXPECT_EQ(0, ModuleNDNM::run);
+  EXPECT_FALSE(PM.run(M));
+  EXPECT_EQ(1u, Calls);
+  EXPECT_EQ(1, ModuleNDNM::run);
+}
+
+TEST(PassManager, WrappedModulePipelineMayRunNativePlan) {
+  LLVMContext C;
+  Module M("native", C);
+  legacy::PassManager PM;
+  ModuleNDM::run = 0;
+  unsigned Calls = 0;
+  PM.addWrappedModulePipeline(
+      {},
+      [&] {
+        PM.add(new ModuleNDM);
+        return false;
+      },
+      [&](Module &, function_ref<bool()> Run) {
+        ++Calls;
+        return Run();
+      });
+  EXPECT_TRUE(PM.run(M));
+  EXPECT_EQ(1, ModuleNDM::run);
+  EXPECT_EQ(1u, Calls);
+}
+
+TEST(PassManager, WrappedModulePipelinePreservesOtherPasses) {
+  enum Reason {
+    PrecedingTransform,
+    UnknownAnalysis,
+    TrailingTransform,
+    Nested,
+    Failed
+  };
+  for (auto R : {PrecedingTransform, UnknownAnalysis, TrailingTransform, Nested,
+                 Failed}) {
+    SCOPED_TRACE(R);
+    LLVMContext C;
+    Module M("unwrapped", C);
+    legacy::PassManager PM;
+    ModuleNDNM::run = ModuleNDM2::run = 0;
+    unsigned Callbacks = 0;
+    auto Callback = [&](Module &, function_ref<bool()>) {
+      ++Callbacks;
+      return false;
+    };
+    if (R == PrecedingTransform)
+      PM.add(new ModuleNDM2);
+    if (R == UnknownAnalysis)
+      PM.add(new PrefixAnalysis);
+    EXPECT_EQ(R == Failed, PM.addWrappedModulePipeline(
+                               {},
+                               [&] {
+                                 PM.add(new ModuleNDNM);
+                                 if (R == Nested)
+                                   PM.addWrappedModulePipeline(
+                                       {},
+                                       [&] {
+                                         PM.add(new ModuleNDM2);
+                                         return false;
+                                       },
+                                       Callback);
+                                 return R == Failed;
+                               },
+                               Callback));
+    if (R == TrailingTransform)
+      PM.add(new ModuleNDM2);
+    PM.run(M);
+    EXPECT_EQ(1, ModuleNDNM::run);
+    EXPECT_EQ(R == PrecedingTransform || R == TrailingTransform || R == Nested,
+              ModuleNDM2::run == 1);
+    EXPECT_EQ(0u, Callbacks);
+  }
+}
+
+TEST(PassManager, WrappedModulePipelineAllowsForwardingManagers) {
+  struct Forwarding : legacy::PassManagerBase {
+    legacy::PassManager PM;
+    unsigned Adds = 0;
+    void add(Pass *P) override {
+      ++Adds;
+      PM.add(P);
+    }
+  } Wrapper;
+  LLVMContext C;
+  Module M("forwarded", C);
+  unsigned Callbacks = 0;
+  ModuleNDNM::run = 0;
+  Wrapper.addWrappedModulePipeline(
+      {},
+      [&] {
+        Wrapper.add(new ModuleNDNM);
+        return false;
+      },
+      [&](Module &, function_ref<bool()>) {
+        ++Callbacks;
+        return false;
+      });
+  Wrapper.PM.run(M);
+  EXPECT_EQ(1u, Wrapper.Adds);
+  EXPECT_EQ(0u, Callbacks);
+  EXPECT_EQ(1, ModuleNDNM::run);
+}
+
 TEST(PassManager, RunOnce) {
   LLVMContext Context;
   Module M("test-once", Context);

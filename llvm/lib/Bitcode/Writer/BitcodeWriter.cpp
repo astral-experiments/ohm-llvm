@@ -313,11 +313,14 @@ public:
   ModuleBitcodeWriter(const Module &M, StringTableBuilder &StrtabBuilder,
                       BitstreamWriter &Stream, bool ShouldPreserveUseListOrder,
                       const ModuleSummaryIndex *Index, bool GenerateHash,
-                      ModuleHash *ModHash = nullptr)
+                      ModuleHash *ModHash = nullptr,
+                      DebugObjectSourceMap *SourceMap = nullptr)
       : ModuleBitcodeWriterBase(M, StrtabBuilder, Stream,
                                 ShouldPreserveUseListOrder, Index),
         GenerateHash(GenerateHash), ModHash(ModHash),
-        BitcodeStartBit(Stream.GetCurrentBitNo()) {}
+        BitcodeStartBit(Stream.GetCurrentBitNo()) {
+    VE.setSourceMap(SourceMap);
+  }
 
   /// Emit the current module to the bitstream.
   void write();
@@ -1908,7 +1911,7 @@ void ModuleBitcodeWriter::writeDILocation(const DILocation *N,
     Abbrev = createDILocationAbbrev();
 
   Record.push_back(N->isDistinct());
-  Record.push_back(N->getLine());
+  Record.push_back(VE.debugLine(N, N->getLine()));
   Record.push_back(N->getColumn());
   Record.push_back(VE.getMetadataID(N->getScope()));
   Record.push_back(VE.getMetadataOrNullID(N->getInlinedAt()));
@@ -2004,7 +2007,7 @@ void ModuleBitcodeWriter::writeDIBasicType(const DIBasicType *N,
   Record.push_back(N->getNumExtraInhabitants());
   Record.push_back(N->getDataSizeInBits());
   Record.push_back(VE.getMetadataOrNullID(N->getFile()));
-  Record.push_back(N->getLine());
+  Record.push_back(VE.debugLine(N, N->getLine()));
   Record.push_back(VE.getMetadataOrNullID(N->getScope()));
 
   Stream.EmitRecord(bitc::METADATA_BASIC_TYPE, Record, Abbrev);
@@ -2038,7 +2041,7 @@ void ModuleBitcodeWriter::writeDIFixedPointType(
   WriteWideInt(N->getDenominatorRaw());
 
   Record.push_back(VE.getMetadataOrNullID(N->getFile()));
-  Record.push_back(N->getLine());
+  Record.push_back(VE.debugLine(N, N->getLine()));
   Record.push_back(VE.getMetadataOrNullID(N->getScope()));
 
   Stream.EmitRecord(bitc::METADATA_FIXED_POINT_TYPE, Record, Abbrev);
@@ -2071,7 +2074,7 @@ void ModuleBitcodeWriter::writeDIDerivedType(const DIDerivedType *N,
   Record.push_back(N->getTag());
   Record.push_back(VE.getMetadataOrNullID(N->getRawName()));
   Record.push_back(VE.getMetadataOrNullID(N->getFile()));
-  Record.push_back(N->getLine());
+  Record.push_back(VE.debugLine(N, N->getLine()));
   Record.push_back(VE.getMetadataOrNullID(N->getScope()));
   Record.push_back(VE.getMetadataOrNullID(N->getBaseType()));
   Record.push_back(VE.getMetadataOrNullID(N->getRawSizeInBits()));
@@ -2105,7 +2108,7 @@ void ModuleBitcodeWriter::writeDISubrangeType(const DISubrangeType *N,
   Record.push_back(SizeIsMetadata | (unsigned)N->isDistinct());
   Record.push_back(VE.getMetadataOrNullID(N->getRawName()));
   Record.push_back(VE.getMetadataOrNullID(N->getFile()));
-  Record.push_back(N->getLine());
+  Record.push_back(VE.debugLine(N, N->getLine()));
   Record.push_back(VE.getMetadataOrNullID(N->getScope()));
   Record.push_back(VE.getMetadataOrNullID(N->getRawSizeInBits()));
   Record.push_back(N->getAlignInBits());
@@ -2130,7 +2133,7 @@ void ModuleBitcodeWriter::writeDICompositeType(
   Record.push_back(N->getTag());
   Record.push_back(VE.getMetadataOrNullID(N->getRawName()));
   Record.push_back(VE.getMetadataOrNullID(N->getFile()));
-  Record.push_back(N->getLine());
+  Record.push_back(VE.debugLine(N, N->getLine()));
   Record.push_back(VE.getMetadataOrNullID(N->getScope()));
   Record.push_back(VE.getMetadataOrNullID(N->getBaseType()));
   Record.push_back(VE.getMetadataOrNullID(N->getRawSizeInBits()));
@@ -2179,7 +2182,7 @@ void ModuleBitcodeWriter::writeDIFile(const DIFile *N,
   Record.push_back(VE.getMetadataOrNullID(N->getRawDirectory()));
   if (N->getRawChecksum()) {
     Record.push_back(N->getRawChecksum()->Kind);
-    Record.push_back(VE.getMetadataOrNullID(N->getRawChecksum()->Value));
+    Record.push_back(VE.getFileChecksumID(N));
   } else {
     // Maintain backwards compatibility with the old internal representation of
     // CSK_None in ChecksumKind by writing nulls here when Checksum is None.
@@ -2244,9 +2247,9 @@ void ModuleBitcodeWriter::writeDISubprogram(const DISubprogram *N,
   Record.push_back(VE.getMetadataOrNullID(N->getRawName()));
   Record.push_back(VE.getMetadataOrNullID(N->getRawLinkageName()));
   Record.push_back(VE.getMetadataOrNullID(N->getFile()));
-  Record.push_back(N->getLine());
+  Record.push_back(VE.debugLine(N, N->getLine()));
   Record.push_back(VE.getMetadataOrNullID(N->getType()));
-  Record.push_back(N->getScopeLine());
+  Record.push_back(VE.debugLine(N, N->getScopeLine()));
   Record.push_back(VE.getMetadataOrNullID(N->getContainingType()));
   Record.push_back(N->getSPFlags());
   Record.push_back(N->getVirtualIndex());
@@ -2271,7 +2274,7 @@ void ModuleBitcodeWriter::writeDILexicalBlock(const DILexicalBlock *N,
   Record.push_back(N->isDistinct());
   Record.push_back(VE.getMetadataOrNullID(N->getScope()));
   Record.push_back(VE.getMetadataOrNullID(N->getFile()));
-  Record.push_back(N->getLine());
+  Record.push_back(VE.debugLine(N, N->getLine()));
   Record.push_back(N->getColumn());
 
   Stream.EmitRecord(bitc::METADATA_LEXICAL_BLOCK, Record, Abbrev);
@@ -2320,7 +2323,7 @@ void ModuleBitcodeWriter::writeDIMacro(const DIMacro *N,
                                        unsigned Abbrev) {
   Record.push_back(N->isDistinct());
   Record.push_back(N->getMacinfoType());
-  Record.push_back(N->getLine());
+  Record.push_back(VE.debugLine(N, N->getLine()));
   Record.push_back(VE.getMetadataOrNullID(N->getRawName()));
   Record.push_back(VE.getMetadataOrNullID(N->getRawValue()));
 
@@ -2333,7 +2336,7 @@ void ModuleBitcodeWriter::writeDIMacroFile(const DIMacroFile *N,
                                            unsigned Abbrev) {
   Record.push_back(N->isDistinct());
   Record.push_back(N->getMacinfoType());
-  Record.push_back(N->getLine());
+  Record.push_back(VE.debugLine(N, N->getLine()));
   Record.push_back(VE.getMetadataOrNullID(N->getFile()));
   Record.push_back(VE.getMetadataOrNullID(N->getElements().get()));
 
@@ -2408,7 +2411,7 @@ void ModuleBitcodeWriter::writeDIGlobalVariable(
   Record.push_back(VE.getMetadataOrNullID(N->getRawName()));
   Record.push_back(VE.getMetadataOrNullID(N->getRawLinkageName()));
   Record.push_back(VE.getMetadataOrNullID(N->getFile()));
-  Record.push_back(N->getLine());
+  Record.push_back(VE.debugLine(N, N->getLine()));
   Record.push_back(VE.getMetadataOrNullID(N->getType()));
   Record.push_back(N->isLocalToUnit());
   Record.push_back(N->isDefinition());
@@ -2442,7 +2445,7 @@ void ModuleBitcodeWriter::writeDILocalVariable(
   Record.push_back(VE.getMetadataOrNullID(N->getScope()));
   Record.push_back(VE.getMetadataOrNullID(N->getRawName()));
   Record.push_back(VE.getMetadataOrNullID(N->getFile()));
-  Record.push_back(N->getLine());
+  Record.push_back(VE.debugLine(N, N->getLine()));
   Record.push_back(VE.getMetadataOrNullID(N->getType()));
   Record.push_back(N->getArg());
   Record.push_back(N->getFlags());
@@ -2461,7 +2464,7 @@ void ModuleBitcodeWriter::writeDILabel(
   Record.push_back(VE.getMetadataOrNullID(N->getScope()));
   Record.push_back(VE.getMetadataOrNullID(N->getRawName()));
   Record.push_back(VE.getMetadataOrNullID(N->getFile()));
-  Record.push_back(N->getLine());
+  Record.push_back(VE.debugLine(N, N->getLine()));
   Record.push_back(N->getColumn());
   Record.push_back(N->getCoroSuspendIdx().has_value()
                        ? (uint64_t)N->getCoroSuspendIdx().value()
@@ -2500,7 +2503,7 @@ void ModuleBitcodeWriter::writeDIObjCProperty(const DIObjCProperty *N,
   Record.push_back(N->isDistinct());
   Record.push_back(VE.getMetadataOrNullID(N->getRawName()));
   Record.push_back(VE.getMetadataOrNullID(N->getFile()));
-  Record.push_back(N->getLine());
+  Record.push_back(VE.debugLine(N, N->getLine()));
   Record.push_back(VE.getMetadataOrNullID(N->getRawSetterName()));
   Record.push_back(VE.getMetadataOrNullID(N->getRawGetterName()));
   Record.push_back(N->getAttributes());
@@ -2517,7 +2520,7 @@ void ModuleBitcodeWriter::writeDIImportedEntity(
   Record.push_back(N->getTag());
   Record.push_back(VE.getMetadataOrNullID(N->getScope()));
   Record.push_back(VE.getMetadataOrNullID(N->getEntity()));
-  Record.push_back(N->getLine());
+  Record.push_back(VE.debugLine(N, N->getLine()));
   Record.push_back(VE.getMetadataOrNullID(N->getRawName()));
   Record.push_back(VE.getMetadataOrNullID(N->getRawFile()));
   Record.push_back(VE.getMetadataOrNullID(N->getElements().get()));
@@ -2582,7 +2585,7 @@ void ModuleBitcodeWriter::writeMetadataStrings(
   {
     BitstreamWriter W(Blob);
     for (const Metadata *MD : Strings)
-      W.EmitVBR(cast<MDString>(MD)->getLength(), 6);
+      W.EmitVBR(VE.debugString(cast<MDString>(MD)).size(), 6);
     W.FlushToWord();
   }
 
@@ -2591,7 +2594,7 @@ void ModuleBitcodeWriter::writeMetadataStrings(
 
   // Add the strings to the blob.
   for (const Metadata *MD : Strings)
-    Blob.append(cast<MDString>(MD)->getString());
+    Blob.append(VE.debugString(cast<MDString>(MD)));
 
   // Emit the final record.
   Stream.EmitRecordWithBlob(createMetadataStringsAbbrev(), Record, Blob);
@@ -3861,7 +3864,7 @@ void ModuleBitcodeWriter::writeFunction(
           // Just repeat the same debug loc as last time.
           Stream.EmitRecord(bitc::FUNC_CODE_DEBUG_LOC_AGAIN, Vals);
         } else {
-          Vals.push_back(DL->getLine());
+          Vals.push_back(VE.debugLine(DL, DL->getLine()));
           Vals.push_back(DL->getColumn());
           Vals.push_back(VE.getMetadataOrNullID(DL->getScope()));
           Vals.push_back(VE.getMetadataOrNullID(DL->getInlinedAt()));
@@ -5692,6 +5695,15 @@ void BitcodeWriter::writeModule(const Module &M,
                                 bool ShouldPreserveUseListOrder,
                                 const ModuleSummaryIndex *Index,
                                 bool GenerateHash, ModuleHash *ModHash) {
+  writeModuleImpl(M, ShouldPreserveUseListOrder, Index, GenerateHash, ModHash,
+                  nullptr);
+}
+
+void BitcodeWriter::writeModuleImpl(const Module &M,
+                                    bool ShouldPreserveUseListOrder,
+                                    const ModuleSummaryIndex *Index,
+                                    bool GenerateHash, ModuleHash *ModHash,
+                                    DebugObjectSourceMap *SourceMap) {
   assert(!WroteStrtab);
 
   // The Mods vector is used by irsymtab::build, which requires non-const
@@ -5703,8 +5715,26 @@ void BitcodeWriter::writeModule(const Module &M,
 
   ModuleBitcodeWriter ModuleWriter(M, StrtabBuilder, *Stream,
                                    ShouldPreserveUseListOrder, Index,
-                                   GenerateHash, ModHash);
+                                   GenerateHash, ModHash, SourceMap);
   ModuleWriter.write();
+}
+
+bool llvm::writeDebugObjectBitcode(const Module &M,
+                                   SmallVectorImpl<char> &Buffer,
+                                   DebugObjectSourceMap *Map) {
+  // Use-list ordering can affect machine-code generation. If the process
+  // explicitly forbids writing it, this compilation cannot supply a key.
+  if (!M.isMaterialized() || !M.getTargetTriple().isOSBinFormatELF() ||
+      (PreserveBitcodeUseListOrder.getNumOccurrences() &&
+       !PreserveBitcodeUseListOrder))
+    return false;
+  if (Map)
+    Map->prepare();
+  BitcodeWriter Writer(Buffer);
+  Writer.writeModuleImpl(M, true, nullptr, false, nullptr, Map);
+  Writer.writeSymtab();
+  Writer.writeStrtab();
+  return !Map || Map->Valid;
 }
 
 void BitcodeWriter::writeIndex(
