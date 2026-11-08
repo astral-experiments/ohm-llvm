@@ -1107,7 +1107,7 @@ bool FastISel::lowerCallTo(CallLoweringInfo &CLI) {
   return true;
 }
 
-bool FastISel::lowerCall(const CallInst *CI) {
+MachineInstr *FastISel::lowerCall(const CallBase *CI) {
   FunctionType *FuncTy = CI->getFunctionType();
   Type *RetTy = CI->getType();
 
@@ -1140,12 +1140,7 @@ bool FastISel::lowerCall(const CallInst *CI) {
   CLI.setCallee(RetTy, FuncTy, CI->getCalledOperand(), std::move(Args), *CI)
       .setTailCall(IsTailCall);
 
-  if (lowerCallTo(CLI)) {
-    diagnoseDontCall(*CI);
-    return true;
-  }
-
-  return false;
+  return lowerCallTo(CLI) ? CLI.Call : nullptr;
 }
 
 bool FastISel::selectCall(const User *I) {
@@ -1184,7 +1179,10 @@ bool FastISel::selectCall(const User *I) {
   if (const auto *II = dyn_cast<IntrinsicInst>(Call))
     return selectIntrinsicCall(II);
 
-  return lowerCall(Call);
+  if (!lowerCall(Call))
+    return false;
+  diagnoseDontCall(*Call);
+  return true;
 }
 
 void FastISel::handleDbgInfo(const Instruction *II) {
