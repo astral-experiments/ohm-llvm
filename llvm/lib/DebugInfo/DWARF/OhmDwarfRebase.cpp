@@ -54,6 +54,27 @@ std::string joinPath(StringRef Directory, StringRef File) {
   return Path.str().str();
 }
 
+// The x86 MC writer chooses from these encodings using the address delta
+// in minimum-instruction units and the signed line delta. A change between
+// forms can preserve every decoded row while differing from fresh MC output.
+enum class LineForm { AdvanceLine, Copy, Special, ConstAddPC, AdvancePC };
+LineForm lineForm(int64_t Delta, uint64_t Address, int Base, unsigned Range,
+                  unsigned OpcodeBase) {
+  const int64_t Biased = Delta - Base;
+  if (Biased < 0 || Biased >= Range || Biased + OpcodeBase > 255)
+    return LineForm::AdvanceLine;
+  if (!Delta && !Address)
+    return LineForm::Copy;
+  const unsigned LastSpecialAddress = (255 - OpcodeBase) / Range;
+  const unsigned DirectLimit = (255 - OpcodeBase - unsigned(Biased)) / Range;
+  if (Address <= DirectLimit)
+    return LineForm::Special;
+  if (Address >= LastSpecialAddress &&
+      Address - LastSpecialAddress <= DirectLimit)
+    return LineForm::ConstAddPC;
+  return LineForm::AdvancePC;
+}
+
 class Cursor {
   StringRef Data;
   std::string &Problem;
@@ -370,6 +391,8 @@ class Rewriter {
     int64_t Before = 1, After = 1;
     std::optional<Advance> Last;
     bool RepeatedAdvance = false;
+    uint64_t Address = 0;
+    bool NonScaledAddress = false;
     bool Ended = false;
     auto move = [&](int64_t Delta) {
       if (AddOverflow(Before, Delta, Before) ||
@@ -395,6 +418,8 @@ class Rewriter {
         } else if (Ext == dwarf::DW_LNE_set_address) {
           if (Len != 9)
             return fail("unsupported set_address width");
+          Address = 0;
+          NonScaledAddress = false;
           AddressOperands.insert(Ops.At);
           Ops.fixed(8);
         } else if (Ext == dwarf::DW_LNE_set_discriminator) {
@@ -404,6 +429,7 @@ class Rewriter {
         if (Ops.At != SubEnd)
           return fail("invalid extended opcode length");
       } else if (Op >= OpBase) {
+        Address = SaturatingAdd(Address, uint64_t((Op - OpBase) / Range));
         if (!move(LineBase + int((Op - OpBase) % Range)))
           return false;
         Row = true;
@@ -413,6 +439,8 @@ class Rewriter {
           Row = true;
           break;
         case dwarf::DW_LNS_advance_pc:
+          Address = SaturatingAdd(Address, Ops.uleb());
+          break;
         case dwarf::DW_LNS_set_column:
         case dwarf::DW_LNS_set_isa:
           Ops.uleb();
@@ -431,12 +459,17 @@ class Rewriter {
           if (!File || File >= U.Files.size())
             return fail("invalid line-program file");
           break;
-        case dwarf::DW_LNS_fixed_advance_pc:
-          Ops.fixed(2);
+        case dwarf::DW_LNS_fixed_advance_pc: {
+          uint64_t Bytes = Ops.fixed(2);
+          NonScaledAddress |= Bytes % Min != 0;
+          Address = SaturatingAdd(Address, Bytes / Min);
+          break;
+        }
+        case dwarf::DW_LNS_const_add_pc:
+          Address = SaturatingAdd(Address, uint64_t((255 - OpBase) / Range));
           break;
         case dwarf::DW_LNS_negate_stmt:
         case dwarf::DW_LNS_set_basic_block:
-        case dwarf::DW_LNS_const_add_pc:
         case dwarf::DW_LNS_set_prologue_end:
         case dwarf::DW_LNS_set_epilogue_begin:
           break;
@@ -456,6 +489,18 @@ class Rewriter {
           Want = I->second;
       int64_t Change = Want - After;
       if (Change) {
+        const int64_t RowDelta =
+            Op >= OpBase ? LineBase + int((Op - OpBase) % Range) : 0;
+        int64_t OldDelta, NewDelta;
+        if (RepeatedAdvance || NonScaledAddress ||
+            AddOverflow(Last ? Last->Value : int64_t(0), RowDelta, OldDelta) ||
+            AddOverflow(OldDelta, Change, NewDelta))
+          return fail("unsupported line program advance");
+        auto BeforeForm = lineForm(OldDelta, Address, LineBase, Range, OpBase);
+        auto AfterForm = lineForm(NewDelta, Address, LineBase, Range, OpBase);
+        if (BeforeForm != AfterForm ||
+            (Last && (BeforeForm != LineForm::AdvanceLine || RowDelta)))
+          return fail("row would change the native MC line opcode form");
         if (Last) {
           int64_t V;
           if (AddOverflow(Last->Value, Change, V))
@@ -466,19 +511,8 @@ class Rewriter {
                           reinterpret_cast<uint8_t *>(
                               Out.Bytes.data() + Line->Offset + Last->Begin));
           } else {
-            // MC emits a separate advance_line and resets its pending line
-            // delta to zero when the requested delta is outside the special
-            // opcode range. Preserve that same encoding decision on both sides.
-            auto NeedsAdvance = [&](int64_t D) {
-              return D < LineBase || D >= int64_t(LineBase) + Range;
-            };
-            const bool ZeroRowDelta =
-                Op == dwarf::DW_LNS_copy ||
-                (Op >= OpBase && LineBase + int((Op - OpBase) % Range) == 0);
-            if (RepeatedAdvance || !ZeroRowDelta ||
-                !NeedsAdvance(Last->Value) || !NeedsAdvance(V) ||
-                getSLEB128Size(Last->Value) != OldWidth)
-              return fail("variable line operand requires a different opcode");
+            if (getSLEB128Size(Last->Value) != OldWidth)
+              return fail("noncanonical variable line operand");
             uint8_t Encoded[16];
             const auto End = encodeSLEB128(V, Encoded);
             Resized.push_back(
@@ -502,6 +536,8 @@ class Rewriter {
       }
       Last.reset();
       RepeatedAdvance = false;
+      Address = 0;
+      NonScaledAddress = false;
       if (EndSequence) {
         Before = After = 1;
         File = 1;
