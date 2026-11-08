@@ -12,11 +12,28 @@
 #include "gtest/gtest.h"
 #if defined(__linux__) && defined(__x86_64__)
 #include <dlfcn.h>
+#if defined(__GLIBC__)
+#include <link.h>
+#endif
 #endif
 
 using namespace llvm;
 
 #if defined(__linux__) && defined(__x86_64__)
+#if defined(__GLIBC__)
+TEST(OhmDebugObjectCache, DetectsCompilerImageLoadsAndUnloads) {
+  auto Before = ohm::getDebugObjectImageGeneration();
+  ASSERT_TRUE(Before);
+  void *Library = ::dlmopen(LM_ID_NEWLM, "libm.so.6", RTLD_NOW | RTLD_LOCAL);
+  ASSERT_NE(Library, nullptr);
+  auto Loaded = ohm::getDebugObjectImageGeneration();
+  EXPECT_EQ(::dlclose(Library), 0);
+  EXPECT_NE(Before, Loaded);
+  EXPECT_NE(Loaded, ohm::getDebugObjectImageGeneration());
+  EXPECT_NE(Before, ohm::getDebugObjectImageGeneration());
+}
+#endif
+
 TEST(OhmDebugObjectCache, IncludesOrdinaryLinkedLibraries) {
   Dl_info Lib{};
   ASSERT_NE(::dladdr(::dlsym(RTLD_DEFAULT, "dlopen"), &Lib), 0);

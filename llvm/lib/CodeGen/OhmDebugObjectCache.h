@@ -14,7 +14,9 @@
 #include "llvm/ADT/StringRef.h"
 #include "llvm/IR/Module.h"
 #include <cstdint>
+#include <optional>
 #include <string>
+#include <utility>
 namespace llvm {
 class CodeGenTargetMachineImpl;
 class raw_svector_ostream;
@@ -27,6 +29,8 @@ struct DebugObjectImage {
 /// File-backed images in loader order, with an empty pathname for the
 /// executable.
 SmallVector<DebugObjectImage> getDebugObjectImages();
+using DebugObjectImageGeneration = std::pair<uint64_t, uint64_t>;
+std::optional<DebugObjectImageGeneration> getDebugObjectImageGeneration();
 #endif
 /// Small machine inputs cost less to compile than to certify and retain.
 inline bool isLargeDebugObjectInput(const Module &M) {
