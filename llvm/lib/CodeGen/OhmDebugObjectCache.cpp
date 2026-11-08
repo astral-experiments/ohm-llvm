@@ -37,6 +37,24 @@
 
 using namespace llvm;
 
+#if defined(__linux__) && defined(__x86_64__)
+SmallVector<ohm::DebugObjectImage> llvm::ohm::getDebugObjectImages() {
+  SmallVector<DebugObjectImage> Images;
+  ::dl_iterate_phdr(
+      [](dl_phdr_info *I, size_t, void *Out) {
+        // The kernel supplies the vDSO without a backing file.
+        if (I->dlpi_addr && I->dlpi_addr == ::getauxval(AT_SYSINFO_EHDR))
+          return 0;
+        static_cast<decltype(Images) *>(Out)->push_back(
+            {I->dlpi_name ? I->dlpi_name : "",
+             reinterpret_cast<uintptr_t>(I->dlpi_phdr)});
+        return 0;
+      },
+      &Images);
+  return Images;
+}
+#endif
+
 namespace {
 #if defined(__linux__) && defined(__x86_64__)
 constexpr StringLiteral Magic("OHMELFO2");
@@ -127,10 +145,6 @@ std::string stamp(const struct stat &S) {
           Twine(S.st_ctim.tv_sec) + "." + Twine(S.st_ctim.tv_nsec))
       .str();
 }
-struct LoadedComponent {
-  std::string Path;
-  uintptr_t Address;
-};
 
 // An atomic toolchain update can replace a pathname after its old DSO has
 // already been loaded. Match the open file to the mapped image before trusting
@@ -157,8 +171,9 @@ bool sameMappedFile(StringRef Maps, uintptr_t Address, const struct stat &S) {
   }
   return false;
 }
-std::optional<std::string> componentIdentity(const LoadedComponent &Component,
-                                             StringRef Maps, StringRef Cache) {
+std::optional<std::string>
+componentIdentity(const ohm::DebugObjectImage &Component, StringRef Maps,
+                  StringRef Cache) {
   StringRef Path = Component.Path;
   int FD = ::open(Component.Path.c_str(), O_RDONLY | O_CLOEXEC);
   if (FD < 0)
@@ -311,36 +326,30 @@ struct Invocation {
     auto Maps = MemoryBuffer::getFileAsStream("/proc/self/maps");
     if (!Maps)
       return;
-    SmallVector<LoadedComponent, 3> Binaries;
-    ::dl_iterate_phdr(
-        [](dl_phdr_info *I, size_t, void *Out) {
-          StringRef P(I->dlpi_name ? I->dlpi_name : "");
-          StringRef N = sys::path::filename(P);
-          if (P.empty() || N.starts_with("librustc_driver-") ||
-              N.starts_with("libLLVM.so."))
-            static_cast<SmallVector<LoadedComponent, 3> *>(Out)->push_back(
-                {P.str(), reinterpret_cast<uintptr_t>(I->dlpi_phdr)});
-          return 0;
-        },
-        &Binaries);
-    if (Binaries.size() != 3 || !Binaries.front().Path.empty())
+    auto Binaries = ohm::getDebugObjectImages();
+    if (Binaries.empty() || !Binaries.front().Path.empty())
       return;
     Binaries.front().Path = Args[0].str();
     BLAKE3 Key;
-    frame(Key, "ohm-debug-object-cache-v1");
+    frame(Key, "ohm-debug-object-cache-images-v2");
     frame(Key, All);
     frame(Key, Cwd);
-    llvm::sort(Binaries,
-               [](const LoadedComponent &L, const LoadedComponent &R) {
-                 return L.Path < R.Path;
-               });
+    unsigned Drivers = 0, LLVMs = 0;
+    // A linked compiler extension can change machine code even when the IR and
+    // the main compiler binaries are identical. ELF symbol resolution also
+    // depends on the order in which the loader makes these images visible.
     for (const auto &C : Binaries) {
+      StringRef Name = sys::path::filename(C.Path);
+      Drivers += Name.starts_with("librustc_driver-");
+      LLVMs += Name.starts_with("libLLVM.so.");
       auto ID = componentIdentity(C, (*Maps)->getBuffer(), IDs);
       if (!ID)
         return;
       frame(Key, C.Path);
       frame(Key, *ID);
     }
+    if (Drivers != 1 || LLVMs != 1)
+      return;
     Namespace = toHex(Key.final(), true);
     Entries = joinPath(Base, "objects");
     Blobs = joinPath(Base, "sources");
