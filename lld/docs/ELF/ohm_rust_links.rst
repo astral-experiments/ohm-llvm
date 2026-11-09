@@ -14,7 +14,8 @@ The linker verifies the files actually mapped into its process before accepting
 or recording a result. The supported runtime consists of the linker, its LLVM
 library and system libraries used by the Ohm Linux distribution. Additional
 providers and libraries changed since the process started use the ordinary path.
-LLD hashes small runtime libraries when a read lease is unavailable. A provider
+Developer-owned providers require a read lease. LLD can instead hash the bytes
+of small installed system libraries the developer cannot write. A provider
 larger than 32 MiB without a stable generation selects the ordinary path.
 
 Native objects, small or recently changed rlibs, scripts and shared libraries

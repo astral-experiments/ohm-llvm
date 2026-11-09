@@ -55,24 +55,29 @@ Stamp generation(const struct stat &st) {
           st.st_mode};
 }
 
-bool hasStableGeneration(int fd, const struct stat &st) {
-  if (st.st_size < 64 * 1024 || st.st_ctim.tv_sec + 2 >= time(nullptr))
-    return false;
+enum class LeaseProof { Stable, Busy, Unavailable };
+
+LeaseProof checkReadLease(int fd, const struct stat &st) {
   // Success excludes existing writable descriptors and shared writable
   // mappings, even when their owners closed the original descriptor. A later
   // writer's first modification must then update this older timestamp. Take
   // the lease only around fstat; a future link checks the generation again.
-  if (fcntl(fd, F_SETSIG, SIGURG) < 0 || fcntl(fd, F_SETLEASE, F_RDLCK) < 0)
-    return false;
+  if (fcntl(fd, F_SETSIG, SIGURG) < 0)
+    return LeaseProof::Unavailable;
+  if (fcntl(fd, F_SETLEASE, F_RDLCK) < 0)
+    return errno == EAGAIN || errno == EBUSY ? LeaseProof::Busy
+                                             : LeaseProof::Unavailable;
   struct stat observed;
   bool stable = !fstat(fd, &observed) && generation(st) == generation(observed);
-  return !fcntl(fd, F_SETLEASE, F_UNLCK) && stable;
+  return !fcntl(fd, F_SETLEASE, F_UNLCK) && stable ? LeaseProof::Stable
+                                                   : LeaseProof::Busy;
 }
 
 struct LoadedImages {
   BLAKE3 &hash;
   ArrayRef<StringRef> maps;
   int64_t processStart;
+  bool sawLLVM = false;
 };
 
 // Initializers may use a provider before LLD even parses its response files.
@@ -91,11 +96,15 @@ int64_t processStartTime() {
   return time(nullptr) - uptime.tv_sec + int64_t(startTicks / ticksPerSecond);
 }
 
+bool isSystemLibrary(StringRef path) {
+  return path.starts_with("/usr/lib/") || path.starts_with("/lib/") ||
+         path.starts_with("/usr/lib64/") || path.starts_with("/lib64/");
+}
+
 bool knownProvider(StringRef name, StringRef path) {
   if (name.empty() || sys::path::filename(name).starts_with("libLLVM.so."))
     return true;
-  if (!path.starts_with("/usr/lib/") && !path.starts_with("/lib/") &&
-      !path.starts_with("/usr/lib64/") && !path.starts_with("/lib64/"))
+  if (!isSystemLibrary(path))
     return false;
   return is_contained({StringRef("ld-linux-x86-64.so.2"),
                        StringRef("libc.so.6"), StringRef("libdl.so.2"),
@@ -110,15 +119,21 @@ bool knownProvider(StringRef name, StringRef path) {
 // providers from the opened file, even if an existing writable mapping can
 // change their bytes without updating ctime. Large unprovable providers make
 // the normal linker cheaper than repeatedly hashing the compiler backend.
-bool hashProvider(BLAKE3 &hash, int fd, const struct stat &st) {
+bool hashProvider(BLAKE3 &hash, int fd, const struct stat &st, StringRef path) {
   auto stamp = generation(st);
   field(hash,
         StringRef(reinterpret_cast<const char *>(stamp.data()), sizeof(stamp)));
-  if (hasStableGeneration(fd, st)) {
+  LeaseProof lease = checkReadLease(fd, st);
+  if (lease == LeaseProof::Stable) {
     field(hash, "generation");
     return true;
   }
-  if (st.st_size < 0 || st.st_size > 32 * 1024 * 1024)
+  // A developer-owned provider must exclude open writers when its generation
+  // is captured. Two byte samples can both miss a transient mapping update.
+  // Use the content fallback only for non-writable installed system libraries.
+  if (lease == LeaseProof::Busy || !isSystemLibrary(path) ||
+      st.st_uid == geteuid() || (st.st_mode & (S_IWGRP | S_IWOTH)) ||
+      st.st_size < 0 || st.st_size > 32 * 1024 * 1024)
     return false;
   BLAKE3 contents;
   uint8_t data[16384];
@@ -146,6 +161,11 @@ int hashLoadedImage(dl_phdr_info *info, size_t, void *opaque) {
   // The boot ID already identifies the kernel's optional vDSO.
   if (StringRef(info->dlpi_name) == "linux-vdso.so.1")
     return 0;
+  if (sys::path::filename(info->dlpi_name).starts_with("libLLVM.so.")) {
+    if (images.sawLLVM)
+      return 1;
+    images.sawLLVM = true;
+  }
   auto headers = ArrayRef(info->dlpi_phdr, info->dlpi_phnum);
   auto load = llvm::find_if(
       headers, [](const auto &p) { return p.p_type == PT_LOAD && p.p_memsz; });
@@ -188,7 +208,7 @@ int hashLoadedImage(dl_phdr_info *info, size_t, void *opaque) {
         return 1;
     }
     field(images.hash, path);
-    return hashProvider(images.hash, fd, st) ? 0 : 1;
+    return hashProvider(images.hash, fd, st, path) ? 0 : 1;
   }
   return 1;
 }
@@ -366,7 +386,9 @@ ErrorOr<std::unique_ptr<MemoryBuffer>> RustTestLink::readFile(StringRef path) {
   auto buffer = MemoryBuffer::getOpenFile(fd, path, st.st_size, false, false);
   // Recently written files may still share the filesystem's current timestamp
   // tick. Authenticate their bytes, as for all native objects and scripts.
-  if (buffer && hasStableGeneration(fd, st)) {
+  if (buffer && st.st_size >= 64 * 1024 &&
+      st.st_ctim.tv_sec + 2 < time(nullptr) &&
+      checkReadLease(fd, st) == LeaseProof::Stable) {
     archives[buffer->get()] = generation(st);
     return buffer;
   }
