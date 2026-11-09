@@ -1,0 +1,83 @@
+# REQUIRES: x86, system-linux
+# RUN: rm -rf %t && split-file %s %t
+# RUN: llvm-mc -triple=x86_64-linux -filetype=obj %t/start.s -o %t/entry.o
+# RUN: llvm-mc -triple=x86_64-linux -filetype=obj %t/empty.s -o %t/empty.o
+# RUN: llvm-mc -triple=x86_64-linux -defsym=V=17 -filetype=obj %t/value.s -o %t/value.o
+# RUN: llvm-ar rcs %t/libfixture.rlib %t/value.o
+# RUN: llvm-mc -triple=x86_64-linux -defsym=V=29 -filetype=obj %t/value.s -o %t/value.o
+# RUN: llvm-ar rcs %t/replacement.rlib %t/value.o
+# RUN: %python %t/check.py ld.lld %t
+
+#--- start.s
+.globl _start
+_start:
+  call value
+  mov %eax, %edi
+  mov $60, %eax
+  syscall
+.section .note.GNU-stack,"",@progbits
+
+#--- value.s
+.globl value
+value:
+  mov $V, %eax
+  ret
+.section .rodata.unused,"a",@progbits
+.fill 75000,1,0
+.section .note.GNU-stack,"",@progbits
+
+#--- empty.s
+.section .note.GNU-stack,"",@progbits
+
+#--- check.py
+import errno
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import time
+
+linker, directory = sys.argv[1:]
+root = Path(directory).resolve()
+out = root / 'harness-0123456789abcdef'
+receipt = root / (out.name + '.lld-relink')
+objects = root / (out.name + '.rlink-objects')
+objects.mkdir()
+entry = (root / 'entry.o').rename(objects / 'harness.main.1234567.rcgu.o')
+scratch = root / 'rustc123456'
+scratch.mkdir()
+symbols = (root / 'empty.o').rename(scratch / 'symbols.o')
+archive = root / 'libfixture.rlib'
+gate = root / 'barrier.o'
+os.mkfifo(gate)
+env = dict(os.environ, CARGO_PKG_NAME='harness', CARGO_MANIFEST_DIR=str(root))
+env.pop('LLD_IN_TEST', None)
+args = [linker, '-m', 'elf_x86_64', '-pie', '--gc-sections', '-o', out,
+        symbols, entry, archive, gate, archive]
+time.sleep(3.1)
+with subprocess.Popen(args, env=env) as process:
+    deadline = time.monotonic() + 30
+    while True:
+        try:
+            fd = os.open(gate, os.O_WRONLY | os.O_NONBLOCK)
+            break
+        except OSError as err:
+            if err.errno != errno.ENXIO or process.poll() is not None or time.monotonic() >= deadline:
+                process.kill()
+                raise
+            time.sleep(0.01)
+    with os.fdopen(fd, 'wb') as stream:
+        # The first archive was opened. Replace it before the second open.
+        os.replace(root / 'replacement.rlib', archive)
+        time.sleep(3.1)
+        stream.write(symbols.read_bytes())
+    assert process.wait(timeout=30) == 0
+first = out.read_bytes()
+gate.unlink()
+shutil.copyfile(symbols, gate)
+subprocess.run(args, env=env, check=True)
+repeated = out.read_bytes()
+receipt.unlink(missing_ok=True)
+subprocess.run(args, env=env, check=True)
+assert repeated == out.read_bytes() and first != repeated

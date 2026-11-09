@@ -21,6 +21,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import time
 
 linker, directory = sys.argv[1:]
 root = Path(directory).resolve()
@@ -43,8 +44,9 @@ def link(*options):
                    env=env, check=True)
 
 receipt.unlink(missing_ok=True)
+time.sleep(max(0, Path(shutil.which(linker)).stat().st_ctime + 3.1 - time.time()))
 link()
-assert receipt.stat().st_size == 104
+assert receipt.stat().st_size == 112
 expected = output.read_bytes()
 os.utime(receipt, (1, 1))
 # A normal new link rewrites the receipt. A successful reuse keeps it.
@@ -61,3 +63,20 @@ assert receipt.stat().st_mtime != 1 and output.read_bytes() == expected
 side = root / 'harness.map'
 link('-Map=' + str(side))
 assert side.is_file() and side.stat().st_size > 0
+
+# A user's existing file can itself be one of the link inputs.
+receipt.unlink()
+shutil.copy(root / 'empty.o', receipt)
+unrelated = receipt.read_bytes()
+link(receipt)
+assert receipt.read_bytes() == unrelated
+
+receipt.unlink()
+receipt.symlink_to(root / 'empty.o')
+link()
+assert receipt.is_symlink() and receipt.read_bytes() == unrelated
+
+receipt.unlink()
+env['LD_PRELOAD'] = ''
+link()
+assert not receipt.exists()

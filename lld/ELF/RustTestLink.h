@@ -9,7 +9,7 @@
 #ifndef LLD_ELF_RUSTTESTLINK_H
 #define LLD_ELF_RUSTTESTLINK_H
 
-#include "llvm/ADT/StringMap.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include <array>
 
@@ -37,8 +37,9 @@ public:
 
 private:
   using Generation = std::array<uint64_t, 6>;
-  std::string output, objectDir, scratchName, argsHash, key, outputHash;
-  llvm::StringMap<Generation> archives;
+  std::string output, objectDir, scratchName, imageHash, argsHash, key,
+      outputHash;
+  llvm::DenseMap<const llvm::MemoryBuffer *, Generation> archives;
   std::string normalize(llvm::StringRef path) const;
   bool inputsStillPresent() const;
   std::string inputKey(Ctx &ctx) const;
