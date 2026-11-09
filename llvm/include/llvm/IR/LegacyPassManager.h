@@ -58,6 +58,11 @@ public:
   bool addWrappedModulePipeline(ArrayRef<const void *> AllowedPrefix,
                                 function_ref<bool()> Build,
                                 ModuleExecutor Execute);
+
+  /// Check the effective immutable pass instances installed before Build.
+  bool addWrappedModulePipelineWithPrefixCheck(
+      function_ref<bool(const Pass &)> AcceptPrefix, function_ref<bool()> Build,
+      ModuleExecutor Execute);
 };
 
 /// PassManager manages ModulePassManagers
