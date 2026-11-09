@@ -263,18 +263,128 @@ static void predictValueUseListOrder(const Value *V, const Function *F,
   }
 }
 
+// Most values only have users described by the normal use-list records. For
+// an unreferenced literal aggregate, record its complete operand tuple, then
+// record its exact position among the ordinary users of every affected value.
+// Number leaves on first encounter in (value ID, actual use-list) order.
+static bool encodeMachineLeaves(SmallVectorImpl<const Value *> &Affected,
+                                const OrderMap &OM,
+                                SmallVectorImpl<uint64_t> &Words) {
+  if (Affected.empty())
+    return true;
+  llvm::sort(Affected, [&](const Value *L, const Value *R) {
+    return OM.lookup(L).first < OM.lookup(R).first;
+  });
+
+  enum Word {
+    KnownUser,
+    NewLeaf,
+    PreviousLeaf,
+    NumberedOperand,
+    LiteralInteger,
+    UndefInteger,
+    PoisonInteger,
+    UndefPointer,
+    PoisonPointer,
+    ArrayLeaf,
+    StructLeaf,
+    PackedStructLeaf
+  };
+  DenseMap<const User *, unsigned> LeafIDs;
+  auto EncodeOperand = [&](const Value *V) {
+    if (unsigned ID = OM.lookup(V).first) {
+      Words.append({NumberedOperand, ID});
+      return true;
+    }
+    // An auxiliary operand with a use list would introduce another
+    // unnumbered graph. Only self-describing scalar data are supported.
+    if (V->hasUseList())
+      return false;
+    if (const auto *CI = dyn_cast<ConstantInt>(V)) {
+      const APInt &N = CI->getValue();
+      if (N.getBitWidth() > 256)
+        return false;
+      Words.append({LiteralInteger, N.getBitWidth()});
+      Words.append(N.getRawData(), N.getRawData() + N.getNumWords());
+      return true;
+    }
+    if (!isa<UndefValue>(V))
+      return false;
+    bool Poison = isa<PoisonValue>(V);
+    if (const auto *IT = dyn_cast<IntegerType>(V->getType()))
+      Words.append({Poison ? PoisonInteger : UndefInteger, IT->getBitWidth()});
+    else if (const auto *PT = dyn_cast<PointerType>(V->getType()))
+      Words.append(
+          {Poison ? PoisonPointer : UndefPointer, PT->getAddressSpace()});
+    else
+      return false;
+    return true;
+  };
+
+  Words.push_back(Affected.size());
+  for (const Value *V : Affected) {
+    Words.push_back(OM.lookup(V).first);
+    size_t Count = Words.size();
+    Words.push_back(0);
+    for (const Use &Use : V->uses()) {
+      if (Words.size() >= 131072)
+        return false;
+      ++Words[Count];
+      const User *U = Use.getUser();
+      Words.push_back(Use.getOperandNo());
+      if (unsigned ID = OM.lookup(U).first) {
+        Words.append({KnownUser, ID});
+        continue;
+      }
+      auto [It, Inserted] = LeafIDs.try_emplace(U, LeafIDs.size());
+      if (!Inserted) {
+        Words.append({PreviousLeaf, It->second});
+        continue;
+      }
+      if (U->getNumOperands() > 256 || !U->use_empty() || U->isUsedByMetadata())
+        return false;
+      if (const auto *Struct = dyn_cast<ConstantStruct>(U)) {
+        if (!Struct->getType()->isLiteral())
+          return false;
+        Words.append({NewLeaf, Struct->getType()->isPacked() ? PackedStructLeaf
+                                                             : StructLeaf});
+      } else if (isa<ConstantArray>(U))
+        Words.append({NewLeaf, ArrayLeaf});
+      else
+        return false;
+      Words.push_back(U->getNumOperands());
+      for (const Value *Op : U->operands())
+        if (!EncodeOperand(Op))
+          return false;
+    }
+  }
+  return true;
+}
+
 // The ordinary bitcode writer can omit users that live only in this
 // LLVMContext. Machine passes may consult them, for example when AsmPrinter
 // chooses a GOT-relative relocation for an initializer with exactly one use.
-static bool hasCompleteMachineUses(const Module &M, const OrderMap &OM) {
+static bool hasCompleteMachineUses(const Module &M, const OrderMap &OM,
+                                   SmallVectorImpl<uint64_t> &Leaves) {
+  SmallVector<const Value *, 8> Affected;
   auto UsesAreEncoded = [&](const Value *V) {
     if (!V->hasUseList())
       return true;
-    bool SawUse = false;
+    bool SawUse = false, HasLeaf = false;
     for (const User *U : V->users()) {
-      if (!OM.lookup(U).first || (SawUse && !OM.lookup(V).second))
+      if (SawUse && !OM.lookup(V).second)
         return false;
+      if (!OM.lookup(U).first) {
+        if (!OM.lookup(V).first || !isa<ConstantArray, ConstantStruct>(U))
+          return false;
+        HasLeaf = true;
+      }
       SawUse = true;
+    }
+    if (HasLeaf) {
+      if (Affected.size() >= 4096)
+        return false;
+      Affected.push_back(V);
     }
     return true;
   };
@@ -354,11 +464,11 @@ static bool hasCompleteMachineUses(const Module &M, const OrderMap &OM) {
         AddValue(VAM->getValue());
     }
   }
-  return true;
+  return encodeMachineLeaves(Affected, OM, Leaves);
 }
 
 static UseListOrderStack predictUseListOrder(const Module &M,
-                                             bool *CompleteUses) {
+                                             MachineUseState *Uses) {
   OrderMap OM = orderModule(M);
 
   // Use-list orders need to be serialized after all the users have been added
@@ -429,8 +539,8 @@ static UseListOrderStack predictUseListOrder(const Module &M,
       predictValueUseListOrder(U.get(), nullptr, OM, Stack);
   }
 
-  if (CompleteUses)
-    *CompleteUses = hasCompleteMachineUses(M, OM);
+  if (Uses)
+    Uses->Complete = hasCompleteMachineUses(M, OM, Uses->Leaves);
   return Stack;
 }
 
@@ -440,10 +550,10 @@ static bool isIntOrIntVectorValue(const std::pair<const Value*, unsigned> &V) {
 
 ValueEnumerator::ValueEnumerator(const Module &M,
                                  bool ShouldPreserveUseListOrder,
-                                 bool *CompleteUses)
+                                 MachineUseState *Uses)
     : ShouldPreserveUseListOrder(ShouldPreserveUseListOrder) {
   if (ShouldPreserveUseListOrder)
-    UseListOrders = predictUseListOrder(M, CompleteUses);
+    UseListOrders = predictUseListOrder(M, Uses);
 
   // Enumerate the global variables.
   for (const GlobalVariable &GV : M.globals()) {

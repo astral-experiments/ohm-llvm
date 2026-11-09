@@ -5,15 +5,18 @@
 #include "llvm/Bitcode/OhmDebugObjectSignature.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/AsmParser/Parser.h"
+#include "llvm/Bitcode/BitcodeReader.h"
 #include "llvm/Bitcode/BitcodeWriter.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/Endian.h"
 #include "llvm/Support/FormatVariadic.h"
+#include "llvm/Support/MemoryBufferRef.h"
 #include "llvm/Support/SHA256.h"
 #include "llvm/Support/SourceMgr.h"
 #include "gtest/gtest.h"
 #include <array>
+#include <set>
 
 using namespace llvm;
 
@@ -129,15 +132,20 @@ protected:
   }
 };
 
-static bool canSaveMachineInput(Module &M) {
+static std::string machineKey(Module &M) {
   char *Data = nullptr;
   size_t Size = 0;
   bool Saved = ohm_bc_save_v1(wrap(&M), &Data, &Size);
+  std::string Key;
+  if (Saved)
+    Key.assign(Data, Size);
   ohm_bc_free_v1(Data);
-  return Saved;
+  return Key;
 }
 
-TEST(DebugObjectUsesTest, RejectsAnUnserializedInitializerUser) {
+static bool canSaveMachineInput(Module &M) { return !machineKey(M).empty(); }
+
+TEST(DebugObjectUsesTest, AuthenticatesAnUnreferencedInitializerUser) {
   LLVMContext Context;
   SMDiagnostic Error;
   auto M = parseAssemblyString(R"(
@@ -156,13 +164,22 @@ TEST(DebugObjectUsesTest, RejectsAnUnserializedInitializerUser) {
     return Bytes;
   };
   auto Before = Serialize();
-  ASSERT_TRUE(canSaveMachineInput(*M));
+  std::string OriginalKey = machineKey(*M);
+  ASSERT_FALSE(OriginalKey.empty());
   Constant *Init = M->getNamedGlobal("field")->getInitializer();
   ASSERT_TRUE(Init->hasOneUse());
   auto *Unreferenced = ConstantStruct::getAnon({Init});
   EXPECT_EQ(Before, Serialize());
   EXPECT_FALSE(Init->hasOneUse());
-  EXPECT_FALSE(canSaveMachineInput(*M));
+  std::string WithLeaf = machineKey(*M);
+  ASSERT_FALSE(WithLeaf.empty());
+  EXPECT_NE(OriginalKey, WithLeaf);
+  // The private evidence block remains valid, readable LLVM bitcode.
+  LLVMContext OtherContext;
+  auto Read =
+      parseBitcodeFile(MemoryBufferRef(WithLeaf, "checked"), OtherContext);
+  ASSERT_TRUE(bool(Read)) << toString(Read.takeError());
+  EXPECT_NE(nullptr, (*Read)->getNamedGlobal("field"));
   // Named metadata serializes the user without giving it a value ID in the
   // writer's use-list order map.
   auto *Named = M->getOrInsertNamedMetadata("additional");
@@ -212,6 +229,71 @@ TEST(DebugObjectUsesTest, ChecksInstructionsBlocksAndMetadataOnlyOperands) {
   EXPECT_TRUE(canSaveMachineInput(*M));
 }
 
+TEST(DebugObjectUsesTest, AuthenticatesLeafKindsOperandsAndUseOrder) {
+  LLVMContext C;
+  SMDiagnostic Error;
+  auto M = parseAssemblyString(R"(
+    target triple = "x86_64-unknown-linux-gnu"
+    @a = external global i8
+    @b = external global i8
+    @keep = global ptr @a
+  )",
+                               Error, C);
+  ASSERT_TRUE(M);
+  GlobalVariable *A = M->getNamedGlobal("a"), *B = M->getNamedGlobal("b");
+  auto *Ptr = A->getType();
+  auto *I64 = Type::getInt64Ty(C);
+  auto *I128 = Type::getInt128Ty(C);
+  std::set<std::string> Keys;
+  auto Distinct = [&](Constant *Leaf) {
+    std::string Key = machineKey(*M);
+    EXPECT_FALSE(Key.empty());
+    EXPECT_TRUE(Keys.insert(Key).second);
+    Leaf->destroyConstant();
+  };
+  Distinct(ConstantStruct::getAnon({A, B}));
+  Distinct(ConstantStruct::getAnon({B, A}));
+  Distinct(ConstantStruct::getAnon({A, B}, true));
+  Distinct(ConstantArray::get(ArrayType::get(Ptr, 2), {A, B}));
+  Distinct(ConstantStruct::getAnon({A, B, A}));
+  Distinct(ConstantStruct::getAnon({A, PoisonValue::get(I64)}));
+  Distinct(ConstantStruct::getAnon({A, UndefValue::get(I64)}));
+  Distinct(ConstantStruct::getAnon({A, UndefValue::get(I128)}));
+  Distinct(ConstantStruct::getAnon({A, ConstantInt::get(I128, 0)}));
+  Distinct(ConstantStruct::getAnon(
+      {A, ConstantInt::get(C, APInt::getOneBitSet(128, 120))}));
+
+  auto Ordinary = [&] {
+    SmallVector<char, 0> Data;
+    raw_svector_ostream OS(Data);
+    WriteBitcodeToFile(*M, OS, /*ShouldPreserveUseListOrder=*/true);
+    return Data;
+  };
+  auto Public = Ordinary();
+  auto *Repeated = ConstantArray::get(ArrayType::get(Ptr, 2), {A, A});
+  std::string Before = machineKey(*M);
+  A->reverseUseList();
+  std::string After = machineKey(*M);
+  EXPECT_EQ(Public, Ordinary());
+  EXPECT_FALSE(Before.empty());
+  EXPECT_FALSE(After.empty());
+  EXPECT_NE(Before, After);
+  A->reverseUseList();
+  EXPECT_EQ(Before, machineKey(*M));
+  auto *Nested = ConstantStruct::getAnon({Repeated});
+  EXPECT_FALSE(canSaveMachineInput(*M));
+  Nested->destroyConstant();
+  Repeated->destroyConstant();
+  auto *Named = StructType::create(C, {Ptr}, "named");
+  auto *Identified = ConstantStruct::get(Named, A);
+  EXPECT_FALSE(canSaveMachineInput(*M));
+  Identified->destroyConstant();
+  SmallVector<Constant *, 0> Many(257, A);
+  auto *Wide = ConstantArray::get(ArrayType::get(Ptr, Many.size()), Many);
+  EXPECT_FALSE(canSaveMachineInput(*M));
+  Wide->destroyConstant();
+}
+
 TEST(DebugObjectUsesTest, IncludesTheWritersImplicitShuffleMask) {
   LLVMContext Context;
   SMDiagnostic Error;
@@ -229,8 +311,10 @@ TEST(DebugObjectUsesTest, IncludesTheWritersImplicitShuffleMask) {
   auto &Shuffle = cast<ShuffleVectorInst>(M->getFunction("f")->front().front());
   Constant *Mask = Shuffle.getShuffleMaskForBitcode();
   ASSERT_TRUE(Mask->hasUseList());
+  std::string Before = machineKey(*M);
   auto *User = ConstantStruct::getAnon({Mask});
-  EXPECT_FALSE(canSaveMachineInput(*M));
+  ASSERT_TRUE(canSaveMachineInput(*M));
+  EXPECT_NE(Before, machineKey(*M));
   User->destroyConstant();
   EXPECT_TRUE(canSaveMachineInput(*M));
 }
@@ -243,10 +327,14 @@ TEST_F(DebugObjectSignatureTest, ChecksUsesOnBothSidesOfALineTableLookup) {
   train(*Old);
   ASSERT_TRUE(matches(*New));
   auto *User = ConstantStruct::getAnon({New->getFunction("f")});
-  EXPECT_FALSE(canSaveMachineInput(*New));
+  EXPECT_TRUE(canSaveMachineInput(*New));
   EXPECT_FALSE(matches(*New));
-  User->destroyConstant();
+  auto *OldUser = ConstantStruct::getAnon({Old->getFunction("f")});
+  train(*Old);
   EXPECT_TRUE(matches(*New));
+  User->destroyConstant();
+  EXPECT_FALSE(matches(*New));
+  OldUser->destroyConstant();
 }
 
 TEST_F(DebugObjectSignatureTest, MatchesOnlyExistingSourceCoordinates) {
