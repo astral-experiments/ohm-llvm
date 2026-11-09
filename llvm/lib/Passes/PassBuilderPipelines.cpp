@@ -27,6 +27,7 @@
 #include "llvm/Analysis/ScopedNoAliasAA.h"
 #include "llvm/Analysis/TypeBasedAliasAnalysis.h"
 #include "llvm/IR/PassManager.h"
+#include "llvm/IR/ValueMap.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/Pass.h"
 #include "llvm/Passes/OptimizationLevel.h"
@@ -966,9 +967,110 @@ static InlineParams getInlineParamsFromOptLevel(OptimizationLevel Level) {
   return getInlineParamsFromOptLevel(static_cast<unsigned>(Level));
 }
 
+namespace {
+
+// Keep the pending work attached to the original definition. If inlining
+// deletes it, the map drops it. A replacement has its own CGSCC visit.
+struct DeferredFunctionConfig : ValueMapConfig<Function *> {
+  static constexpr bool FollowRAUW = false;
+};
+
+class LocalFunctionSimplification
+    : public RequiredPassInfoMixin<LocalFunctionSimplification> {
+  struct State {
+    explicit State(FunctionPassManager Pipeline)
+        : Pipeline(std::move(Pipeline)) {}
+    FunctionPassManager Pipeline;
+    ValueMap<Function *, bool, DeferredFunctionConfig> Pending;
+    std::optional<bool> HasCoroutines;
+  };
+  std::shared_ptr<State> S;
+  bool AfterInlining = false;
+
+public:
+  explicit LocalFunctionSimplification(FunctionPassManager Pipeline)
+      : S(std::make_shared<State>(std::move(Pipeline))) {}
+
+  LocalFunctionSimplification afterInlining() const {
+    auto Late = *this;
+    Late.AfterInlining = true;
+    return Late;
+  }
+
+  PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM) {
+    if (AfterInlining) {
+      if (!S->Pending.erase(&F))
+        return PreservedAnalyses::all();
+    } else {
+      // CoroElide belongs before the CGSCC coroutine passes.
+      if (!S->HasCoroutines)
+        S->HasCoroutines = any_of(*F.getParent(), [](const Function &Fn) {
+          return Fn.isPresplitCoroutine() ||
+                 (Fn.isIntrinsic() && Fn.getName().starts_with("llvm.coro."));
+        });
+      if (!*S->HasCoroutines && F.hasLocalLinkage() && !F.hasOptNone() &&
+          !F.hasFnAttribute(Attribute::NoInline) && !F.hasAddressTaken() &&
+          // Simplifying loops can make a multi-use callee small enough to
+          // inline. Let the normal bottom-up pipeline expose that opportunity.
+          (F.hasOneUse() || F.size() == 1 ||
+           AM.getResult<LoopAnalysis>(F).empty())) {
+        S->Pending.insert({&F, true});
+        return PreservedAnalyses::all();
+      }
+      // A revisit can remove eligibility before the late sweep.
+      S->Pending.erase(&F);
+    }
+    return S->Pipeline.run(F, AM);
+  }
+};
+
+// The two adapters share one inlining session and one function pipeline.
+// Give the whole session a textual spelling so printing and parsing preserve
+// that relationship, including the configured inliner and late worklist.
+class O1LocalInlinerPass : public RequiredPassInfoMixin<O1LocalInlinerPass> {
+  ModuleInlinerWrapperPass Inliner;
+
+public:
+  explicit O1LocalInlinerPass(ModuleInlinerWrapperPass Inliner)
+      : Inliner(std::move(Inliner)) {}
+  PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM) {
+    return Inliner.run(M, AM);
+  }
+  void printPipeline(raw_ostream &OS, function_ref<StringRef(StringRef)>) {
+    OS << "o1-local-inliner";
+  }
+};
+
+} // namespace
+
+bool PassBuilder::deferLocalSimplification(OptimizationLevel Level,
+                                           ThinOrFullLTOPhase Phase) const {
+  // Extension point passes can observe individual callees before inlining.
+  return Level == OptimizationLevel::O1 && Phase == ThinOrFullLTOPhase::None &&
+         !PGOOpt && CGSCCOptimizerLateEPCallbacks.empty() &&
+         PeepholeEPCallbacks.empty() && LateLoopOptimizationsEPCallbacks.empty() &&
+         LoopOptimizerEndEPCallbacks.empty() &&
+         ScalarOptimizerLateEPCallbacks.empty();
+}
+
+ModulePassManager PassBuilder::buildO1LocalInlinerPipeline() {
+  ModulePassManager MPM;
+  const auto Level = OptimizationLevel::O1;
+  constexpr auto Phase = ThinOrFullLTOPhase::None;
+  MPM.addPass(O1LocalInlinerPass(buildInlinerPipelineImpl(
+      Level, Phase, deferLocalSimplification(Level, Phase))));
+  return MPM;
+}
+
 ModuleInlinerWrapperPass
 PassBuilder::buildInlinerPipeline(OptimizationLevel Level,
                                   ThinOrFullLTOPhase Phase) {
+  return buildInlinerPipelineImpl(Level, Phase, /*DeferLocal=*/false);
+}
+
+ModuleInlinerWrapperPass
+PassBuilder::buildInlinerPipelineImpl(OptimizationLevel Level,
+                                      ThinOrFullLTOPhase Phase, bool DeferLocal) {
   InlineParams IP;
   if (PTO.InlinerThreshold == -1)
     IP = ::getInlineParamsFromOptLevel(Level);
@@ -1041,9 +1143,17 @@ PassBuilder::buildInlinerPipeline(OptimizationLevel Level,
 
   // Add the core function simplification pipeline nested inside the
   // CGSCC walk.
-  MainCGPipeline.addPass(createCGSCCToFunctionPassAdaptor(
-      buildFunctionSimplificationPipeline(Level, Phase),
-      PTO.EagerlyInvalidateAnalyses, /*NoRerun=*/true));
+  auto Simplify = buildFunctionSimplificationPipeline(Level, Phase);
+  if (DeferLocal) {
+    LocalFunctionSimplification Local(std::move(Simplify));
+    MIWP.addLateModulePass(
+        createModuleToFunctionPassAdaptor(Local.afterInlining()));
+    MainCGPipeline.addPass(createCGSCCToFunctionPassAdaptor(
+        std::move(Local), PTO.EagerlyInvalidateAnalyses, /*NoRerun=*/true));
+  } else {
+    MainCGPipeline.addPass(createCGSCCToFunctionPassAdaptor(
+        std::move(Simplify), PTO.EagerlyInvalidateAnalyses, /*NoRerun=*/true));
+  }
 
   // Finally, deduce any function attributes based on the fully simplified
   // function.
@@ -1324,6 +1434,8 @@ PassBuilder::buildModuleSimplificationPipeline(OptimizationLevel Level,
 
   if (EnableModuleInliner)
     MPM.addPass(buildModuleInlinerPipeline(Level, Phase));
+  else if (deferLocalSimplification(Level, Phase))
+    MPM.addPass(buildO1LocalInlinerPipeline());
   else
     MPM.addPass(buildInlinerPipeline(Level, Phase));
 
