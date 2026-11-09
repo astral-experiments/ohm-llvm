@@ -268,10 +268,21 @@ bool CodeGenTargetMachineImpl::addPassesToEmitFile(
   };
   if (!CanReuse)
     return Build();
-  return PM.addWrappedModulePipeline(
-      {&TargetTransformInfoWrapperPass::ID, &TargetLibraryInfoWrapperPass::ID,
-       &RuntimeLibraryInfoWrapper::ID},
-      Build, [this, &Out](Module &M, function_ref<bool()> Emit) {
+  return PM.addWrappedModulePipelineWithPrefixCheck(
+      [&](const Pass &P) {
+        if (P.getPassID() == &TargetLibraryInfoWrapperPass::ID) {
+          // The frontend can disable builtins for the entire crate. That
+          // changes native libcall lowering independently of the module IR.
+          const auto &TLI =
+              static_cast<const TargetLibraryInfoWrapperPass &>(P);
+          return TLI.hasBaseline(
+              TargetLibraryInfoImpl(getTargetTriple(), Options.VecLib));
+        }
+        return P.getPassID() == &TargetTransformInfoWrapperPass::ID ||
+               P.getPassID() == &RuntimeLibraryInfoWrapper::ID;
+      },
+      Build,
+      [this, &Out](Module &M, function_ref<bool()> Emit) {
         return ohm::runDebugObjectCache(
             M, *this, static_cast<raw_svector_ostream &>(Out), Emit);
       });
