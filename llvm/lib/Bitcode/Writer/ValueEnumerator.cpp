@@ -11,6 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "ValueEnumerator.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Config/llvm-config.h"
 #include "llvm/IR/Argument.h"
@@ -262,7 +263,102 @@ static void predictValueUseListOrder(const Value *V, const Function *F,
   }
 }
 
-static UseListOrderStack predictUseListOrder(const Module &M) {
+// The ordinary bitcode writer can omit users that live only in this
+// LLVMContext. Machine passes may consult them, for example when AsmPrinter
+// chooses a GOT-relative relocation for an initializer with exactly one use.
+static bool hasCompleteMachineUses(const Module &M, const OrderMap &OM) {
+  auto UsesAreEncoded = [&](const Value *V) {
+    if (!V->hasUseList())
+      return true;
+    bool SawUse = false;
+    for (const User *U : V->users()) {
+      if (!OM.lookup(U).first || (SawUse && !OM.lookup(V).second))
+        return false;
+      SawUse = true;
+    }
+    return true;
+  };
+
+  DenseSet<const Metadata *> MetadataNodes;
+  SmallVector<const Metadata *, 32> PendingMetadata;
+  DenseSet<const Value *> ExtraValues;
+  SmallVector<const Value *, 16> PendingValues;
+  auto AddMetadata = [&](const Metadata *MD) {
+    if (MD && MetadataNodes.insert(MD).second)
+      PendingMetadata.push_back(MD);
+  };
+  auto AddValue = [&](const Value *V) {
+    if (V && !OM.lookup(V).first && ExtraValues.insert(V).second)
+      PendingValues.push_back(V);
+  };
+  auto AddAttachments = [&](const auto &Object) {
+    SmallVector<std::pair<unsigned, MDNode *>, 4> Kinds;
+    Object.getAllMetadata(Kinds);
+    for (const auto &Entry : Kinds)
+      AddMetadata(Entry.second);
+  };
+
+  // Use the writer's map for globals, function bodies, switch cases and the
+  // implicit shuffle mask constants. A metadata-only user is not necessarily
+  // part of that map, even though its operands appear somewhere in the file.
+  for (const auto &Entry : OM.IDs) {
+    const Value *V = Entry.first;
+    if (!UsesAreEncoded(V))
+      return false;
+    if (const auto *BB = dyn_cast<BasicBlock>(V)) {
+      // A BlockAddress can mark its block without creating a Use on it.
+      if (BB->hasAddressTaken() && !OM.lookup(BlockAddress::lookup(BB)).first)
+        return false;
+    } else if (const auto *I = dyn_cast<Instruction>(V)) {
+      if (I->hasDbgRecords())
+        return false;
+      if (I->hasMetadata())
+        AddAttachments(*I);
+      for (const Value *Op : I->operands())
+        if (isa<MetadataAsValue>(Op))
+          AddValue(Op);
+    } else if (const auto *GO = dyn_cast<GlobalObject>(V))
+      AddAttachments(*GO);
+  }
+  for (const Function &F : M)
+    if (F.isDeclaration())
+      for (const Argument &Arg : F.args())
+        AddValue(&Arg);
+  for (const NamedMDNode &N : M.named_metadata())
+    for (const MDNode *MD : N.operands())
+      AddMetadata(MD);
+
+  // Include values reachable only through metadata. If the writer does not
+  // predict an order for a value, only an empty or singleton use list has a
+  // fully determined order.
+  while (!PendingValues.empty() || !PendingMetadata.empty()) {
+    while (!PendingValues.empty()) {
+      const Value *V = PendingValues.pop_back_val();
+      if (!UsesAreEncoded(V))
+        return false;
+      if (const auto *U = dyn_cast<User>(V))
+        for (const Use &Op : U->operands())
+          AddValue(Op.get());
+      if (const auto *MAV = dyn_cast<MetadataAsValue>(V))
+        AddMetadata(MAV->getMetadata());
+    }
+    while (!PendingMetadata.empty()) {
+      const Metadata *MD = PendingMetadata.pop_back_val();
+      if (const auto *Args = dyn_cast<DIArgList>(MD))
+        for (const ValueAsMetadata *Arg : Args->getArgs())
+          AddMetadata(Arg);
+      if (const auto *N = dyn_cast<MDNode>(MD))
+        for (const MDOperand &Op : N->operands())
+          AddMetadata(Op.get());
+      if (const auto *VAM = dyn_cast<ValueAsMetadata>(MD))
+        AddValue(VAM->getValue());
+    }
+  }
+  return true;
+}
+
+static UseListOrderStack predictUseListOrder(const Module &M,
+                                             bool *CompleteUses) {
   OrderMap OM = orderModule(M);
 
   // Use-list orders need to be serialized after all the users have been added
@@ -333,6 +429,8 @@ static UseListOrderStack predictUseListOrder(const Module &M) {
       predictValueUseListOrder(U.get(), nullptr, OM, Stack);
   }
 
+  if (CompleteUses)
+    *CompleteUses = hasCompleteMachineUses(M, OM);
   return Stack;
 }
 
@@ -341,10 +439,11 @@ static bool isIntOrIntVectorValue(const std::pair<const Value*, unsigned> &V) {
 }
 
 ValueEnumerator::ValueEnumerator(const Module &M,
-                                 bool ShouldPreserveUseListOrder)
+                                 bool ShouldPreserveUseListOrder,
+                                 bool *CompleteUses)
     : ShouldPreserveUseListOrder(ShouldPreserveUseListOrder) {
   if (ShouldPreserveUseListOrder)
-    UseListOrders = predictUseListOrder(M);
+    UseListOrders = predictUseListOrder(M, CompleteUses);
 
   // Enumerate the global variables.
   for (const GlobalVariable &GV : M.globals()) {

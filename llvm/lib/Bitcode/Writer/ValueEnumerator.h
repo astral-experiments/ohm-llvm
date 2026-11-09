@@ -163,7 +163,8 @@ private:
   unsigned FirstInstID;
 
 public:
-  ValueEnumerator(const Module &M, bool ShouldPreserveUseListOrder);
+  ValueEnumerator(const Module &M, bool ShouldPreserveUseListOrder,
+                  bool *CompleteUses = nullptr);
   ValueEnumerator(const ValueEnumerator &) = delete;
   ValueEnumerator &operator=(const ValueEnumerator &) = delete;
 
