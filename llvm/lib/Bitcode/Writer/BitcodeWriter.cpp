@@ -5744,12 +5744,15 @@ bool llvm::writeDebugObjectBitcode(const Module &M,
   Writer.writeStrtab();
   if (!Uses.Complete || (Map && !Map->Valid))
     return false;
-  if (!Uses.Leaves.empty()) {
+  if (!Uses.Leaves.empty() || !Uses.MetadataUses.empty()) {
     // This private top-level block is part of a checked machine key only.
     // Ordinary bitcode readers skip unknown blocks.
     constexpr unsigned CheckedMachineUsesBlock = 0x4f484d;
     Writer.Stream->EnterSubblock(CheckedMachineUsesBlock, 3);
-    Writer.Stream->EmitRecord(1, Uses.Leaves);
+    if (!Uses.Leaves.empty())
+      Writer.Stream->EmitRecord(1, Uses.Leaves);
+    for (const auto &Order : Uses.MetadataUses)
+      Writer.Stream->EmitRecord(2, Order);
     Writer.Stream->ExitBlock();
   }
   return true;

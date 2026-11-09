@@ -294,6 +294,47 @@ TEST(DebugObjectUsesTest, AuthenticatesLeafKindsOperandsAndUseOrder) {
   Wide->destroyConstant();
 }
 
+TEST(DebugObjectUsesTest, AuthenticatesUnnumberedMetadataOperandOrder) {
+  LLVMContext C;
+  SMDiagnostic Error;
+  auto M = parseAssemblyString(R"(
+    target triple = "x86_64-unknown-linux-gnu"
+    declare void @llvm.experimental.noalias.scope.decl(metadata)
+    define void @f() {
+      call void @llvm.experimental.noalias.scope.decl(metadata !2)
+      call void @llvm.experimental.noalias.scope.decl(metadata !2)
+      ret void
+    }
+    !0 = distinct !{!0, !"domain"}
+    !1 = distinct !{!1, !0, !"scope"}
+    !2 = !{!1}
+  )",
+                               Error, C);
+  ASSERT_TRUE(M);
+  auto *Call = cast<CallInst>(&M->getFunction("f")->front().front());
+  auto *Scope = cast<MetadataAsValue>(Call->getArgOperand(0));
+  ASSERT_TRUE(Scope->hasNUses(2));
+  auto Ordinary = [&] {
+    SmallVector<char, 0> Data;
+    raw_svector_ostream OS(Data);
+    WriteBitcodeToFile(*M, OS, /*ShouldPreserveUseListOrder=*/true);
+    return Data;
+  };
+  auto Public = Ordinary();
+  std::string Key = machineKey(*M);
+  ASSERT_FALSE(Key.empty());
+  Scope->reverseUseList();
+  EXPECT_EQ(Public, Ordinary());
+  EXPECT_NE(Key, machineKey(*M));
+  Scope->reverseUseList();
+  EXPECT_EQ(Key, machineKey(*M));
+  auto *Outside = CallInst::Create(Call->getFunctionType(),
+                                   Call->getCalledOperand(), {Scope});
+  EXPECT_FALSE(canSaveMachineInput(*M));
+  Outside->deleteValue();
+  EXPECT_EQ(Key, machineKey(*M));
+}
+
 TEST(DebugObjectUsesTest, IncludesTheWritersImplicitShuffleMask) {
   LLVMContext Context;
   SMDiagnostic Error;
