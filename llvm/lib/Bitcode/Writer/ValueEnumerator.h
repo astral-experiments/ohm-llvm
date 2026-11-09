@@ -13,6 +13,7 @@
 #ifndef LLVM_LIB_BITCODE_WRITER_VALUEENUMERATOR_H
 #define LLVM_LIB_BITCODE_WRITER_VALUEENUMERATOR_H
 
+#include "DebugObjectSourceMap.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/UniqueVector.h"
@@ -41,7 +42,22 @@ class Value;
 class ValueSymbolTable;
 
 class ValueEnumerator {
+  DebugObjectSourceMap *SourceMap = nullptr;
+
 public:
+  void setSourceMap(DebugObjectSourceMap *Map) { SourceMap = Map; }
+  unsigned debugLine(const Metadata *N, unsigned Line) const {
+    return SourceMap ? SourceMap->line(N, Line) : Line;
+  }
+  StringRef debugString(const MDString *S) const {
+    return SourceMap ? SourceMap->string(S) : S->getString();
+  }
+  unsigned getFileChecksumID(const DIFile *File) const {
+    if (SourceMap)
+      SourceMap->checkFileChecksum(File);
+    return MetadataMap.lookup(File->getRawChecksum()->Value).ID;
+  }
+
   using TypeList = std::vector<Type *>;
 
   // For each value, we remember its Value* and occurrence frequency.
@@ -156,6 +172,8 @@ public:
   }
 
   unsigned getMetadataOrNullID(const Metadata *MD) const {
+    if (SourceMap)
+      SourceMap->checkReference(MD);
     return MetadataMap.lookup(MD).ID;
   }
 

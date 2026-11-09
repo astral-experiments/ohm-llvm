@@ -28,7 +28,14 @@ class BitstreamWriter;
 class Module;
 class raw_ostream;
 
+struct DebugObjectSourceMap;
+
 class BitcodeWriter {
+  friend bool writeDebugObjectBitcode(const Module &, SmallVectorImpl<char> &,
+                                      DebugObjectSourceMap *);
+  void writeModuleImpl(const Module &, bool, const ModuleSummaryIndex *, bool,
+                       ModuleHash *, DebugObjectSourceMap *);
+
   std::unique_ptr<BitstreamWriter> Stream;
 
   StringTableBuilder StrtabBuilder{StringTableBuilder::RAW};

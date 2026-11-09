@@ -169,6 +169,9 @@ add_llvm_component_library(LLVMCodeGen
   MIRPrintingPass.cpp
   MacroFusion.cpp
   NonRelocatableStringpool.cpp
+  OhmDebugObjectCache.cpp
+  OhmDebugObjectSources.cpp
+  OhmLineCertificate.cpp
   OptimizePHIs.cpp
   PeepholeOptimizer.cpp
   PHIElimination.cpp
@@ -285,6 +288,7 @@ add_llvm_component_library(LLVMCodeGen
   CGData
   CodeGenTypes
   Core
+  DebugInfoDWARF
   MC
   ObjCARC
   ProfileData
