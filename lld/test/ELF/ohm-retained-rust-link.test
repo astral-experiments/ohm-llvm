@@ -1,0 +1,82 @@
+# REQUIRES: x86, system-linux
+# RUN: split-file %s %t
+# RUN: llvm-mc -triple=x86_64-unknown-linux -filetype=obj %t/start.s -o %t/entry.o
+# RUN: llvm-mc -triple=x86_64-unknown-linux -filetype=obj %t/empty.s -o %t/empty.o
+# RUN: %python %t/check.py ld.lld %t
+
+#--- start.s
+.global _start
+_start:
+  movl $60, %eax
+  xorl %edi, %edi
+  syscall
+.section .note.GNU-stack,"",@progbits
+
+#--- empty.s
+.section .note.GNU-stack,"",@progbits
+
+#--- check.py
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import time
+
+linker, directory = sys.argv[1:]
+root = Path(directory).resolve()
+output = root / 'harness-0123456789abcdef'
+receipt = root / (output.name + '.lld-relink')
+objects = root / (output.name + '.rlink-objects')
+objects.mkdir(exist_ok=True)
+entry = objects / 'harness.module.1234567.rcgu.o'
+shutil.copy(root / 'entry.o', entry)
+scratch = root / 'rustc123456'
+scratch.mkdir(exist_ok=True)
+symbols = scratch / 'symbols.o'
+shutil.copy(root / 'empty.o', symbols)
+env = dict(os.environ, CARGO_PKG_NAME='harness', CARGO_MANIFEST_DIR=str(root))
+env.pop('LLD_IN_TEST', None)
+
+def link(*options):
+    subprocess.run([linker, '-m', 'elf_x86_64', '-pie', '--build-id',
+                    '--gc-sections', '-o', output, symbols, entry, *options],
+                   env=env, check=True)
+
+receipt.unlink(missing_ok=True)
+time.sleep(max(0, Path(shutil.which(linker)).stat().st_ctime + 3.1 - time.time()))
+link()
+assert receipt.stat().st_size == 112
+expected = output.read_bytes()
+os.utime(receipt, (1, 1))
+# A normal new link rewrites the receipt. A successful reuse keeps it.
+entry = entry.rename(objects / 'harness.module.7654321.rcgu.o')
+link()
+assert receipt.stat().st_mtime == 1 and output.read_bytes() == expected
+
+data = bytearray(expected)
+data[-1] ^= 1
+output.write_bytes(data)
+link()
+assert receipt.stat().st_mtime != 1 and output.read_bytes() == expected
+
+side = root / 'harness.map'
+link('-Map=' + str(side))
+assert side.is_file() and side.stat().st_size > 0
+
+# A user's existing file can itself be one of the link inputs.
+receipt.unlink()
+shutil.copy(root / 'empty.o', receipt)
+unrelated = receipt.read_bytes()
+link(receipt)
+assert receipt.read_bytes() == unrelated
+
+receipt.unlink()
+receipt.symlink_to(root / 'empty.o')
+link()
+assert receipt.is_symlink() and receipt.read_bytes() == unrelated
+
+receipt.unlink()
+env['LD_PRELOAD'] = ''
+link()
+assert not receipt.exists()

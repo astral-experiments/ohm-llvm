@@ -244,6 +244,9 @@ void ScriptParser::readLinkerScript() {
 }
 
 void ScriptParser::readLinkerScriptStmt(StringRef tok) {
+  // Only ordinary native-library groups can participate in a retained test link.
+  if (tok != ";" && tok != "GROUP" && tok != "INPUT" && tok != "OUTPUT_FORMAT")
+    ctx.rustTestLink.disable();
   if (tok == ";")
     return;
 

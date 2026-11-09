@@ -699,6 +699,7 @@ void LinkerDriver::linkerMain(ArrayRef<const char *> argsArr) {
     llvm::TimeTraceScope timeScope("ExecuteLinker");
 
     initLLVM();
+    ctx.rustTestLink.configure(ctx, args);
     createFiles(args);
     if (errCount(ctx))
       return;
@@ -709,6 +710,8 @@ void LinkerDriver::linkerMain(ArrayRef<const char *> argsArr) {
     if (errCount(ctx))
       return;
 
+    if (ctx.rustTestLink.reuse(ctx))
+      return;
     invokeELFT(link, args);
   }
 
@@ -3594,4 +3597,6 @@ template <class ELFT> void LinkerDriver::link(opt::InputArgList &args) {
 
   // Write the result to the file.
   writeResult<ELFT>(ctx);
+  if (!errCount(ctx))
+    ctx.rustTestLink.publish(ctx);
 }
