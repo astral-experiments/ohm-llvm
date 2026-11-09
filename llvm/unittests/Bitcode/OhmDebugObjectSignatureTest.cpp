@@ -5,6 +5,7 @@
 #include "llvm/Bitcode/OhmDebugObjectSignature.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/AsmParser/Parser.h"
+#include "llvm/Bitcode/BitcodeWriter.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/Endian.h"
@@ -127,6 +128,126 @@ protected:
                            Mapping.size(), Proof.data(), Proof.size());
   }
 };
+
+static bool canSaveMachineInput(Module &M) {
+  char *Data = nullptr;
+  size_t Size = 0;
+  bool Saved = ohm_bc_save_v1(wrap(&M), &Data, &Size);
+  ohm_bc_free_v1(Data);
+  return Saved;
+}
+
+TEST(DebugObjectUsesTest, RejectsAnUnserializedInitializerUser) {
+  LLVMContext Context;
+  SMDiagnostic Error;
+  auto M = parseAssemblyString(R"(
+    target triple = "x86_64-unknown-linux-gnu"
+    @target = external global i32
+    @ptr = private unnamed_addr constant ptr @target
+    @field = constant i32 trunc (i64 sub (i64 ptrtoint (ptr @ptr to i64),
+                                         i64 ptrtoint (ptr @field to i64)) to i32)
+  )",
+                               Error, Context);
+  ASSERT_TRUE(M);
+  auto Serialize = [&] {
+    SmallVector<char, 0> Bytes;
+    raw_svector_ostream Stream(Bytes);
+    WriteBitcodeToFile(*M, Stream, /*ShouldPreserveUseListOrder=*/true);
+    return Bytes;
+  };
+  auto Before = Serialize();
+  ASSERT_TRUE(canSaveMachineInput(*M));
+  Constant *Init = M->getNamedGlobal("field")->getInitializer();
+  ASSERT_TRUE(Init->hasOneUse());
+  auto *Unreferenced = ConstantStruct::getAnon({Init});
+  EXPECT_EQ(Before, Serialize());
+  EXPECT_FALSE(Init->hasOneUse());
+  EXPECT_FALSE(canSaveMachineInput(*M));
+  // Named metadata serializes the user without giving it a value ID in the
+  // writer's use-list order map.
+  auto *Named = M->getOrInsertNamedMetadata("additional");
+  Named->addOperand(
+      MDNode::get(Context, ConstantAsMetadata::get(Unreferenced)));
+  EXPECT_FALSE(canSaveMachineInput(*M));
+  M->eraseNamedMetadata(Named);
+  Unreferenced->destroyConstant();
+  EXPECT_TRUE(canSaveMachineInput(*M));
+}
+
+TEST(DebugObjectUsesTest, ChecksInstructionsBlocksAndMetadataOnlyOperands) {
+  LLVMContext Context;
+  SMDiagnostic Error;
+  auto M = parseAssemblyString(R"(
+    target triple = "x86_64-unknown-linux-gnu"
+    define i32 @f(i32 %arg) {
+      br label %exit
+    exit:
+      %v = add i32 %arg, 1
+      ret i32 %v
+    }
+    !named = !{!0}
+    !0 = !{ptr inttoptr (i64 123456789 to ptr)}
+  )",
+                               Error, Context);
+  ASSERT_TRUE(M);
+  ASSERT_TRUE(canSaveMachineInput(*M));
+  Function *F = M->getFunction("f");
+  BasicBlock &Exit = F->back();
+  auto *Outside = BinaryOperator::CreateAdd(F->getArg(0), &Exit.front());
+  EXPECT_FALSE(canSaveMachineInput(*M));
+  Outside->deleteValue();
+  auto *Address = BlockAddress::get(&Exit);
+  EXPECT_FALSE(canSaveMachineInput(*M));
+  auto *AddressOwner = new GlobalVariable(*M, Address->getType(), true,
+                                          GlobalValue::PrivateLinkage, Address);
+  EXPECT_TRUE(canSaveMachineInput(*M));
+  AddressOwner->eraseFromParent();
+  Address->destroyConstant();
+  Constant *Number = ConstantExpr::getIntToPtr(
+      ConstantInt::get(Type::getInt64Ty(Context), 123456789),
+      PointerType::getUnqual(Context));
+  auto *User = ConstantStruct::getAnon({Number});
+  EXPECT_FALSE(canSaveMachineInput(*M));
+  User->destroyConstant();
+  EXPECT_TRUE(canSaveMachineInput(*M));
+}
+
+TEST(DebugObjectUsesTest, IncludesTheWritersImplicitShuffleMask) {
+  LLVMContext Context;
+  SMDiagnostic Error;
+  auto M = parseAssemblyString(R"(
+    target triple = "x86_64-unknown-linux-gnu"
+    define <2 x i32> @f(<2 x i32> %v) {
+      %s = shufflevector <2 x i32> %v, <2 x i32> poison,
+                         <2 x i32> <i32 1, i32 poison>
+      ret <2 x i32> %s
+    }
+  )",
+                               Error, Context);
+  ASSERT_TRUE(M);
+  ASSERT_TRUE(canSaveMachineInput(*M));
+  auto &Shuffle = cast<ShuffleVectorInst>(M->getFunction("f")->front().front());
+  Constant *Mask = Shuffle.getShuffleMaskForBitcode();
+  ASSERT_TRUE(Mask->hasUseList());
+  auto *User = ConstantStruct::getAnon({Mask});
+  EXPECT_FALSE(canSaveMachineInput(*M));
+  User->destroyConstant();
+  EXPECT_TRUE(canSaveMachineInput(*M));
+}
+
+TEST_F(DebugObjectSignatureTest, ChecksUsesOnBothSidesOfALineTableLookup) {
+  LLVMContext Before, After;
+  auto Old = module(Before, OldSum, 3, "same");
+  auto New = module(After, NewSum, 4, "same");
+  ASSERT_TRUE(Old && New);
+  train(*Old);
+  ASSERT_TRUE(matches(*New));
+  auto *User = ConstantStruct::getAnon({New->getFunction("f")});
+  EXPECT_FALSE(canSaveMachineInput(*New));
+  EXPECT_FALSE(matches(*New));
+  User->destroyConstant();
+  EXPECT_TRUE(matches(*New));
+}
 
 TEST_F(DebugObjectSignatureTest, MatchesOnlyExistingSourceCoordinates) {
   LLVMContext Before, After, Inserted;

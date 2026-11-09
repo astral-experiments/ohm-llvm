@@ -216,11 +216,14 @@ public:
   ModuleBitcodeWriterBase(const Module &M, StringTableBuilder &StrtabBuilder,
                           BitstreamWriter &Stream,
                           bool ShouldPreserveUseListOrder,
-                          const ModuleSummaryIndex *Index)
+                          const ModuleSummaryIndex *Index,
+                          bool *CompleteUses = nullptr)
       : BitcodeWriterBase(Stream, StrtabBuilder), M(M),
-        VE(M, PreserveBitcodeUseListOrder.getNumOccurrences()
-                  ? PreserveBitcodeUseListOrder
-                  : ShouldPreserveUseListOrder),
+        VE(M,
+           PreserveBitcodeUseListOrder.getNumOccurrences()
+               ? PreserveBitcodeUseListOrder
+               : ShouldPreserveUseListOrder,
+           CompleteUses),
         Index(Index) {
     // Assign ValueIds to any callee values in the index that came from
     // indirect call profiles and were recorded as a GUID not a Value*
@@ -314,9 +317,11 @@ public:
                       BitstreamWriter &Stream, bool ShouldPreserveUseListOrder,
                       const ModuleSummaryIndex *Index, bool GenerateHash,
                       ModuleHash *ModHash = nullptr,
-                      DebugObjectSourceMap *SourceMap = nullptr)
+                      DebugObjectSourceMap *SourceMap = nullptr,
+                      bool *CompleteUses = nullptr)
       : ModuleBitcodeWriterBase(M, StrtabBuilder, Stream,
-                                ShouldPreserveUseListOrder, Index),
+                                ShouldPreserveUseListOrder, Index,
+                                CompleteUses),
         GenerateHash(GenerateHash), ModHash(ModHash),
         BitcodeStartBit(Stream.GetCurrentBitNo()) {
     VE.setSourceMap(SourceMap);
@@ -5704,7 +5709,8 @@ void BitcodeWriter::writeModuleImpl(const Module &M,
                                     bool ShouldPreserveUseListOrder,
                                     const ModuleSummaryIndex *Index,
                                     bool GenerateHash, ModuleHash *ModHash,
-                                    DebugObjectSourceMap *SourceMap) {
+                                    DebugObjectSourceMap *SourceMap,
+                                    bool *CompleteUses) {
   assert(!WroteStrtab);
 
   // The Mods vector is used by irsymtab::build, which requires non-const
@@ -5714,10 +5720,11 @@ void BitcodeWriter::writeModuleImpl(const Module &M,
   assert(M.isMaterialized());
   Mods.push_back(const_cast<Module *>(&M));
 
-  ModuleBitcodeWriter ModuleWriter(M, StrtabBuilder, *Stream,
-                                   ShouldPreserveUseListOrder, Index,
-                                   GenerateHash, ModHash, SourceMap);
-  ModuleWriter.write();
+  ModuleBitcodeWriter ModuleWriter(
+      M, StrtabBuilder, *Stream, ShouldPreserveUseListOrder, Index,
+      GenerateHash, ModHash, SourceMap, CompleteUses);
+  if (!CompleteUses || *CompleteUses)
+    ModuleWriter.write();
 }
 
 bool llvm::writeDebugObjectBitcode(const Module &M,
@@ -5732,10 +5739,11 @@ bool llvm::writeDebugObjectBitcode(const Module &M,
   if (Map)
     Map->prepare();
   BitcodeWriter Writer(Buffer);
-  Writer.writeModuleImpl(M, true, nullptr, false, nullptr, Map);
+  bool CompleteUses = false;
+  Writer.writeModuleImpl(M, true, nullptr, false, nullptr, Map, &CompleteUses);
   Writer.writeSymtab();
   Writer.writeStrtab();
-  return !Map || Map->Valid;
+  return CompleteUses && (!Map || Map->Valid);
 }
 
 void BitcodeWriter::writeIndex(

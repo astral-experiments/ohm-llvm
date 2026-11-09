@@ -34,7 +34,8 @@ class BitcodeWriter {
   friend bool writeDebugObjectBitcode(const Module &, SmallVectorImpl<char> &,
                                       DebugObjectSourceMap *);
   void writeModuleImpl(const Module &, bool, const ModuleSummaryIndex *, bool,
-                       ModuleHash *, DebugObjectSourceMap *);
+                       ModuleHash *, DebugObjectSourceMap *,
+                       bool *CompleteUses = nullptr);
 
   std::unique_ptr<BitstreamWriter> Stream;
 
