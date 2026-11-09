@@ -467,7 +467,7 @@ namespace legacy {
 // Only the actual module manager can attest to the prefix it was given.
 struct ModulePipelineCapture {
   PassManagerBase *Owner;
-  ArrayRef<const void *> Allowed;
+  function_ref<bool(const Pass &)> AcceptPrefix;
   ModulePipelineCapture *Previous;
   PassManagerImpl *Impl = nullptr;
   bool Eligible = true;
@@ -504,7 +504,9 @@ public:
       if (auto *C = ModulePipelineCapture::find(Owner)) {
         C->Impl = this;
         C->Eligible &= llvm::all_of(InitialAnalyses, [&](const void *ID) {
-          return llvm::is_contained(C->Allowed, ID);
+          // schedulePass may have discarded a duplicate registration.
+          const Pass *Effective = PMTopLevelManager::findAnalysisPass(ID);
+          return Effective && C->AcceptPrefix(*Effective);
         });
         PrefixIntact = false;
       } else if (P->getAsImmutablePass() && InitialAnalyses.size() < 4)
@@ -1834,11 +1836,21 @@ legacy::PassManagerBase::~PassManagerBase() = default;
 bool legacy::PassManagerBase::addWrappedModulePipeline(
     ArrayRef<const void *> AllowedPrefix, function_ref<bool()> Build,
     ModuleExecutor Execute) {
+  return addWrappedModulePipelineWithPrefixCheck(
+      [&](const Pass &P) {
+        return llvm::is_contained(AllowedPrefix, P.getPassID());
+      },
+      Build, std::move(Execute));
+}
+
+bool legacy::PassManagerBase::addWrappedModulePipelineWithPrefixCheck(
+    function_ref<bool(const Pass &)> AcceptPrefix, function_ref<bool()> Build,
+    ModuleExecutor Execute) {
   if (auto *Outer = legacy::ModulePipelineCapture::find(this)) {
     Outer->Eligible = false;
     return Build();
   }
-  legacy::ModulePipelineCapture Capture{this, AllowedPrefix,
+  legacy::ModulePipelineCapture Capture{this, AcceptPrefix,
                                         legacy::ModulePipelineCapture::Current};
   SaveAndRestore Guard(legacy::ModulePipelineCapture::Current, &Capture);
   bool Failed = Build();
