@@ -18,6 +18,40 @@ using namespace llvm;
 
 namespace {
 
+TEST(TargetLibraryBaselineTest, ComparesScalarAndVectorModel) {
+  const Triple T("x86_64-unknown-linux-gnu");
+  const TargetLibraryInfoImpl Default(T);
+  auto Matches = [&](const TargetLibraryInfoImpl &Info) {
+    return TargetLibraryInfoWrapperPass(Info).hasBaseline(Default);
+  };
+  EXPECT_TRUE(Matches(Default));
+  TargetLibraryInfoImpl Info(Default);
+  Info.disableAllFunctions();
+  EXPECT_FALSE(Matches(Info));
+  Info = Default;
+  Info.setAvailableWithName(LibFunc_memcpy, "custom_copy");
+  EXPECT_FALSE(Matches(Info));
+  Info = Default;
+  Info.setIntSize(16);
+  EXPECT_FALSE(Matches(Info));
+  Info = Default;
+  Info.addVectorizableFunctions(
+      {VecDesc("sin", "wide_sin", ElementCount::getFixed(4), false, "_ZGVbN4v",
+               std::nullopt)});
+  EXPECT_FALSE(Matches(Info));
+  EXPECT_TRUE(TargetLibraryInfoWrapperPass(Info).hasBaseline(Info));
+
+  LLVMContext Context;
+  Module M("function-overrides", Context);
+  Function *F =
+      Function::Create(FunctionType::get(Type::getVoidTy(Context), false),
+                       GlobalValue::ExternalLinkage, "f", M);
+  F->addFnAttr("no-builtins");
+  TargetLibraryInfoWrapperPass P(Default);
+  EXPECT_FALSE(P.getTLI(*F).has(LibFunc_memcpy));
+  EXPECT_TRUE(P.hasBaseline(Default));
+}
+
 class TargetLibraryInfoTest : public testing::Test {
 protected:
   LLVMContext Context;
