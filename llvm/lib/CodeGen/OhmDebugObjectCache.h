@@ -33,9 +33,21 @@ using DebugObjectImageGeneration = std::pair<uint64_t, uint64_t>;
 std::optional<DebugObjectImageGeneration> getDebugObjectImageGeneration();
 #endif
 /// Small machine inputs cost less to compile than to certify and retain.
-inline bool isLargeDebugObjectInput(const Module &M) {
-  constexpr unsigned MinInstructions = 32 * 1024;
-  return M.getInstructionCount() >= MinInstructions;
+inline bool isLargeDebugObjectInput(const Module &M,
+                                    bool WithoutDebug = false) {
+  // Exact objects need one bitcode serialization and no source or DWARF work.
+  const unsigned MinInstructions = WithoutDebug ? 2 * 1024 : 32 * 1024;
+  // Instruction selection and liveness also scale with the number of basic
+  // blocks in control-flow-heavy modules whose blocks are individually short.
+  unsigned Blocks = 0, Instructions = 0;
+  for (const Function &F : M)
+    for (const BasicBlock &BB : F) {
+      ++Blocks;
+      Instructions += BB.size();
+      if (Instructions >= MinInstructions)
+        return true;
+    }
+  return Blocks >= 2 * 1024 && Instructions <= 4 * Blocks;
 }
 /// The Linux loader consumes its initial environment before constructors can
 /// clear their process-visible variables. A truncated environment is unknown.
