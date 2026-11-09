@@ -4,6 +4,7 @@
 
 #include "llvm/Bitcode/OhmDebugObjectSignature.h"
 #include "DebugObjectSourceMap.h"
+#include "OhmCallerLocationProof.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/JSON.h"
@@ -132,19 +133,42 @@ extern "C" int ohm_bc_save_v1(LLVMModuleRef Ref, char **Data, size_t *Length) {
   return 1;
 }
 
-extern "C" int ohm_bc_match_v1(LLVMModuleRef Ref, const char *Origin,
-                               size_t OriginLength, const char *Mapping,
-                               size_t MappingLength, const char *Proof,
-                               size_t ProofLength) {
+extern "C" int ohm_bc_match_relocatable_v1(
+    LLVMModuleRef Ref, const char *Origin, size_t OriginLength,
+    const char *Mapping, size_t MappingLength, const char *Proof,
+    size_t ProofLength, OhmCheckRuntimeLocations Check, void *Context) {
   if (!Ref || !Origin || !OriginLength || !Mapping || !Proof)
     return 0;
   auto Map = inverseMap({Mapping, MappingLength}, {Proof, ProofLength});
   if (!Map)
     return 0;
+  bool Runtime = false;
+  if (Check) {
+    json::Array Changes;
+    if (ohm_location::prepare(*unwrap(Ref), *Map, Changes)) {
+      std::string Proposed;
+      raw_string_ostream(Proposed) << json::Value(std::move(Changes));
+      Runtime = Check(Context, Proposed.data(), Proposed.size()) == 1;
+    }
+    if (!Runtime) {
+      Map->CallerTails.clear();
+      Map->CallerInitializers.clear();
+    }
+  }
   SmallVector<char, 0> Bytes;
-  return writeDebugObjectBitcode(*unwrap(Ref), Bytes, &*Map) &&
-         StringRef(Origin, OriginLength) ==
-             StringRef(Bytes.data(), Bytes.size());
+  if (!writeDebugObjectBitcode(*unwrap(Ref), Bytes, &*Map) ||
+      StringRef(Origin, OriginLength) != StringRef(Bytes.data(), Bytes.size()))
+    return 0;
+  return Runtime ? 2 : 1;
+}
+
+extern "C" int ohm_bc_match_v1(LLVMModuleRef Ref, const char *Origin,
+                               size_t OriginLength, const char *Mapping,
+                               size_t MappingLength, const char *Proof,
+                               size_t ProofLength) {
+  return ohm_bc_match_relocatable_v1(Ref, Origin, OriginLength, Mapping,
+                                     MappingLength, Proof, ProofLength,
+                                     nullptr, nullptr);
 }
 extern "C" void ohm_bc_free_v1(void *P) { std::free(P); }
 

@@ -7,6 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/DebugInfo/DWARF/OhmDwarfRebase.h"
+#include "OhmDebugObjectJSON.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/BinaryFormat/Dwarf.h"
@@ -51,6 +52,27 @@ std::string joinPath(StringRef Directory, StringRef File) {
   SmallString<256> Path(Directory);
   sys::path::append(Path, sys::path::Style::posix, File);
   return Path.str().str();
+}
+
+// The x86 MC writer chooses from these encodings using the address delta
+// in minimum-instruction units and the signed line delta. A change between
+// forms can preserve every decoded row while differing from fresh MC output.
+enum class LineForm { AdvanceLine, Copy, Special, ConstAddPC, AdvancePC };
+LineForm lineForm(int64_t Delta, uint64_t Address, int Base, unsigned Range,
+                  unsigned OpcodeBase) {
+  const int64_t Biased = Delta - Base;
+  if (Biased < 0 || Biased >= Range || Biased + OpcodeBase > 255)
+    return LineForm::AdvanceLine;
+  if (!Delta && !Address)
+    return LineForm::Copy;
+  const unsigned LastSpecialAddress = (255 - OpcodeBase) / Range;
+  const unsigned DirectLimit = (255 - OpcodeBase - unsigned(Biased)) / Range;
+  if (Address <= DirectLimit)
+    return LineForm::Special;
+  if (Address >= LastSpecialAddress &&
+      Address - LastSpecialAddress <= DirectLimit)
+    return LineForm::ConstAddPC;
+  return LineForm::AdvancePC;
 }
 
 class Cursor {
@@ -153,6 +175,12 @@ class Rewriter {
   std::string Problem;
   std::vector<Section> Sections;
   std::map<std::string, unsigned, std::less<>> Debug;
+  struct ResizedLEB {
+    size_t Begin, End;
+    std::string Bytes;
+    int64_t ShiftAfter = 0;
+  };
+  std::vector<ResizedLEB> Resized;
   std::vector<Relocation> LineRelocs, InfoRelocs;
   std::map<size_t, UnitLines> LineUnits;
   std::set<size_t> AddressOperands;
@@ -362,6 +390,9 @@ class Rewriter {
     uint64_t File = 1;
     int64_t Before = 1, After = 1;
     std::optional<Advance> Last;
+    bool RepeatedAdvance = false;
+    uint64_t Address = 0;
+    bool NonScaledAddress = false;
     bool Ended = false;
     auto move = [&](int64_t Delta) {
       if (AddOverflow(Before, Delta, Before) ||
@@ -387,6 +418,8 @@ class Rewriter {
         } else if (Ext == dwarf::DW_LNE_set_address) {
           if (Len != 9)
             return fail("unsupported set_address width");
+          Address = 0;
+          NonScaledAddress = false;
           AddressOperands.insert(Ops.At);
           Ops.fixed(8);
         } else if (Ext == dwarf::DW_LNE_set_discriminator) {
@@ -396,6 +429,7 @@ class Rewriter {
         if (Ops.At != SubEnd)
           return fail("invalid extended opcode length");
       } else if (Op >= OpBase) {
+        Address = SaturatingAdd(Address, uint64_t((Op - OpBase) / Range));
         if (!move(LineBase + int((Op - OpBase) % Range)))
           return false;
         Row = true;
@@ -405,6 +439,8 @@ class Rewriter {
           Row = true;
           break;
         case dwarf::DW_LNS_advance_pc:
+          Address = SaturatingAdd(Address, Ops.uleb());
+          break;
         case dwarf::DW_LNS_set_column:
         case dwarf::DW_LNS_set_isa:
           Ops.uleb();
@@ -414,6 +450,7 @@ class Rewriter {
           auto V = Ops.sleb();
           if (!move(V))
             return false;
+          RepeatedAdvance |= Last.has_value();
           Last = Advance{Pos, Ops.At, V};
           break;
         }
@@ -422,12 +459,17 @@ class Rewriter {
           if (!File || File >= U.Files.size())
             return fail("invalid line-program file");
           break;
-        case dwarf::DW_LNS_fixed_advance_pc:
-          Ops.fixed(2);
+        case dwarf::DW_LNS_fixed_advance_pc: {
+          uint64_t Bytes = Ops.fixed(2);
+          NonScaledAddress |= Bytes % Min != 0;
+          Address = SaturatingAdd(Address, Bytes / Min);
+          break;
+        }
+        case dwarf::DW_LNS_const_add_pc:
+          Address = SaturatingAdd(Address, uint64_t((255 - OpBase) / Range));
           break;
         case dwarf::DW_LNS_negate_stmt:
         case dwarf::DW_LNS_set_basic_block:
-        case dwarf::DW_LNS_const_add_pc:
         case dwarf::DW_LNS_set_prologue_end:
         case dwarf::DW_LNS_set_epilogue_begin:
           break;
@@ -447,13 +489,36 @@ class Rewriter {
           Want = I->second;
       int64_t Change = Want - After;
       if (Change) {
+        const int64_t RowDelta =
+            Op >= OpBase ? LineBase + int((Op - OpBase) % Range) : 0;
+        int64_t OldDelta, NewDelta;
+        if (RepeatedAdvance || NonScaledAddress ||
+            AddOverflow(Last ? Last->Value : int64_t(0), RowDelta, OldDelta) ||
+            AddOverflow(OldDelta, Change, NewDelta))
+          return fail("unsupported line program advance");
+        auto BeforeForm = lineForm(OldDelta, Address, LineBase, Range, OpBase);
+        auto AfterForm = lineForm(NewDelta, Address, LineBase, Range, OpBase);
+        if (BeforeForm != AfterForm ||
+            (Last && (BeforeForm != LineForm::AdvanceLine || RowDelta)))
+          return fail("row would change the native MC line opcode form");
         if (Last) {
           int64_t V;
-          if (AddOverflow(Last->Value, Change, V) ||
-              getSLEB128Size(V) != Last->End - Last->Begin)
-            return fail("advance_line would change encoded width");
-          encodeSLEB128(V, reinterpret_cast<uint8_t *>(
-                               Out.Bytes.data() + Line->Offset + Last->Begin));
+          if (AddOverflow(Last->Value, Change, V))
+            return fail("advance_line operand overflow");
+          const size_t OldWidth = Last->End - Last->Begin;
+          if (getSLEB128Size(V) == OldWidth) {
+            encodeSLEB128(V,
+                          reinterpret_cast<uint8_t *>(
+                              Out.Bytes.data() + Line->Offset + Last->Begin));
+          } else {
+            if (getSLEB128Size(Last->Value) != OldWidth)
+              return fail("noncanonical variable line operand");
+            uint8_t Encoded[16];
+            const auto End = encodeSLEB128(V, Encoded);
+            Resized.push_back(
+                {Last->Begin, Last->End,
+                 std::string(reinterpret_cast<char *>(Encoded), End)});
+          }
         } else if (Op >= OpBase) {
           int64_t Index = (Op - OpBase) % Range + Change;
           if (Index < 0 || Index >= Range || int64_t(Op) + Change > 255)
@@ -470,6 +535,9 @@ class Rewriter {
         After = Want;
       }
       Last.reset();
+      RepeatedAdvance = false;
+      Address = 0;
+      NonScaledAddress = false;
       if (EndSequence) {
         Before = After = 1;
         File = 1;
@@ -740,6 +808,116 @@ class Rewriter {
     return true;
   }
 
+  bool finishResizedLines(const ELF64LEObjectFile &Obj) {
+    if (Resized.empty())
+      return true;
+    if (LineUnits.size() != 1 || LineUnits.begin()->first != 0 ||
+        LineUnits.begin()->second.End != Line->Size)
+      return fail("resized lines require one complete line unit");
+    llvm::sort(Resized,
+               [](const auto &A, const auto &B) { return A.Begin < B.Begin; });
+    StringRef Bytes(Out.Bytes.data() + Line->Offset, Line->Size);
+    std::string New;
+    size_t Previous = 0;
+    for (auto &E : Resized) {
+      if (E.Begin < Previous || E.Begin >= E.End || E.End > Bytes.size())
+        return fail("overlapping line operand edits");
+      New.append(Bytes.substr(Previous, E.Begin - Previous));
+      New.append(E.Bytes);
+      Previous = E.End;
+      E.ShiftAfter = int64_t(New.size()) - int64_t(E.End);
+    }
+    New.append(Bytes.substr(Previous));
+    if (New.size() < 4 || New.size() - 4 > UINT32_MAX)
+      return fail("resized line unit is too large");
+    support::endian::write32le(New.data(), New.size() - 4);
+
+    const auto &EF = Obj.getELFFile();
+    auto All = EF.sections();
+    if (!All)
+      return fail(toString(All.takeError()));
+    const size_t LineIndex = Debug.at(".debug_line");
+    size_t Next = EF.getHeader().e_shoff;
+    uint64_t Alignment = 8;
+    for (const auto &S : *All) {
+      if (S.sh_type != ELF::SHT_NOBITS && S.sh_size &&
+          S.sh_offset > Line->Offset && S.sh_offset < Next) {
+        Next = S.sh_offset;
+        Alignment = std::max<uint64_t>(1, S.sh_addralign);
+      }
+    }
+    if (New.size() > Raw.size() - Line->Offset || !isPowerOf2_64(Alignment) ||
+        Next < Line->Offset + Line->Size ||
+        alignTo(Line->Offset + Line->Size, Alignment) != Next ||
+        alignTo(Line->Offset + New.size(), Alignment) != Next ||
+        !llvm::all_of(Raw.slice(Line->Offset + Line->Size, Next),
+                      [](char V) { return V == 0; }))
+      return fail("resized line table would move a following ELF section");
+
+    auto OutputOffset = [&](const void *Address) {
+      return Out.Bytes.data() +
+             (static_cast<const char *>(Address) - Raw.data());
+    };
+    for (const auto &S : *All) {
+      if (S.sh_type == ELF::SHT_REL || S.sh_type == ELF::SHT_RELR ||
+          S.sh_type == ELF::SHT_DYNSYM || S.sh_type == ELF::SHT_SYMTAB_SHNDX)
+        return fail("unsupported relocation or symbol-index format on resize");
+      if (S.sh_type == ELF::SHT_SYMTAB) {
+        auto Symbols = EF.symbols(&S);
+        if (!Symbols)
+          return fail(toString(Symbols.takeError()));
+        for (const auto &Sym : *Symbols)
+          if (Sym.st_shndx == LineIndex && (Sym.getType() != ELF::STT_SECTION ||
+                                            Sym.st_value || Sym.st_size))
+            return fail("a named symbol points into the resized line table");
+      }
+      if (S.sh_type != ELF::SHT_RELA)
+        continue;
+      if (S.sh_link >= All->size() ||
+          (*All)[S.sh_link].sh_type != ELF::SHT_SYMTAB)
+        return fail("invalid relocation symbol table");
+      auto Symbols = EF.symbols(&(*All)[S.sh_link]);
+      if (!Symbols)
+        return fail(toString(Symbols.takeError()));
+      auto Relocs = EF.relas(S);
+      if (!Relocs)
+        return fail(toString(Relocs.takeError()));
+      for (const auto &Rel : *Relocs) {
+        const size_t Index = Rel.getSymbol(false);
+        if (Index >= Symbols->size())
+          return fail("invalid ELF relocation symbol");
+        const auto &Sym = (*Symbols)[Index];
+        if (Sym.st_shndx == LineIndex &&
+            (S.sh_info != Debug.at(".debug_info") ||
+             Sym.getType() != ELF::STT_SECTION || Sym.st_value || Rel.r_addend))
+          return fail(
+              "an unsupported relocation references the resized line table");
+        if (S.sh_info != LineIndex)
+          continue;
+        int64_t Shift = 0;
+        auto After = llvm::upper_bound(
+            Resized, uint64_t(Rel.r_offset),
+            [](uint64_t At, const ResizedLEB &E) { return At < E.Begin; });
+        if (After != Resized.begin()) {
+          const auto &Last = *std::prev(After);
+          if (Rel.r_offset < Last.End)
+            return fail("line relocation overlaps a resized operand");
+          Shift = Last.ShiftAfter;
+        }
+        const int64_t Offset = int64_t(Rel.r_offset) + Shift;
+        if (Offset < 0 || uint64_t(Offset) >= New.size())
+          return fail("relocated line address is out of bounds");
+        support::endian::write64le(OutputOffset(&Rel.r_offset), Offset);
+      }
+    }
+    support::endian::write64le(OutputOffset(&(*All)[LineIndex].sh_size),
+                               New.size());
+    std::copy(New.begin(), New.end(), Out.Bytes.begin() + Line->Offset);
+    std::fill(Out.Bytes.begin() + Line->Offset + New.size(),
+              Out.Bytes.begin() + Next, 0);
+    return true;
+  }
+
 public:
   Rewriter(MemoryBufferRef Input, const SourceMap &Lines)
       : Old(Input), Map(Lines), Raw(Input.getBuffer()) {}
@@ -755,57 +933,12 @@ public:
     Out.Bytes.assign(Raw.begin(), Raw.end());
     if (!inspectDWARF(*Obj))
       return unsupported(Problem);
+    if (!finishResizedLines(*Obj))
+      return unsupported(Problem);
     return std::move(Out);
   }
 };
 
-// JSON object names must be unique independently of the consumer's choice of
-// first/last-wins semantics. The LLVM parser first validates the full syntax.
-bool uniqueObjectKeys(StringRef Text) {
-  std::vector<std::set<std::string>> Keys;
-  for (size_t I = 0; I < Text.size(); ++I) {
-    char Ch = Text[I];
-    if (Ch == '{') {
-      Keys.emplace_back();
-      continue;
-    }
-    if (Ch == '}') {
-      if (Keys.empty())
-        return false;
-      Keys.pop_back();
-      continue;
-    }
-    if (Ch != '"')
-      continue;
-    size_t Begin = I;
-    while (++I < Text.size()) {
-      if (Text[I] == '\\') {
-        ++I;
-        continue;
-      }
-      if (Text[I] == '"')
-        break;
-    }
-    const size_t End = I + 1;
-    size_t J = End;
-    while (J < Text.size() && (Text[J] == ' ' || Text[J] == '\t' ||
-                               Text[J] == '\r' || Text[J] == '\n'))
-      ++J;
-    if (J < Text.size() && Text[J] == ':') {
-      if (Keys.empty())
-        return false;
-      auto Key = json::parse(Text.slice(Begin, End));
-      if (!Key) {
-        consumeError(Key.takeError());
-        return false;
-      }
-      auto S = Key->getAsString();
-      if (!S || !Keys.back().insert(S->str()).second)
-        return false;
-    }
-  }
-  return Keys.empty();
-}
 } // namespace
 
 Expected<SourceMap> llvm::ohm::parseSourceMap(StringRef Json) {
