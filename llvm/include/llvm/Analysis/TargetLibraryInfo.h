@@ -82,6 +82,7 @@ public:
 /// TargetLibraryInfo wrapper below.
 class TargetLibraryInfoImpl {
   friend class TargetLibraryInfo;
+  friend class TargetLibraryInfoWrapperPass;
 
   unsigned char AvailableArray[(NumLibFuncs+3)/4];
   DenseMap<unsigned, std::string> CustomNames;
@@ -619,6 +620,7 @@ public:
 
 private:
   friend AnalysisInfoMixin<TargetLibraryAnalysis>;
+  friend class TargetLibraryInfoWrapperPass;
   LLVM_ABI static AnalysisKey Key;
 
   std::optional<TargetLibraryInfoImpl> BaselineInfoImpl;
@@ -643,6 +645,10 @@ public:
   // FIXME: This should be removed when PlaceSafepoints is fixed to not create a
   // PassManager inside a pass.
   explicit TargetLibraryInfoWrapperPass(const TargetLibraryInfo &TLI);
+
+  /// Compare the module-wide baseline before any per-function builtin
+  /// overrides.
+  bool hasBaseline(const TargetLibraryInfoImpl &Expected) const;
 
   TargetLibraryInfo &getTLI(const Function &F) {
     FunctionAnalysisManager DummyFAM;
