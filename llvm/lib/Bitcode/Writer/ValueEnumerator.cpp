@@ -365,21 +365,46 @@ static bool encodeMachineLeaves(SmallVectorImpl<const Value *> &Affected,
 // LLVMContext. Machine passes may consult them, for example when AsmPrinter
 // chooses a GOT-relative relocation for an initializer with exactly one use.
 static bool hasCompleteMachineUses(const Module &M, const OrderMap &OM,
-                                   SmallVectorImpl<uint64_t> &Leaves) {
+                                   MachineUseState &State) {
   SmallVector<const Value *, 8> Affected;
-  auto UsesAreEncoded = [&](const Value *V) {
+  unsigned MetadataEdges = 0;
+  auto UsesAreEncoded = [&](const Value *V, std::pair<unsigned, bool> Order) {
     if (!V->hasUseList())
       return true;
-    bool SawUse = false, HasLeaf = false;
-    for (const User *U : V->users()) {
-      if (SawUse && !OM.lookup(V).second)
+    // MetadataAsValue instruction operands have no value-order ID. Each
+    // (numbered instruction, explicit operand index) nevertheless identifies
+    // the actual value uniquely within this module. Use the least such pair
+    // as its anchor and capture the complete live list in its actual order.
+    if (!Order.second && !V->use_empty() && !V->hasOneUse()) {
+      if (!isa<MetadataAsValue>(V) || Order.first ||
+          State.MetadataUses.size() >= 4096)
         return false;
+      SmallVector<uint64_t, 8> Record(2);
+      std::pair<unsigned, unsigned> Anchor{0, 0};
+      for (const Use &U : V->uses()) {
+        const auto *I = dyn_cast<Instruction>(U.getUser());
+        unsigned ID = OM.lookup(U.getUser()).first;
+        unsigned Op = U.getOperandNo();
+        if (!I || !ID || Op >= I->getNumOperands() ||
+            &I->getOperandUse(Op) != &U || ++MetadataEdges > 65536)
+          return false;
+        auto Edge = std::make_pair(ID, Op);
+        if (!Anchor.first || Edge < Anchor)
+          Anchor = Edge;
+        Record.append({ID, Op});
+      }
+      Record[0] = Anchor.first;
+      Record[1] = Anchor.second;
+      State.MetadataUses.push_back(std::move(Record));
+      return true;
+    }
+    bool HasLeaf = false;
+    for (const User *U : V->users()) {
       if (!OM.lookup(U).first) {
-        if (!OM.lookup(V).first || !isa<ConstantArray, ConstantStruct>(U))
+        if (!Order.first || !isa<ConstantArray, ConstantStruct>(U))
           return false;
         HasLeaf = true;
       }
-      SawUse = true;
     }
     if (HasLeaf) {
       if (Affected.size() >= 4096)
@@ -413,7 +438,7 @@ static bool hasCompleteMachineUses(const Module &M, const OrderMap &OM,
   // part of that map, even though its operands appear somewhere in the file.
   for (const auto &Entry : OM.IDs) {
     const Value *V = Entry.first;
-    if (!UsesAreEncoded(V))
+    if (!UsesAreEncoded(V, Entry.second))
       return false;
     if (const auto *BB = dyn_cast<BasicBlock>(V)) {
       // A BlockAddress can mark its block without creating a Use on it.
@@ -444,7 +469,7 @@ static bool hasCompleteMachineUses(const Module &M, const OrderMap &OM,
   while (!PendingValues.empty() || !PendingMetadata.empty()) {
     while (!PendingValues.empty()) {
       const Value *V = PendingValues.pop_back_val();
-      if (!UsesAreEncoded(V))
+      if (!UsesAreEncoded(V, {0, false}))
         return false;
       if (const auto *U = dyn_cast<User>(V))
         for (const Use &Op : U->operands())
@@ -464,7 +489,8 @@ static bool hasCompleteMachineUses(const Module &M, const OrderMap &OM,
         AddValue(VAM->getValue());
     }
   }
-  return encodeMachineLeaves(Affected, OM, Leaves);
+  llvm::sort(State.MetadataUses);
+  return encodeMachineLeaves(Affected, OM, State.Leaves);
 }
 
 static UseListOrderStack predictUseListOrder(const Module &M,
@@ -540,7 +566,7 @@ static UseListOrderStack predictUseListOrder(const Module &M,
   }
 
   if (Uses)
-    Uses->Complete = hasCompleteMachineUses(M, OM, Uses->Leaves);
+    Uses->Complete = hasCompleteMachineUses(M, OM, *Uses);
   return Stack;
 }
 
