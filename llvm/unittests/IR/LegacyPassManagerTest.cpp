@@ -17,6 +17,7 @@
 #include "llvm/Analysis/CallGraphSCCPass.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/LoopPass.h"
+#include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/AsmParser/Parser.h"
 #include "llvm/IR/AbstractCallSite.h"
 #include "llvm/IR/BasicBlock.h"
@@ -250,6 +251,48 @@ struct PrefixAnalysis : ImmutablePass {
   PrefixAnalysis() : ImmutablePass(ID) {}
 };
 char PrefixAnalysis::ID;
+
+TEST(PassManager, WrappedModulePipelineChecksEffectiveLibraryInfo) {
+  initializeTargetLibraryInfoWrapperPassPass(*PassRegistry::getPassRegistry());
+  LLVMContext C;
+  Module M("library-policy", C);
+  const TargetLibraryInfoImpl Default(Triple("x86_64-unknown-linux-gnu"));
+  auto Check = [&](ArrayRef<bool> DisableBuiltins, bool ShouldWrap) {
+    legacy::PassManager PM;
+    for (bool Disable : DisableBuiltins) {
+      TargetLibraryInfoImpl Info(Default);
+      if (Disable)
+        Info.disableAllFunctions();
+      PM.add(new TargetLibraryInfoWrapperPass(Info));
+    }
+    bool Wrapped = false;
+    ModuleNDNM::run = 0;
+    PM.addWrappedModulePipelineWithPrefixCheck(
+        [&](const Pass &P) {
+          return P.getPassID() == &TargetLibraryInfoWrapperPass::ID &&
+                 static_cast<const TargetLibraryInfoWrapperPass &>(P)
+                     .hasBaseline(Default);
+        },
+        [&] {
+          // CodeGen also installs its own target-default TLI.
+          PM.add(new TargetLibraryInfoWrapperPass(Default));
+          PM.add(new ModuleNDNM);
+          return false;
+        },
+        [&](Module &, function_ref<bool()>) {
+          Wrapped = true;
+          return false;
+        });
+    PM.run(M);
+    EXPECT_EQ(ShouldWrap, Wrapped);
+    EXPECT_EQ(ShouldWrap ? 0 : 1, ModuleNDNM::run);
+  };
+  Check({}, true);
+  Check({false}, true);
+  Check({true}, false);
+  Check({false, true}, true);
+  Check({true, false}, false);
+}
 
 TEST(PassManager, WrappedModulePipelineIsOneShot) {
   LLVMContext C;
