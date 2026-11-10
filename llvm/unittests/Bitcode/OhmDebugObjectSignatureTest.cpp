@@ -5,14 +5,18 @@
 #include "llvm/Bitcode/OhmDebugObjectSignature.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/AsmParser/Parser.h"
+#include "llvm/Bitcode/BitcodeReader.h"
+#include "llvm/Bitcode/BitcodeWriter.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/Endian.h"
 #include "llvm/Support/FormatVariadic.h"
+#include "llvm/Support/MemoryBufferRef.h"
 #include "llvm/Support/SHA256.h"
 #include "llvm/Support/SourceMgr.h"
 #include "gtest/gtest.h"
 #include <array>
+#include <set>
 
 using namespace llvm;
 
@@ -127,6 +131,252 @@ protected:
                            Mapping.size(), Proof.data(), Proof.size());
   }
 };
+
+static std::string machineKey(Module &M) {
+  char *Data = nullptr;
+  size_t Size = 0;
+  bool Saved = ohm_bc_save_v1(wrap(&M), &Data, &Size);
+  std::string Key;
+  if (Saved)
+    Key.assign(Data, Size);
+  ohm_bc_free_v1(Data);
+  return Key;
+}
+
+static bool canSaveMachineInput(Module &M) { return !machineKey(M).empty(); }
+
+TEST(DebugObjectUsesTest, AuthenticatesAnUnreferencedInitializerUser) {
+  LLVMContext Context;
+  SMDiagnostic Error;
+  auto M = parseAssemblyString(R"(
+    target triple = "x86_64-unknown-linux-gnu"
+    @target = external global i32
+    @ptr = private unnamed_addr constant ptr @target
+    @field = constant i32 trunc (i64 sub (i64 ptrtoint (ptr @ptr to i64),
+                                         i64 ptrtoint (ptr @field to i64)) to i32)
+  )",
+                               Error, Context);
+  ASSERT_TRUE(M);
+  auto Serialize = [&] {
+    SmallVector<char, 0> Bytes;
+    raw_svector_ostream Stream(Bytes);
+    WriteBitcodeToFile(*M, Stream, /*ShouldPreserveUseListOrder=*/true);
+    return Bytes;
+  };
+  auto Before = Serialize();
+  std::string OriginalKey = machineKey(*M);
+  ASSERT_FALSE(OriginalKey.empty());
+  Constant *Init = M->getNamedGlobal("field")->getInitializer();
+  ASSERT_TRUE(Init->hasOneUse());
+  auto *Unreferenced = ConstantStruct::getAnon({Init});
+  EXPECT_EQ(Before, Serialize());
+  EXPECT_FALSE(Init->hasOneUse());
+  std::string WithLeaf = machineKey(*M);
+  ASSERT_FALSE(WithLeaf.empty());
+  EXPECT_NE(OriginalKey, WithLeaf);
+  // The private evidence block remains valid, readable LLVM bitcode.
+  LLVMContext OtherContext;
+  auto Read =
+      parseBitcodeFile(MemoryBufferRef(WithLeaf, "checked"), OtherContext);
+  ASSERT_TRUE(bool(Read)) << toString(Read.takeError());
+  EXPECT_NE(nullptr, (*Read)->getNamedGlobal("field"));
+  // Named metadata serializes the user without giving it a value ID in the
+  // writer's use-list order map.
+  auto *Named = M->getOrInsertNamedMetadata("additional");
+  Named->addOperand(
+      MDNode::get(Context, ConstantAsMetadata::get(Unreferenced)));
+  EXPECT_FALSE(canSaveMachineInput(*M));
+  M->eraseNamedMetadata(Named);
+  Unreferenced->destroyConstant();
+  EXPECT_TRUE(canSaveMachineInput(*M));
+}
+
+TEST(DebugObjectUsesTest, ChecksInstructionsBlocksAndMetadataOnlyOperands) {
+  LLVMContext Context;
+  SMDiagnostic Error;
+  auto M = parseAssemblyString(R"(
+    target triple = "x86_64-unknown-linux-gnu"
+    define i32 @f(i32 %arg) {
+      br label %exit
+    exit:
+      %v = add i32 %arg, 1
+      ret i32 %v
+    }
+    !named = !{!0}
+    !0 = !{ptr inttoptr (i64 123456789 to ptr)}
+  )",
+                               Error, Context);
+  ASSERT_TRUE(M);
+  ASSERT_TRUE(canSaveMachineInput(*M));
+  Function *F = M->getFunction("f");
+  BasicBlock &Exit = F->back();
+  auto *Outside = BinaryOperator::CreateAdd(F->getArg(0), &Exit.front());
+  EXPECT_FALSE(canSaveMachineInput(*M));
+  Outside->deleteValue();
+  auto *Address = BlockAddress::get(&Exit);
+  EXPECT_FALSE(canSaveMachineInput(*M));
+  auto *AddressOwner = new GlobalVariable(*M, Address->getType(), true,
+                                          GlobalValue::PrivateLinkage, Address);
+  EXPECT_TRUE(canSaveMachineInput(*M));
+  AddressOwner->eraseFromParent();
+  Address->destroyConstant();
+  Constant *Number = ConstantExpr::getIntToPtr(
+      ConstantInt::get(Type::getInt64Ty(Context), 123456789),
+      PointerType::getUnqual(Context));
+  auto *User = ConstantStruct::getAnon({Number});
+  EXPECT_FALSE(canSaveMachineInput(*M));
+  User->destroyConstant();
+  EXPECT_TRUE(canSaveMachineInput(*M));
+}
+
+TEST(DebugObjectUsesTest, AuthenticatesLeafKindsOperandsAndUseOrder) {
+  LLVMContext C;
+  SMDiagnostic Error;
+  auto M = parseAssemblyString(R"(
+    target triple = "x86_64-unknown-linux-gnu"
+    @a = external global i8
+    @b = external global i8
+    @keep = global ptr @a
+  )",
+                               Error, C);
+  ASSERT_TRUE(M);
+  GlobalVariable *A = M->getNamedGlobal("a"), *B = M->getNamedGlobal("b");
+  auto *Ptr = A->getType();
+  auto *I64 = Type::getInt64Ty(C);
+  auto *I128 = Type::getInt128Ty(C);
+  std::set<std::string> Keys;
+  auto Distinct = [&](Constant *Leaf) {
+    std::string Key = machineKey(*M);
+    EXPECT_FALSE(Key.empty());
+    EXPECT_TRUE(Keys.insert(Key).second);
+    Leaf->destroyConstant();
+  };
+  Distinct(ConstantStruct::getAnon({A, B}));
+  Distinct(ConstantStruct::getAnon({B, A}));
+  Distinct(ConstantStruct::getAnon({A, B}, true));
+  Distinct(ConstantArray::get(ArrayType::get(Ptr, 2), {A, B}));
+  Distinct(ConstantStruct::getAnon({A, B, A}));
+  Distinct(ConstantStruct::getAnon({A, PoisonValue::get(I64)}));
+  Distinct(ConstantStruct::getAnon({A, UndefValue::get(I64)}));
+  Distinct(ConstantStruct::getAnon({A, UndefValue::get(I128)}));
+  Distinct(ConstantStruct::getAnon({A, ConstantInt::get(I128, 0)}));
+  Distinct(ConstantStruct::getAnon(
+      {A, ConstantInt::get(C, APInt::getOneBitSet(128, 120))}));
+
+  auto Ordinary = [&] {
+    SmallVector<char, 0> Data;
+    raw_svector_ostream OS(Data);
+    WriteBitcodeToFile(*M, OS, /*ShouldPreserveUseListOrder=*/true);
+    return Data;
+  };
+  auto Public = Ordinary();
+  auto *Repeated = ConstantArray::get(ArrayType::get(Ptr, 2), {A, A});
+  std::string Before = machineKey(*M);
+  A->reverseUseList();
+  std::string After = machineKey(*M);
+  EXPECT_EQ(Public, Ordinary());
+  EXPECT_FALSE(Before.empty());
+  EXPECT_FALSE(After.empty());
+  EXPECT_NE(Before, After);
+  A->reverseUseList();
+  EXPECT_EQ(Before, machineKey(*M));
+  auto *Nested = ConstantStruct::getAnon({Repeated});
+  EXPECT_FALSE(canSaveMachineInput(*M));
+  Nested->destroyConstant();
+  Repeated->destroyConstant();
+  auto *Named = StructType::create(C, {Ptr}, "named");
+  auto *Identified = ConstantStruct::get(Named, A);
+  EXPECT_FALSE(canSaveMachineInput(*M));
+  Identified->destroyConstant();
+  SmallVector<Constant *, 0> Many(257, A);
+  auto *Wide = ConstantArray::get(ArrayType::get(Ptr, Many.size()), Many);
+  EXPECT_FALSE(canSaveMachineInput(*M));
+  Wide->destroyConstant();
+}
+
+TEST(DebugObjectUsesTest, AuthenticatesUnnumberedMetadataOperandOrder) {
+  LLVMContext C;
+  SMDiagnostic Error;
+  auto M = parseAssemblyString(R"(
+    target triple = "x86_64-unknown-linux-gnu"
+    declare void @llvm.experimental.noalias.scope.decl(metadata)
+    define void @f() {
+      call void @llvm.experimental.noalias.scope.decl(metadata !2)
+      call void @llvm.experimental.noalias.scope.decl(metadata !2)
+      ret void
+    }
+    !0 = distinct !{!0, !"domain"}
+    !1 = distinct !{!1, !0, !"scope"}
+    !2 = !{!1}
+  )",
+                               Error, C);
+  ASSERT_TRUE(M);
+  auto *Call = cast<CallInst>(&M->getFunction("f")->front().front());
+  auto *Scope = cast<MetadataAsValue>(Call->getArgOperand(0));
+  ASSERT_TRUE(Scope->hasNUses(2));
+  auto Ordinary = [&] {
+    SmallVector<char, 0> Data;
+    raw_svector_ostream OS(Data);
+    WriteBitcodeToFile(*M, OS, /*ShouldPreserveUseListOrder=*/true);
+    return Data;
+  };
+  auto Public = Ordinary();
+  std::string Key = machineKey(*M);
+  ASSERT_FALSE(Key.empty());
+  Scope->reverseUseList();
+  EXPECT_EQ(Public, Ordinary());
+  EXPECT_NE(Key, machineKey(*M));
+  Scope->reverseUseList();
+  EXPECT_EQ(Key, machineKey(*M));
+  auto *Outside = CallInst::Create(Call->getFunctionType(),
+                                   Call->getCalledOperand(), {Scope});
+  EXPECT_FALSE(canSaveMachineInput(*M));
+  Outside->deleteValue();
+  EXPECT_EQ(Key, machineKey(*M));
+}
+
+TEST(DebugObjectUsesTest, IncludesTheWritersImplicitShuffleMask) {
+  LLVMContext Context;
+  SMDiagnostic Error;
+  auto M = parseAssemblyString(R"(
+    target triple = "x86_64-unknown-linux-gnu"
+    define <2 x i32> @f(<2 x i32> %v) {
+      %s = shufflevector <2 x i32> %v, <2 x i32> poison,
+                         <2 x i32> <i32 1, i32 poison>
+      ret <2 x i32> %s
+    }
+  )",
+                               Error, Context);
+  ASSERT_TRUE(M);
+  ASSERT_TRUE(canSaveMachineInput(*M));
+  auto &Shuffle = cast<ShuffleVectorInst>(M->getFunction("f")->front().front());
+  Constant *Mask = Shuffle.getShuffleMaskForBitcode();
+  ASSERT_TRUE(Mask->hasUseList());
+  std::string Before = machineKey(*M);
+  auto *User = ConstantStruct::getAnon({Mask});
+  ASSERT_TRUE(canSaveMachineInput(*M));
+  EXPECT_NE(Before, machineKey(*M));
+  User->destroyConstant();
+  EXPECT_TRUE(canSaveMachineInput(*M));
+}
+
+TEST_F(DebugObjectSignatureTest, ChecksUsesOnBothSidesOfALineTableLookup) {
+  LLVMContext Before, After;
+  auto Old = module(Before, OldSum, 3, "same");
+  auto New = module(After, NewSum, 4, "same");
+  ASSERT_TRUE(Old && New);
+  train(*Old);
+  ASSERT_TRUE(matches(*New));
+  auto *User = ConstantStruct::getAnon({New->getFunction("f")});
+  EXPECT_TRUE(canSaveMachineInput(*New));
+  EXPECT_FALSE(matches(*New));
+  auto *OldUser = ConstantStruct::getAnon({Old->getFunction("f")});
+  train(*Old);
+  EXPECT_TRUE(matches(*New));
+  User->destroyConstant();
+  EXPECT_FALSE(matches(*New));
+  OldUser->destroyConstant();
+}
 
 TEST_F(DebugObjectSignatureTest, MatchesOnlyExistingSourceCoordinates) {
   LLVMContext Before, After, Inserted;

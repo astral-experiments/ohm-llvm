@@ -18,6 +18,7 @@
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/Twine.h"
 #include "llvm/IR/DiagnosticInfo.h"
+#include "llvm/IR/DiagnosticObservation.h"
 #include "llvm/IR/DiagnosticPrinter.h"
 #include "llvm/IR/LLVMRemarkStreamer.h"
 #include "llvm/Remarks/RemarkStreamer.h"
@@ -248,8 +249,26 @@ LLVMContext::getDiagnosticMessagePrefix(DiagnosticSeverity Severity) {
   llvm_unreachable("Unknown DiagnosticSeverity");
 }
 
+DiagnosticObservation::DiagnosticObservation(LLVMContext &C) : Context(C) {
+  Context.pImpl->DiagnosticObservers.fetch_add(1, std::memory_order_relaxed);
+  Before = Context.pImpl->ObservedDiagnostics.load(std::memory_order_relaxed);
+}
+
+DiagnosticObservation::~DiagnosticObservation() {
+  Context.pImpl->DiagnosticObservers.fetch_sub(1, std::memory_order_relaxed);
+}
+
+bool DiagnosticObservation::hasDiagnostics() const {
+  return Context.pImpl->ObservedDiagnostics.load(std::memory_order_relaxed) !=
+         Before;
+}
+
 void LLVMContext::diagnose(const DiagnosticInfo &DI) {
-  if (auto *OptDiagBase = dyn_cast<DiagnosticInfoOptimizationBase>(&DI))
+  const auto *OptDiagBase = dyn_cast<DiagnosticInfoOptimizationBase>(&DI);
+  if (pImpl->DiagnosticObservers.load(std::memory_order_relaxed) &&
+      (!OptDiagBase || !pImpl->DiagHandler || OptDiagBase->isEnabled()))
+    pImpl->ObservedDiagnostics.fetch_add(1, std::memory_order_relaxed);
+  if (OptDiagBase)
     if (LLVMRemarkStreamer *RS = getLLVMRemarkStreamer())
       RS->emit(*OptDiagBase);
 

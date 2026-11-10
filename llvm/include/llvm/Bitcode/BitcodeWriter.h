@@ -29,12 +29,14 @@ class Module;
 class raw_ostream;
 
 struct DebugObjectSourceMap;
+struct MachineUseState;
 
 class BitcodeWriter {
   friend bool writeDebugObjectBitcode(const Module &, SmallVectorImpl<char> &,
                                       DebugObjectSourceMap *);
   void writeModuleImpl(const Module &, bool, const ModuleSummaryIndex *, bool,
-                       ModuleHash *, DebugObjectSourceMap *);
+                       ModuleHash *, DebugObjectSourceMap *,
+                       MachineUseState *Uses = nullptr);
 
   std::unique_ptr<BitstreamWriter> Stream;
 

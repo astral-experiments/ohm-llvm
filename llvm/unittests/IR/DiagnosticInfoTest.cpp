@@ -7,6 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/IR/DiagnosticInfo.h"
+#include "llvm/IR/DiagnosticObservation.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/Casting.h"
@@ -31,6 +32,29 @@ TEST(DiagnosticInfoTest, DebugMetadataKindsMatchClassof) {
   EXPECT_EQ(DK_DebugMetadataInvalid, InvalidInfo->getKind());
   EXPECT_TRUE(isa<DiagnosticInfoIgnoringInvalidDebugMetadata>(InvalidInfo));
   EXPECT_FALSE(isa<DiagnosticInfoDebugMetadataVersion>(InvalidInfo));
+}
+
+TEST(DiagnosticInfoTest, CountsDiagnosticsAcrossHandlers) {
+  LLVMContext Context;
+  Context.setDiagnosticHandlerCallBack([](const DiagnosticInfo *, void *) {},
+                                       nullptr);
+  DiagnosticObservation Observation(Context);
+  EXPECT_FALSE(Observation.hasDiagnostics());
+  Context.diagnose(DiagnosticInfoInlineAsm(0, "warning", DS_Warning));
+  EXPECT_TRUE(Observation.hasDiagnostics());
+  DiagnosticObservation Nested(Context);
+  EXPECT_FALSE(Nested.hasDiagnostics());
+  Context.setDiagnosticHandlerCallBack([](const DiagnosticInfo *, void *) {},
+                                       nullptr);
+  Context.emitError("error");
+  EXPECT_TRUE(Nested.hasDiagnostics());
+
+  DiagnosticObservation DisabledRemark(Context);
+  Module M("M", Context);
+  auto *Ty = FunctionType::get(Type::getVoidTy(Context), false);
+  auto *F = Function::Create(Ty, GlobalValue::ExternalLinkage, "f", M);
+  Context.diagnose(OptimizationRemark("test", "disabled", F));
+  EXPECT_FALSE(DisabledRemark.hasDiagnostics());
 }
 
 } // end anonymous namespace
