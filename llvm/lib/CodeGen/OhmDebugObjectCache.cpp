@@ -17,6 +17,7 @@
 #include "llvm/CodeGen/OhmLineCertificate.h"
 #include "llvm/DebugInfo/DWARF/OhmRuntimeLocations.h"
 #include "llvm/IR/DebugInfoMetadata.h"
+#include "llvm/IR/DiagnosticObservation.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/BLAKE3.h"
@@ -231,6 +232,7 @@ bool contains(ArrayRef<StringRef> Choices, StringRef Value) {
 }
 struct Invocation {
   std::string Root, Entries, Blobs, Cwd, Remap, Namespace;
+  bool WithoutDebug = false;
   std::optional<ohm::DebugObjectImageGeneration> Generation;
   bool imagesUnchanged() const {
     return Generation && Generation == ohm::getDebugObjectImageGeneration();
@@ -249,6 +251,7 @@ struct Invocation {
       return;
     StringRef Incremental, Opt, LTO, Embed, Debug, Crate, Outputs, Source;
     bool Ohm = false;
+    bool Strip = false;
     for (size_t I = 1; I < Args.size(); ++I) {
       StringRef A = Args[I], Key, V;
       if (A.starts_with("--")) {
@@ -287,8 +290,8 @@ struct Invocation {
         auto [O, Value] = V.split('=');
         if (Key == "-C") {
           if (!contains({"opt-level", "lto", "embed-bitcode", "debuginfo",
-                         "debug-assertions", "metadata", "extra-filename",
-                         "incremental", "linker-features",
+                         "strip", "debug-assertions", "metadata",
+                         "extra-filename", "incremental", "linker-features",
                          "link-self-contained", "link-arg", "codegen-units",
                          "overflow-checks", "target-cpu", "target-feature",
                          "relocation-model", "code-model", "panic"},
@@ -302,7 +305,11 @@ struct Invocation {
             Embed = Value;
           else if (O == "debuginfo")
             Debug = Value;
-          else if (O == "incremental")
+          else if (O == "strip") {
+            if (!contains({"none", "debuginfo", "symbols"}, Value))
+              return;
+            Strip = true;
+          } else if (O == "incremental")
             Incremental = Value;
         } else if (Key == "-Z") {
           if (!contains({"ohm-shared-stages", "public-api-hash", "threads",
@@ -322,10 +329,13 @@ struct Invocation {
       else
         return;
     }
+    WithoutDebug = Debug.empty() || Debug == "0" || Debug == "none";
     if (!Ohm || Source.empty() || !contains({"lib", "rlib"}, Crate) ||
         Outputs != "dep-info,metadata,link" ||
         !sys::path::is_absolute(Incremental) || Opt != "1" || LTO != "off" ||
-        Embed != "no" || Debug != "line-tables-only" || Remap.empty())
+        Embed != "no" ||
+        (!WithoutDebug && (Debug != "line-tables-only" || Strip)) ||
+        Remap.empty())
       return;
     // An ELF extension can change target passes without changing rustc, its
     // driver, libLLVM, or the input IR. getenv() loses constructors' unsets.
@@ -377,7 +387,8 @@ struct Invocation {
     Namespace = toHex(Key.final(), true);
     Entries = joinPath(Base, "objects");
     Blobs = joinPath(Base, "sources");
-    if (!privateDirectory(Entries) || !privateDirectory(Blobs))
+    if (!privateDirectory(Entries) ||
+        (!WithoutDebug && !privateDirectory(Blobs)))
       return;
     // Source blobs can be pruned independently: a missing origin source is a
     // checked miss. The content keys also cover entries from older toolchains.
@@ -385,8 +396,10 @@ struct Invocation {
     CachePruningPolicy Policy;
     Policy.MaxSizeBytes = 4ULL << 30;
     consumeError(pruneCache(Entries, Policy).takeError());
-    Policy.MaxSizeBytes = 1ULL << 30;
-    consumeError(pruneCache(Blobs, Policy).takeError());
+    if (!WithoutDebug) {
+      Policy.MaxSizeBytes = 1ULL << 30;
+      consumeError(pruneCache(Blobs, Policy).takeError());
+    }
     Root = std::move(Base);
   }
 };
@@ -468,32 +481,39 @@ struct Origin {
   }
 };
 
-bool ordinaryModule(const Module &M) {
+bool ordinaryModule(const Module &M, bool WithoutDebug) {
   if (!M.getModuleInlineAsm().empty() || M.getModuleFlag("ProfileSummary") ||
       M.getModuleFlag("CSProfileSummary") ||
       M.getModuleFlag("Debug Info For Profiling"))
     return false;
   const auto *Units = M.getNamedMetadata("llvm.dbg.cu");
-  if (!Units || Units->getNumOperands() != 1)
-    return false;
-  const auto *CU = dyn_cast<DICompileUnit>(Units->getOperand(0));
-  if (!CU || CU->getEmissionKind() != DICompileUnit::LineTablesOnly ||
-      CU->getDebugInfoForProfiling() || CU->getDWOId() ||
-      !CU->getSplitDebugFilename().empty())
-    return false;
+  if (WithoutDebug) {
+    if (Units)
+      return false;
+  } else {
+    if (!Units || Units->getNumOperands() != 1)
+      return false;
+    const auto *CU = dyn_cast<DICompileUnit>(Units->getOperand(0));
+    if (!CU || CU->getEmissionKind() != DICompileUnit::LineTablesOnly ||
+        CU->getDebugInfoForProfiling() || CU->getDWOId() ||
+        !CU->getSplitDebugFilename().empty())
+      return false;
+  }
   for (const NamedMDNode &N : M.named_metadata())
     if (N.getName().starts_with("llvm.pseudo_probe") ||
         N.getName().starts_with("llvm.coverage"))
       return false;
   for (const GlobalVariable &G : M.globals())
-    if (G.getName().starts_with("__llvm_prf") ||
+    if ((WithoutDebug && G.getMetadata(LLVMContext::MD_dbg)) ||
+        G.getName().starts_with("__llvm_prf") ||
         G.getName().starts_with("__llvm_cov") ||
         G.getName().starts_with("__sancov"))
       return false;
   for (const Function &F : M) {
     StringRef N = F.getName();
     const auto *SP = F.getSubprogram();
-    if (F.hasGC() || (SP && SP->getKeyInstructionsEnabled()) ||
+    if (F.hasGC() ||
+        (SP && (WithoutDebug || SP->getKeyInstructionsEnabled())) ||
         N.starts_with("llvm.instrprof") || N.starts_with("llvm.pseudoprobe") ||
         N.starts_with("llvm.experimental.gc.") ||
         N.starts_with("llvm.experimental.stackmap") ||
@@ -514,7 +534,7 @@ bool ordinaryModule(const Module &M) {
     }
     for (const BasicBlock &BB : F)
       for (const Instruction &Inst : BB) {
-        if (Inst.hasDbgRecords())
+        if (Inst.hasDbgRecords() || (WithoutDebug && Inst.getDebugLoc()))
           return false;
         if (const auto *CB = dyn_cast<CallBase>(&Inst); CB && CB->isInlineAsm())
           return false;
@@ -535,6 +555,75 @@ void event(StringRef M, StringRef State, StringRef Reason = {}) {
   (void)::write(FD, S.data(), S.size());
   ::close(FD);
 }
+// For a module without debug information, an exact machine input needs no
+// source snapshots or changes to its object. Bind its output to the full
+// input, target and toolchain, including the use-list order in the bitcode.
+std::string exactObjectKey(Module &M, const Invocation &I, StringRef Target) {
+  Signature Input;
+  if (!ohm_bc_save_v1(reinterpret_cast<LLVMModuleRef>(&M), &Input.Data,
+                      &Input.Size))
+    return {};
+  BLAKE3 H;
+  frame(H, "ohm-exact-machine-input-v1");
+  frame(H, I.Namespace);
+  frame(H, Target);
+  frame(H, M.getModuleIdentifier());
+  frame(H, Input.bytes());
+  return toHex(H.final(), true);
+}
+
+bool runExactObjectCache(Module &M, const Invocation &I, StringRef Target,
+                         raw_svector_ostream &Out, function_ref<bool()> Emit) {
+  LLVMContext &Ctx = M.getContext();
+  const auto *DH = Ctx.getDiagHandlerPtr();
+  if (!DH || DH->HasErrors || DH->isAnyRemarkEnabled() ||
+      Ctx.getMainRemarkStreamer() || Ctx.getLLVMRemarkStreamer()) {
+    event(M.getModuleIdentifier(), "bypass", "explicit compiler diagnostics");
+    return Emit();
+  }
+  std::string Key = exactObjectKey(M, I, Target);
+  if (Key.empty())
+    return Emit();
+  std::string Path = joinPath(I.Entries, "llvmcache-" + Key);
+  constexpr StringLiteral Header("OHMOBJ01");
+  auto Checksum = [&](StringRef Object) {
+    BLAKE3 Digest;
+    frame(Digest, Key);
+    frame(Digest, Object);
+    return toHex(Digest.final(), true);
+  };
+  if (auto Saved = readPrivate(Path, MaxOrigin)) {
+    StringRef Record = Saved->getBuffer();
+    if (Record.consume_front(Header) && Record.size() >= 64) {
+      StringRef Stored = Record.take_front(64);
+      StringRef Object = Record.drop_front(64);
+      if (Object.starts_with("\x7f"
+                             "ELF") &&
+          Stored == Checksum(Object) && I.imagesUnchanged()) {
+        Out << Object;
+        event(M.getModuleIdentifier(), "hit", "exact machine input");
+        return false;
+      }
+    }
+  }
+
+  DiagnosticObservation Diagnostics(Ctx);
+  bool Changed = Emit();
+  StringRef Object = Out.str();
+  if (Diagnostics.hasDiagnostics()) {
+    event(M.getModuleIdentifier(), "bypass", "machine diagnostics");
+    return Changed;
+  }
+  if (Object.starts_with("\x7f"
+                         "ELF") &&
+      Object.size() <= MaxOrigin - Header.size() - 64 && I.imagesUnchanged()) {
+    std::string Sum = Checksum(Object);
+    if (writeAtomic(Path, {Header, Sum, Object}))
+      event(M.getModuleIdentifier(), "committed", "exact machine input");
+  }
+  return Changed;
+}
+
 #endif
 } // namespace
 
@@ -559,16 +648,20 @@ bool llvm::ohm::runDebugObjectCache(Module &M, CodeGenTargetMachineImpl &TM,
 #if defined(__linux__) && defined(__x86_64__)
   // This precedes all cache filesystem activity, including toolchain identity
   // reads and the creation of source or object directories.
-  if (!Out.str().empty() || !isLargeDebugObjectInput(M))
+  if (!Out.str().empty() ||
+      !isLargeDebugObjectInput(M, !M.getNamedMetadata("llvm.dbg.cu")))
     return Emit();
   auto &I = invocation();
-  if (I.Root.empty() || !I.imagesUnchanged() || !ordinaryModule(M))
+  if (I.Root.empty() || !I.imagesUnchanged() ||
+      !ordinaryModule(M, I.WithoutDebug))
     return Emit();
   std::string Target =
       TM.getTargetTriple().str() + "|" + TM.getTargetCPU().str() + "|" +
       TM.getTargetFeatureString().str() + "|" +
       std::to_string(unsigned(TM.getRelocationModel())) + "|" +
       std::to_string(unsigned(TM.getCodeModel())) + "|" + M.getDataLayoutStr();
+  if (I.WithoutDebug)
+    return runExactObjectCache(M, I, Target, Out, Emit);
   BLAKE3 Key;
   frame(Key, I.Namespace);
   frame(Key, M.getModuleIdentifier());

@@ -216,11 +216,14 @@ public:
   ModuleBitcodeWriterBase(const Module &M, StringTableBuilder &StrtabBuilder,
                           BitstreamWriter &Stream,
                           bool ShouldPreserveUseListOrder,
-                          const ModuleSummaryIndex *Index)
+                          const ModuleSummaryIndex *Index,
+                          MachineUseState *Uses = nullptr)
       : BitcodeWriterBase(Stream, StrtabBuilder), M(M),
-        VE(M, PreserveBitcodeUseListOrder.getNumOccurrences()
-                  ? PreserveBitcodeUseListOrder
-                  : ShouldPreserveUseListOrder),
+        VE(M,
+           PreserveBitcodeUseListOrder.getNumOccurrences()
+               ? PreserveBitcodeUseListOrder
+               : ShouldPreserveUseListOrder,
+           Uses),
         Index(Index) {
     // Assign ValueIds to any callee values in the index that came from
     // indirect call profiles and were recorded as a GUID not a Value*
@@ -314,9 +317,10 @@ public:
                       BitstreamWriter &Stream, bool ShouldPreserveUseListOrder,
                       const ModuleSummaryIndex *Index, bool GenerateHash,
                       ModuleHash *ModHash = nullptr,
-                      DebugObjectSourceMap *SourceMap = nullptr)
+                      DebugObjectSourceMap *SourceMap = nullptr,
+                      MachineUseState *Uses = nullptr)
       : ModuleBitcodeWriterBase(M, StrtabBuilder, Stream,
-                                ShouldPreserveUseListOrder, Index),
+                                ShouldPreserveUseListOrder, Index, Uses),
         GenerateHash(GenerateHash), ModHash(ModHash),
         BitcodeStartBit(Stream.GetCurrentBitNo()) {
     VE.setSourceMap(SourceMap);
@@ -5704,7 +5708,8 @@ void BitcodeWriter::writeModuleImpl(const Module &M,
                                     bool ShouldPreserveUseListOrder,
                                     const ModuleSummaryIndex *Index,
                                     bool GenerateHash, ModuleHash *ModHash,
-                                    DebugObjectSourceMap *SourceMap) {
+                                    DebugObjectSourceMap *SourceMap,
+                                    MachineUseState *Uses) {
   assert(!WroteStrtab);
 
   // The Mods vector is used by irsymtab::build, which requires non-const
@@ -5716,8 +5721,9 @@ void BitcodeWriter::writeModuleImpl(const Module &M,
 
   ModuleBitcodeWriter ModuleWriter(M, StrtabBuilder, *Stream,
                                    ShouldPreserveUseListOrder, Index,
-                                   GenerateHash, ModHash, SourceMap);
-  ModuleWriter.write();
+                                   GenerateHash, ModHash, SourceMap, Uses);
+  if (!Uses || Uses->Complete)
+    ModuleWriter.write();
 }
 
 bool llvm::writeDebugObjectBitcode(const Module &M,
@@ -5732,10 +5738,24 @@ bool llvm::writeDebugObjectBitcode(const Module &M,
   if (Map)
     Map->prepare();
   BitcodeWriter Writer(Buffer);
-  Writer.writeModuleImpl(M, true, nullptr, false, nullptr, Map);
+  MachineUseState Uses;
+  Writer.writeModuleImpl(M, true, nullptr, false, nullptr, Map, &Uses);
   Writer.writeSymtab();
   Writer.writeStrtab();
-  return !Map || Map->Valid;
+  if (!Uses.Complete || (Map && !Map->Valid))
+    return false;
+  if (!Uses.Leaves.empty() || !Uses.MetadataUses.empty()) {
+    // This private top-level block is part of a checked machine key only.
+    // Ordinary bitcode readers skip unknown blocks.
+    constexpr unsigned CheckedMachineUsesBlock = 0x4f484d;
+    Writer.Stream->EnterSubblock(CheckedMachineUsesBlock, 3);
+    if (!Uses.Leaves.empty())
+      Writer.Stream->EmitRecord(1, Uses.Leaves);
+    for (const auto &Order : Uses.MetadataUses)
+      Writer.Stream->EmitRecord(2, Order);
+    Writer.Stream->ExitBlock();
+  }
+  return true;
 }
 
 void BitcodeWriter::writeIndex(
