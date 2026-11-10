@@ -13,6 +13,7 @@
 
 #include "llvm/IR/LLVMContext.h"
 #include "LLVMContextImpl.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
@@ -483,6 +484,30 @@ bool llvm::ohm::getOptimizerContextState(Module &M,
         MetadataRoot(MD->getMetadata());
     }
   }
+  // An optimizer fold can retrieve a previously uniqued constant and inspect
+  // its uses. The writer sees users of represented operands, but cannot see
+  // a whole expression or aggregate that is detached from the module. Such a
+  // constant is inert only when it has no observers and none of its operands
+  // keeps a use list.
+  auto AccountedFor = [&](User *U) {
+    if (SeenValues.contains(U))
+      return true;
+    bool HasOperandUse = false;
+    for (Value *V : U->operand_values()) {
+      if (!V->hasUseList())
+        continue;
+      if (SeenValues.contains(V))
+        return true;
+      HasOperandUse = true;
+    }
+    return !HasOperandUse && U->use_empty() && !U->isUsedByMetadata();
+  };
+  if (!llvm::all_of(I.ExprConstants, AccountedFor) ||
+      !llvm::all_of(I.StructConstants, AccountedFor) ||
+      !llvm::all_of(I.ArrayConstants, AccountedFor) ||
+      !llvm::all_of(I.VectorConstants, AccountedFor) ||
+      !llvm::all_of(I.ConstantPtrAuths, AccountedFor))
+    return false;
   for (Value *V : Values)
     if (V->isUsedByMetadata() &&
         !SeenMetadata.contains(ValueAsMetadata::getIfExists(V)))

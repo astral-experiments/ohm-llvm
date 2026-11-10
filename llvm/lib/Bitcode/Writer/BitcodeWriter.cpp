@@ -5740,15 +5740,16 @@ bool llvm::writeDebugObjectBitcode(const Module &M,
     Map->prepare();
   BitcodeWriter Writer(Buffer);
   MachineUseState Uses;
+  Uses.OptimizerInput = !AllowMachineOnlyUses;
   Writer.writeModuleImpl(M, true, nullptr, false, nullptr, Map, &Uses);
   Writer.writeSymtab();
   Writer.writeStrtab();
   if (!Uses.Complete || (Map && !Map->Valid))
     return false;
   if (!Uses.Leaves.empty() || !Uses.MetadataUses.empty()) {
-    if (!AllowMachineOnlyUses)
+    if (Uses.OptimizerInput && !Uses.MetadataUses.empty())
       return false;
-    // This private top-level block is part of a checked machine key only.
+    // Only the private cache signature observes this top-level block.
     // Ordinary bitcode readers skip unknown blocks.
     constexpr unsigned CheckedMachineUsesBlock = 0x4f484d;
     Writer.Stream->EnterSubblock(CheckedMachineUsesBlock, 3);
