@@ -3424,9 +3424,18 @@ InlineParams llvm::getInlineParams() {
 }
 
 InlineParams llvm::getInlineParamsFromOptLevel(unsigned OptLevel) {
-  auto Params =
-      getInlineParams(OptLevel > 2 ? InlineConstants::OptAggressiveThreshold
-                                   : DefaultThreshold);
+  int Threshold = DefaultThreshold;
+  if (OptLevel > 2)
+    Threshold = InlineConstants::OptAggressiveThreshold;
+  else if (OptLevel == 1 && !DefaultThreshold.getNumOccurrences())
+    Threshold = 50;
+
+  auto Params = getInlineParams(Threshold);
+  // Limit code growth at O1 so later passes spend less time on cloned IR.
+  if (OptLevel == 1 && !HintThreshold.getNumOccurrences()) {
+    Params.HintThreshold = 75;
+    Params.OptSizeHintThreshold = Params.HintThreshold;
+  }
   // At O3, use the value of -locally-hot-callsite-threshold option to populate
   // Params.LocallyHotCallSiteThreshold. Below O3, this flag has effect only
   // when it is specified explicitly.

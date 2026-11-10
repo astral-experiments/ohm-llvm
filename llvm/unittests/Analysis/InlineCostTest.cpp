@@ -23,6 +23,16 @@ namespace {
 
 using namespace llvm;
 
+TEST(InlineCostTest, O1Thresholds) {
+  auto O1 = getInlineParamsFromOptLevel(1);
+  auto O2 = getInlineParamsFromOptLevel(2);
+  EXPECT_EQ(50, O1.DefaultThreshold);
+  EXPECT_EQ(75, O1.HintThreshold);
+  EXPECT_EQ(O1.HintThreshold, O1.OptSizeHintThreshold);
+  EXPECT_LT(O1.DefaultThreshold, O2.DefaultThreshold);
+  EXPECT_LT(O1.HintThreshold, O2.HintThreshold);
+}
+
 CallBase *getCallInFunction(Function *F) {
   for (auto &I : instructions(F)) {
     if (auto *CB = dyn_cast<llvm::CallBase>(&I))
