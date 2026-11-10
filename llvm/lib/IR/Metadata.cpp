@@ -1985,3 +1985,23 @@ void GlobalVariable::getDebugInfo(
   for (MDNode *MD : MDs)
     GVs.push_back(cast<DIGlobalVariableExpression>(MD));
 }
+
+bool ReplaceableMetadataImpl::hasOnlyRepresentedUsers(
+    Metadata &MD, const DenseSet<Value *> &Values,
+    const DenseSet<Metadata *> &Nodes) {
+  const auto *Uses = getIfExists(MD);
+  if (!Uses)
+    return true;
+  for (const auto &Entry : Uses->UseMap) {
+    OwnerTy Owner = Entry.second.first;
+    if (auto *M = dyn_cast_if_present<Metadata *>(Owner)) {
+      if (Nodes.contains(M))
+        continue;
+    } else if (auto *V = dyn_cast_if_present<MetadataAsValue *>(Owner)) {
+      if (Values.contains(V) || (V->use_empty() && !V->isUsedByMetadata()))
+        continue;
+    }
+    return false;
+  }
+  return true;
+}

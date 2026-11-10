@@ -11,15 +11,18 @@
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringExtras.h"
+#include "llvm/Bitcode/BitcodeWriter.h"
 #include "llvm/Bitcode/OhmDebugObjectSignature.h"
 #include "llvm/CodeGen/CodeGenTargetMachineImpl.h"
 #include "llvm/CodeGen/OhmDebugObjectSources.h"
+#include "llvm/CodeGen/OhmEarlyObjectCache.h"
 #include "llvm/CodeGen/OhmLineCertificate.h"
 #include "llvm/DebugInfo/DWARF/OhmRuntimeLocations.h"
 #include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/IR/DiagnosticObservation.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/OhmOptimizerState.h"
 #include "llvm/Support/BLAKE3.h"
 #include "llvm/Support/CachePruning.h"
 #include "llvm/Support/Endian.h"
@@ -140,11 +143,12 @@ std::unique_ptr<MemoryBuffer> readPrivate(StringRef Path, uint64_t Limit) {
                                         /*IsVolatile=*/true);
   return Data ? std::move(*Data) : nullptr;
 }
-bool writeAtomic(StringRef Path, ArrayRef<StringRef> Parts) {
+bool writeAtomic(StringRef Path, ArrayRef<StringRef> Parts,
+                 unsigned Mode = 0600) {
   int FD;
   SmallString<256> Tmp;
   if (sys::fs::createUniqueFile(Twine(Path) + ".%%%%%%", FD, Tmp,
-                                sys::fs::OF_None, 0600))
+                                sys::fs::OF_None, Mode))
     return false;
   auto Remove = scope_exit([&] { sys::fs::remove(Tmp); });
   raw_fd_ostream Out(FD, /*shouldClose=*/true);
@@ -572,6 +576,47 @@ std::string exactObjectKey(Module &M, const Invocation &I, StringRef Target) {
   return toHex(H.final(), true);
 }
 
+StringRef exactObjectPayload(StringRef Record, StringRef Key) {
+  if (!Record.consume_front("OHMOBJ01") || Record.size() < 64)
+    return {};
+  auto Stored = Record.take_front(64);
+  auto Payload = Record.drop_front(64);
+  BLAKE3 H;
+  frame(H, Key);
+  frame(H, Payload);
+  if (!Payload.starts_with("\x7f"
+                           "ELF") ||
+      Stored != toHex(H.final(), true))
+    return {};
+  return Payload;
+}
+std::string machineTarget(const Module &M, const TargetMachine &TM) {
+  return TM.getTargetTriple().str() + "|" + TM.getTargetCPU().str() + "|" +
+         TM.getTargetFeatureString().str() + "|" +
+         std::to_string(unsigned(TM.getRelocationModel())) + "|" +
+         std::to_string(unsigned(TM.getCodeModel())) + "|" +
+         M.getDataLayoutStr();
+}
+struct EarlyOrigin {
+  Module *Input;
+  std::string Key;
+  std::string MachineKey;
+  DiagnosticObservation Diagnostics;
+  EarlyOrigin(Module &M, std::string K)
+      : Input(&M), Key(std::move(K)), Diagnostics(M.getContext()) {}
+};
+thread_local std::weak_ptr<EarlyOrigin> PendingEarly;
+void observedMachineObject(Module &M, StringRef Key) {
+  if (auto Origin = PendingEarly.lock(); Origin && Origin->Input == &M)
+    Origin->MachineKey = Key.str();
+}
+std::string earlyIndexChecksum(StringRef Early, StringRef Machine) {
+  BLAKE3 H;
+  frame(H, "ohm-verified-optimizer-origin-v1");
+  frame(H, Early);
+  frame(H, Machine);
+  return toHex(H.final(), true);
+}
 bool runExactObjectCache(Module &M, const Invocation &I, StringRef Target,
                          raw_svector_ostream &Out, function_ref<bool()> Emit) {
   LLVMContext &Ctx = M.getContext();
@@ -593,17 +638,12 @@ bool runExactObjectCache(Module &M, const Invocation &I, StringRef Target,
     return toHex(Digest.final(), true);
   };
   if (auto Saved = readPrivate(Path, MaxOrigin)) {
-    StringRef Record = Saved->getBuffer();
-    if (Record.consume_front(Header) && Record.size() >= 64) {
-      StringRef Stored = Record.take_front(64);
-      StringRef Object = Record.drop_front(64);
-      if (Object.starts_with("\x7f"
-                             "ELF") &&
-          Stored == Checksum(Object) && I.imagesUnchanged()) {
-        Out << Object;
-        event(M.getModuleIdentifier(), "hit", "exact machine input");
-        return false;
-      }
+    StringRef Object = exactObjectPayload(Saved->getBuffer(), Key);
+    if (!Object.empty() && I.imagesUnchanged()) {
+      Out << Object;
+      observedMachineObject(M, Key);
+      event(M.getModuleIdentifier(), "hit", "exact machine input");
+      return false;
     }
   }
 
@@ -618,8 +658,10 @@ bool runExactObjectCache(Module &M, const Invocation &I, StringRef Target,
                          "ELF") &&
       Object.size() <= MaxOrigin - Header.size() - 64 && I.imagesUnchanged()) {
     std::string Sum = Checksum(Object);
-    if (writeAtomic(Path, {Header, Sum, Object}))
+    if (writeAtomic(Path, {Header, Sum, Object})) {
+      observedMachineObject(M, Key);
       event(M.getModuleIdentifier(), "committed", "exact machine input");
+    }
   }
   return Changed;
 }
@@ -655,11 +697,7 @@ bool llvm::ohm::runDebugObjectCache(Module &M, CodeGenTargetMachineImpl &TM,
   if (I.Root.empty() || !I.imagesUnchanged() ||
       !ordinaryModule(M, I.WithoutDebug))
     return Emit();
-  std::string Target =
-      TM.getTargetTriple().str() + "|" + TM.getTargetCPU().str() + "|" +
-      TM.getTargetFeatureString().str() + "|" +
-      std::to_string(unsigned(TM.getRelocationModel())) + "|" +
-      std::to_string(unsigned(TM.getCodeModel())) + "|" + M.getDataLayoutStr();
+  std::string Target = machineTarget(M, TM);
   if (I.WithoutDebug)
     return runExactObjectCache(M, I, Target, Out, Emit);
   BLAKE3 Key;
@@ -733,5 +771,91 @@ bool llvm::ohm::runDebugObjectCache(Module &M, CodeGenTargetMachineImpl &TM,
   return Changed;
 #else
   return Emit();
+#endif
+}
+
+extern "C" int ohm_early_object_begin_v1(LLVMModuleRef Ref,
+                                         LLVMTargetMachineRef TM,
+                                         const char *Output, size_t Length,
+                                         void **Ticket) {
+  if (!Ticket)
+    return 0;
+  *Ticket = nullptr;
+#if defined(__linux__) && defined(__x86_64__)
+  if (!Ref || !TM)
+    return 0;
+  auto &M = *unwrap(Ref);
+  if (!Output || !Length ||
+      !sys::path::is_absolute(StringRef(Output, Length)) ||
+      std::getenv("OHM_DISABLE_EARLY_OBJECT_CACHE") ||
+      !ohm::isLargeDebugObjectInput(M, true))
+    return 0;
+  const auto &I = invocation();
+  if (I.Root.empty() || !I.WithoutDebug || !I.imagesUnchanged() ||
+      !ordinaryModule(M, true))
+    return 0;
+  auto &C = M.getContext();
+  auto *Handler = C.getDiagHandlerPtr();
+  if (!Handler || Handler->HasErrors || Handler->isAnyRemarkEnabled() ||
+      C.getMainRemarkStreamer() || C.getLLVMRemarkStreamer())
+    return 0;
+  SmallVector<char, 128> State;
+  if (!ohm::getOptimizerContextState(M, State)) {
+    event(M.getModuleIdentifier(), "early-bypass", "unrepresented context");
+    return 0;
+  }
+  SmallVector<char, 0> Input;
+  if (!writeClosedOptimizerInput(M, Input))
+    return 0;
+  BLAKE3 H;
+  frame(H, "ohm-optimizer-input-v1");
+  frame(H, I.Namespace);
+  frame(H, machineTarget(M, *reinterpret_cast<TargetMachine *>(TM)));
+  frame(H, M.getModuleIdentifier());
+  frame(H, StringRef(Input.data(), Input.size()));
+  frame(H, StringRef(State.data(), State.size()));
+  auto Key = toHex(H.final(), true);
+  auto Index = readPrivate(joinPath(I.Entries, "llvmcache-" + Key), 136);
+  if (Index) {
+    StringRef R = Index->getBuffer();
+    if (R.consume_front("OHMOPT01") && R.size() == 128) {
+      auto MK = R.drop_front(64);
+      if (llvm::all_of(MK, isHexDigit) &&
+          R.take_front(64) == earlyIndexChecksum(Key, MK)) {
+        if (auto Saved = readPrivate(
+                joinPath(I.Entries, ("llvmcache-" + MK).str()), MaxOrigin)) {
+          auto Object = exactObjectPayload(Saved->getBuffer(), MK);
+          if (!Object.empty() && I.imagesUnchanged() &&
+              writeAtomic(StringRef(Output, Length), {Object}, 0666)) {
+            event(M.getModuleIdentifier(), "early-hit",
+                  "checked native object");
+            return 1;
+          }
+        }
+      }
+    }
+  }
+  auto Origin = std::make_shared<EarlyOrigin>(M, std::move(Key));
+  PendingEarly = Origin;
+  *Ticket = new std::shared_ptr<EarlyOrigin>(std::move(Origin));
+#endif
+  return 0;
+}
+extern "C" void ohm_early_object_end_v1(void *Ticket, int Completed) {
+#if defined(__linux__) && defined(__x86_64__)
+  std::unique_ptr<std::shared_ptr<EarlyOrigin>> Holder(
+      static_cast<std::shared_ptr<EarlyOrigin> *>(Ticket));
+  if (!Holder || !Completed)
+    return;
+  const auto &Entry = **Holder;
+  const auto &I = invocation();
+  if (Entry.MachineKey.empty() || Entry.Diagnostics.hasDiagnostics() ||
+      !I.imagesUnchanged())
+    return;
+  auto Sum = earlyIndexChecksum(Entry.Key, Entry.MachineKey);
+  if (writeAtomic(joinPath(I.Entries, "llvmcache-" + Entry.Key),
+                  {"OHMOPT01", Sum, Entry.MachineKey}))
+    event(Entry.Input->getModuleIdentifier(), "early-committed",
+          "checked native object");
 #endif
 }

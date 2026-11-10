@@ -45,6 +45,7 @@ struct DebugObjectSourceMap {
 };
 
 bool writeDebugObjectBitcode(const Module &M, SmallVectorImpl<char> &Buffer,
-                             DebugObjectSourceMap *Map);
+                             DebugObjectSourceMap *Map,
+                             bool AllowMachineOnlyUses = true);
 } // namespace llvm
 #endif
