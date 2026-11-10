@@ -38,9 +38,12 @@ std::optional<DebugObjectSourceMap> inverseMap(StringRef Input,
   const auto *Map = M->getAsObject();
   const auto *Record = P->getAsObject();
   if (!Map || !Record || Map->getInteger("version") != 1 ||
-      Record->getInteger("version") != 1 || !Map->getArray("files") ||
-      !Record->getArray("files"))
+      !Map->getArray("files") || !Record->getArray("files"))
     return std::nullopt;
+  auto Version = Record->getInteger("version");
+  if (Version != 1 && Version != 2)
+    return std::nullopt;
+  bool Explicit = Version == 2;
   auto Digest = Record->getString("map_sha256");
   if (!Digest ||
       *Digest != toHex(SHA256::hash(arrayRefFromStringRef(Input)), true))
@@ -68,10 +71,12 @@ std::optional<DebugObjectSourceMap> inverseMap(StringRef Input,
       return std::nullopt;
     auto &F = Result.Files.at(*K);
     const auto &P = *Verified->second;
-    auto OldCount = P.getInteger("ordered_byte_identical_old_lines");
+    auto OldCount = P.getInteger(
+        Explicit ? "old_lines" : "ordered_byte_identical_old_lines");
     auto NewCount = P.getInteger("new_lines");
-    if (!OldCount || !NewCount || *OldCount < 1 || *NewCount < *OldCount ||
-        *NewCount > 16000000)
+    if (!OldCount || !NewCount || *OldCount < 1 || *OldCount > 16000000 ||
+        *NewCount < 1 || *NewCount > 16000000 ||
+        (!Explicit && *NewCount < *OldCount))
       return std::nullopt;
     std::vector<unsigned> Forward(*OldCount + 1);
     for (const auto &Line : *O->getArray("lines")) {
@@ -87,6 +92,8 @@ std::optional<DebugObjectSourceMap> inverseMap(StringRef Input,
     F.Lines.resize(*NewCount + 1);
     unsigned Last = 0;
     for (unsigned Old = 1; Old < Forward.size(); ++Old) {
+      if (Explicit && !Forward[Old])
+        continue;
       unsigned New = Forward[Old] ? Forward[Old] : Old;
       if (New <= Last)
         return std::nullopt;
