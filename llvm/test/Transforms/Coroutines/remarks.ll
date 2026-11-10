@@ -8,7 +8,8 @@
 ; CHECK: 'foo' not elided in 'bar' (frame_size=24, align=8) (hotness: 100)
 ; CHECK: 'foo' elided in 'baz' (frame_size=24, align=8) (hotness: 200)
 
-define ptr @foo() presplitcoroutine !prof !0 {
+; Inline foo into both callers so the test exercises both elision remarks.
+define ptr @foo() alwaysinline presplitcoroutine !prof !0 {
 entry:
   %id = call token @llvm.coro.id(i32 0, ptr null, ptr null, ptr null)
   %need.dyn.alloc = call i1 @llvm.coro.alloc(token %id)
