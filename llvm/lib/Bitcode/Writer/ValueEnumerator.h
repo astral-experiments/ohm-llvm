@@ -41,6 +41,12 @@ class Type;
 class Value;
 class ValueSymbolTable;
 
+struct MachineUseState {
+  bool Complete = false;
+  SmallVector<uint64_t, 0> Leaves;
+  SmallVector<SmallVector<uint64_t, 8>, 0> MetadataUses;
+};
+
 class ValueEnumerator {
   DebugObjectSourceMap *SourceMap = nullptr;
   unsigned getRawValueID(const Value *V) const;
@@ -163,7 +169,8 @@ private:
   unsigned FirstInstID;
 
 public:
-  ValueEnumerator(const Module &M, bool ShouldPreserveUseListOrder);
+  ValueEnumerator(const Module &M, bool ShouldPreserveUseListOrder,
+                  MachineUseState *Uses = nullptr);
   ValueEnumerator(const ValueEnumerator &) = delete;
   ValueEnumerator &operator=(const ValueEnumerator &) = delete;
 

@@ -11,6 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "ValueEnumerator.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Config/llvm-config.h"
 #include "llvm/IR/Argument.h"
@@ -262,7 +263,238 @@ static void predictValueUseListOrder(const Value *V, const Function *F,
   }
 }
 
-static UseListOrderStack predictUseListOrder(const Module &M) {
+// Most values only have users described by the normal use-list records. For
+// an unreferenced literal aggregate, record its complete operand tuple, then
+// record its exact position among the ordinary users of every affected value.
+// Number leaves on first encounter in (value ID, actual use-list) order.
+static bool encodeMachineLeaves(SmallVectorImpl<const Value *> &Affected,
+                                const OrderMap &OM,
+                                SmallVectorImpl<uint64_t> &Words) {
+  if (Affected.empty())
+    return true;
+  llvm::sort(Affected, [&](const Value *L, const Value *R) {
+    return OM.lookup(L).first < OM.lookup(R).first;
+  });
+
+  enum Word {
+    KnownUser,
+    NewLeaf,
+    PreviousLeaf,
+    NumberedOperand,
+    LiteralInteger,
+    UndefInteger,
+    PoisonInteger,
+    UndefPointer,
+    PoisonPointer,
+    ArrayLeaf,
+    StructLeaf,
+    PackedStructLeaf
+  };
+  DenseMap<const User *, unsigned> LeafIDs;
+  auto EncodeOperand = [&](const Value *V) {
+    if (unsigned ID = OM.lookup(V).first) {
+      Words.append({NumberedOperand, ID});
+      return true;
+    }
+    // An auxiliary operand with a use list would introduce another
+    // unnumbered graph. Only self-describing scalar data are supported.
+    if (V->hasUseList())
+      return false;
+    if (const auto *CI = dyn_cast<ConstantInt>(V)) {
+      const APInt &N = CI->getValue();
+      if (N.getBitWidth() > 256)
+        return false;
+      Words.append({LiteralInteger, N.getBitWidth()});
+      Words.append(N.getRawData(), N.getRawData() + N.getNumWords());
+      return true;
+    }
+    if (!isa<UndefValue>(V))
+      return false;
+    bool Poison = isa<PoisonValue>(V);
+    if (const auto *IT = dyn_cast<IntegerType>(V->getType()))
+      Words.append({Poison ? PoisonInteger : UndefInteger, IT->getBitWidth()});
+    else if (const auto *PT = dyn_cast<PointerType>(V->getType()))
+      Words.append(
+          {Poison ? PoisonPointer : UndefPointer, PT->getAddressSpace()});
+    else
+      return false;
+    return true;
+  };
+
+  Words.push_back(Affected.size());
+  for (const Value *V : Affected) {
+    Words.push_back(OM.lookup(V).first);
+    size_t Count = Words.size();
+    Words.push_back(0);
+    for (const Use &Use : V->uses()) {
+      if (Words.size() >= 131072)
+        return false;
+      ++Words[Count];
+      const User *U = Use.getUser();
+      Words.push_back(Use.getOperandNo());
+      if (unsigned ID = OM.lookup(U).first) {
+        Words.append({KnownUser, ID});
+        continue;
+      }
+      auto [It, Inserted] = LeafIDs.try_emplace(U, LeafIDs.size());
+      if (!Inserted) {
+        Words.append({PreviousLeaf, It->second});
+        continue;
+      }
+      if (U->getNumOperands() > 256 || !U->use_empty() || U->isUsedByMetadata())
+        return false;
+      if (const auto *Struct = dyn_cast<ConstantStruct>(U)) {
+        if (!Struct->getType()->isLiteral())
+          return false;
+        Words.append({NewLeaf, Struct->getType()->isPacked() ? PackedStructLeaf
+                                                             : StructLeaf});
+      } else if (isa<ConstantArray>(U))
+        Words.append({NewLeaf, ArrayLeaf});
+      else
+        return false;
+      Words.push_back(U->getNumOperands());
+      for (const Value *Op : U->operands())
+        if (!EncodeOperand(Op))
+          return false;
+    }
+  }
+  return true;
+}
+
+// The ordinary bitcode writer can omit users that live only in this
+// LLVMContext. Machine passes may consult them, for example when AsmPrinter
+// chooses a GOT-relative relocation for an initializer with exactly one use.
+static bool hasCompleteMachineUses(const Module &M, const OrderMap &OM,
+                                   MachineUseState &State) {
+  SmallVector<const Value *, 8> Affected;
+  unsigned MetadataEdges = 0;
+  auto UsesAreEncoded = [&](const Value *V, std::pair<unsigned, bool> Order) {
+    if (!V->hasUseList())
+      return true;
+    // MetadataAsValue instruction operands have no value-order ID. Each
+    // (numbered instruction, explicit operand index) nevertheless identifies
+    // the actual value uniquely within this module. Use the least such pair
+    // as its anchor and capture the complete live list in its actual order.
+    if (!Order.second && !V->use_empty() && !V->hasOneUse()) {
+      if (!isa<MetadataAsValue>(V) || Order.first ||
+          State.MetadataUses.size() >= 4096)
+        return false;
+      SmallVector<uint64_t, 8> Record(2);
+      std::pair<unsigned, unsigned> Anchor{0, 0};
+      for (const Use &U : V->uses()) {
+        const auto *I = dyn_cast<Instruction>(U.getUser());
+        unsigned ID = OM.lookup(U.getUser()).first;
+        unsigned Op = U.getOperandNo();
+        if (!I || !ID || Op >= I->getNumOperands() ||
+            &I->getOperandUse(Op) != &U || ++MetadataEdges > 65536)
+          return false;
+        auto Edge = std::make_pair(ID, Op);
+        if (!Anchor.first || Edge < Anchor)
+          Anchor = Edge;
+        Record.append({ID, Op});
+      }
+      Record[0] = Anchor.first;
+      Record[1] = Anchor.second;
+      State.MetadataUses.push_back(std::move(Record));
+      return true;
+    }
+    bool HasLeaf = false;
+    for (const User *U : V->users()) {
+      if (!OM.lookup(U).first) {
+        if (!Order.first || !isa<ConstantArray, ConstantStruct>(U))
+          return false;
+        HasLeaf = true;
+      }
+    }
+    if (HasLeaf) {
+      if (Affected.size() >= 4096)
+        return false;
+      Affected.push_back(V);
+    }
+    return true;
+  };
+
+  DenseSet<const Metadata *> MetadataNodes;
+  SmallVector<const Metadata *, 32> PendingMetadata;
+  DenseSet<const Value *> ExtraValues;
+  SmallVector<const Value *, 16> PendingValues;
+  auto AddMetadata = [&](const Metadata *MD) {
+    if (MD && MetadataNodes.insert(MD).second)
+      PendingMetadata.push_back(MD);
+  };
+  auto AddValue = [&](const Value *V) {
+    if (V && !OM.lookup(V).first && ExtraValues.insert(V).second)
+      PendingValues.push_back(V);
+  };
+  auto AddAttachments = [&](const auto &Object) {
+    SmallVector<std::pair<unsigned, MDNode *>, 4> Kinds;
+    Object.getAllMetadata(Kinds);
+    for (const auto &Entry : Kinds)
+      AddMetadata(Entry.second);
+  };
+
+  // Use the writer's map for globals, function bodies, switch cases and the
+  // implicit shuffle mask constants. A metadata-only user is not necessarily
+  // part of that map, even though its operands appear somewhere in the file.
+  for (const auto &Entry : OM.IDs) {
+    const Value *V = Entry.first;
+    if (!UsesAreEncoded(V, Entry.second))
+      return false;
+    if (const auto *BB = dyn_cast<BasicBlock>(V)) {
+      // A BlockAddress can mark its block without creating a Use on it.
+      if (BB->hasAddressTaken() && !OM.lookup(BlockAddress::lookup(BB)).first)
+        return false;
+    } else if (const auto *I = dyn_cast<Instruction>(V)) {
+      if (I->hasDbgRecords())
+        return false;
+      if (I->hasMetadata())
+        AddAttachments(*I);
+      for (const Value *Op : I->operands())
+        if (isa<MetadataAsValue>(Op))
+          AddValue(Op);
+    } else if (const auto *GO = dyn_cast<GlobalObject>(V))
+      AddAttachments(*GO);
+  }
+  for (const Function &F : M)
+    if (F.isDeclaration())
+      for (const Argument &Arg : F.args())
+        AddValue(&Arg);
+  for (const NamedMDNode &N : M.named_metadata())
+    for (const MDNode *MD : N.operands())
+      AddMetadata(MD);
+
+  // Include values reachable only through metadata. If the writer does not
+  // predict an order for a value, only an empty or singleton use list has a
+  // fully determined order.
+  while (!PendingValues.empty() || !PendingMetadata.empty()) {
+    while (!PendingValues.empty()) {
+      const Value *V = PendingValues.pop_back_val();
+      if (!UsesAreEncoded(V, {0, false}))
+        return false;
+      if (const auto *U = dyn_cast<User>(V))
+        for (const Use &Op : U->operands())
+          AddValue(Op.get());
+      if (const auto *MAV = dyn_cast<MetadataAsValue>(V))
+        AddMetadata(MAV->getMetadata());
+    }
+    while (!PendingMetadata.empty()) {
+      const Metadata *MD = PendingMetadata.pop_back_val();
+      if (const auto *Args = dyn_cast<DIArgList>(MD))
+        for (const ValueAsMetadata *Arg : Args->getArgs())
+          AddMetadata(Arg);
+      if (const auto *N = dyn_cast<MDNode>(MD))
+        for (const MDOperand &Op : N->operands())
+          AddMetadata(Op.get());
+      if (const auto *VAM = dyn_cast<ValueAsMetadata>(MD))
+        AddValue(VAM->getValue());
+    }
+  }
+  llvm::sort(State.MetadataUses);
+  return encodeMachineLeaves(Affected, OM, State.Leaves);
+}
+
+static UseListOrderStack predictUseListOrder(const Module &M,
+                                             MachineUseState *Uses) {
   OrderMap OM = orderModule(M);
 
   // Use-list orders need to be serialized after all the users have been added
@@ -333,6 +565,8 @@ static UseListOrderStack predictUseListOrder(const Module &M) {
       predictValueUseListOrder(U.get(), nullptr, OM, Stack);
   }
 
+  if (Uses)
+    Uses->Complete = hasCompleteMachineUses(M, OM, *Uses);
   return Stack;
 }
 
@@ -341,10 +575,11 @@ static bool isIntOrIntVectorValue(const std::pair<const Value*, unsigned> &V) {
 }
 
 ValueEnumerator::ValueEnumerator(const Module &M,
-                                 bool ShouldPreserveUseListOrder)
+                                 bool ShouldPreserveUseListOrder,
+                                 MachineUseState *Uses)
     : ShouldPreserveUseListOrder(ShouldPreserveUseListOrder) {
   if (ShouldPreserveUseListOrder)
-    UseListOrders = predictUseListOrder(M);
+    UseListOrders = predictUseListOrder(M, Uses);
 
   // Enumerate the global variables.
   for (const GlobalVariable &GV : M.globals()) {
