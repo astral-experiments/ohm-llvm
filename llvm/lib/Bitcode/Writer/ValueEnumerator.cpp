@@ -263,15 +263,42 @@ static void predictValueUseListOrder(const Value *V, const Function *F,
   }
 }
 
+// rustc can leave an unused slice constant while constructing a module. Its
+// only operand with a use list is a numbered address. The other operand is a
+// canonical scalar with no metadata observers. The leaf record below captures
+// the entire constant and its position in the address's use list.
+static bool isOptimizerSliceLeaf(const User &U, const OrderMap &OM) {
+  const auto *S = dyn_cast<ConstantStruct>(&U);
+  if (!S || S->getNumOperands() != 2 || !S->getType()->isLiteral() ||
+      S->getType()->isPacked())
+    return false;
+  const auto *Pointer = S->getOperand(0);
+  const auto *Length = dyn_cast<PoisonValue>(S->getOperand(1));
+  if (!Pointer->getType()->isPointerTy() ||
+      Pointer->getType()->getPointerAddressSpace() != 0 ||
+      !OM.lookup(Pointer).first || !Length ||
+      !Length->getType()->isIntegerTy(64) || Length->hasUseList() ||
+      Length->isUsedByMetadata())
+    return false;
+  if (const auto *Storage = dyn_cast<GlobalVariable>(Pointer))
+    return Storage->isConstant() && Storage->hasLocalLinkage();
+  // Empty slices also use a literal alignment as their address. The complete
+  // cast and its integer operand already appear in ordinary module bitcode.
+  const auto *Address = dyn_cast<ConstantExpr>(Pointer);
+  return Address && Address->getOpcode() == Instruction::IntToPtr &&
+         isa<ConstantInt>(Address->getOperand(0)) &&
+         Address->getOperand(0)->getType()->isIntegerTy(64);
+}
+
 // Most values only have users described by the normal use-list records. For
 // an unreferenced literal aggregate, record its complete operand tuple, then
 // record its exact position among the ordinary users of every affected value.
 // Number leaves on first encounter in (value ID, actual use-list) order.
 static bool encodeMachineLeaves(SmallVectorImpl<const Value *> &Affected,
-                                const OrderMap &OM,
-                                SmallVectorImpl<uint64_t> &Words) {
+                                const OrderMap &OM, MachineUseState &State) {
   if (Affected.empty())
     return true;
+  auto &Words = State.Leaves;
   llvm::sort(Affected, [&](const Value *L, const Value *R) {
     return OM.lookup(L).first < OM.lookup(R).first;
   });
@@ -342,6 +369,8 @@ static bool encodeMachineLeaves(SmallVectorImpl<const Value *> &Affected,
         continue;
       }
       if (U->getNumOperands() > 256 || !U->use_empty() || U->isUsedByMetadata())
+        return false;
+      if (State.OptimizerInput && !isOptimizerSliceLeaf(*U, OM))
         return false;
       if (const auto *Struct = dyn_cast<ConstantStruct>(U)) {
         if (!Struct->getType()->isLiteral())
@@ -490,7 +519,7 @@ static bool hasCompleteMachineUses(const Module &M, const OrderMap &OM,
     }
   }
   llvm::sort(State.MetadataUses);
-  return encodeMachineLeaves(Affected, OM, State.Leaves);
+  return encodeMachineLeaves(Affected, OM, State);
 }
 
 static UseListOrderStack predictUseListOrder(const Module &M,

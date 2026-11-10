@@ -144,10 +144,9 @@ LLVM_ABI void WriteBitcodeToFile(const Module &M, raw_ostream &Out,
                                  bool GenerateHash = false,
                                  ModuleHash *ModHash = nullptr);
 
-/// Serialize a closed optimizer input with complete use-list ordering. Decline
-/// inputs whose machine key needs side records for users outside ordinary
-/// bitcode. Those records describe emission and do not establish optimizer
-/// equivalence.
+/// Serialize an optimizer input with complete use-list ordering. An unused
+/// literal slice constant may be represented by a private leaf record. Other
+/// users outside ordinary bitcode require normal optimization.
 LLVM_ABI bool writeClosedOptimizerInput(const Module &M,
                                         SmallVectorImpl<char> &Buffer);
 
