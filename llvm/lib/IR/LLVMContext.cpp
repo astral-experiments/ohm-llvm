@@ -17,10 +17,13 @@
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/Twine.h"
+#include "llvm/IR/Constants.h"
 #include "llvm/IR/DiagnosticInfo.h"
 #include "llvm/IR/DiagnosticObservation.h"
 #include "llvm/IR/DiagnosticPrinter.h"
+#include "llvm/IR/Instructions.h"
 #include "llvm/IR/LLVMRemarkStreamer.h"
+#include "llvm/IR/OhmOptimizerState.h"
 #include "llvm/Remarks/RemarkStreamer.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/ErrorHandling.h"
@@ -407,4 +410,92 @@ void LLVMContext::updateDILocationAtomGroupWaterline(uint64_t V) {
 
 uint64_t LLVMContext::incNextDILocationAtomGroup() {
   return pImpl->NextAtomGroup++;
+}
+
+// The bitcode writer accounts for every ordinary Use (including BlockAddress
+// side links) independently. Metadata wrappers also carry context-observable
+// state that does not appear in the serialized Module.
+bool llvm::ohm::getOptimizerContextState(Module &M,
+                                         SmallVectorImpl<char> &Bits) {
+  auto &C = M.getContext();
+  auto &I = *C.pImpl;
+  if (I.OwnedModules.size() != 1 || !I.OwnedModules.contains(&M) ||
+      !I.MachineFunctionNums.empty() || !I.ValueHandles.empty() ||
+      I.YieldCallback || I.OPG || !I.NamedStructTypes.empty() ||
+      I.NamedStructTypesUniqueID)
+    return false;
+  DenseSet<Value *> SeenValues;
+  DenseSet<Metadata *> SeenMetadata;
+  SmallVector<Value *, 128> Values;
+  SmallVector<Metadata *, 64> Nodes;
+  auto ValueRoot = [&](Value *V) {
+    if (V && SeenValues.insert(V).second)
+      Values.push_back(V);
+  };
+  auto MetadataRoot = [&](Metadata *N) {
+    if (N && SeenMetadata.insert(N).second)
+      Nodes.push_back(N);
+  };
+  auto Attachments = [&](auto &V) {
+    SmallVector<std::pair<unsigned, MDNode *>, 4> A;
+    V.getAllMetadata(A);
+    for (auto Entry : A)
+      MetadataRoot(Entry.second);
+  };
+  for (auto &N : M.named_metadata())
+    for (auto *MD : N.operands())
+      MetadataRoot(MD);
+  for (auto &G : M.global_values()) {
+    ValueRoot(&G);
+    if (auto *O = dyn_cast<GlobalObject>(&G))
+      Attachments(*O);
+    if (auto *F = dyn_cast<Function>(&G)) {
+      for (auto &A : F->args())
+        ValueRoot(&A);
+      for (auto &BB : *F) {
+        ValueRoot(&BB);
+        for (auto &Inst : BB) {
+          ValueRoot(&Inst);
+          Attachments(Inst);
+        }
+      }
+    }
+  }
+  size_t VI = 0, MI = 0;
+  while (VI != Values.size() || MI != Nodes.size()) {
+    while (MI != Nodes.size()) {
+      auto *MD = Nodes[MI++];
+      if (auto *N = dyn_cast<MDNode>(MD)) {
+        if (!N->isResolved() || N->isTemporary())
+          return false;
+        for (auto &Op : N->operands())
+          MetadataRoot(Op.get());
+      } else if (auto *V = dyn_cast<ValueAsMetadata>(MD)) {
+        ValueRoot(V->getValue());
+      }
+    }
+    while (VI != Values.size()) {
+      auto *V = Values[VI++];
+      if (auto *U = dyn_cast<User>(V))
+        for (auto &Op : U->operands())
+          ValueRoot(Op.get());
+      if (auto *MD = dyn_cast<MetadataAsValue>(V))
+        MetadataRoot(MD->getMetadata());
+    }
+  }
+  for (Value *V : Values)
+    if (V->isUsedByMetadata() &&
+        !SeenMetadata.contains(ValueAsMetadata::getIfExists(V)))
+      return false;
+  for (Metadata *MD : Nodes) {
+    if (!ReplaceableMetadataImpl::hasOnlyRepresentedUsers(*MD, SeenValues,
+                                                          SeenMetadata))
+      return false;
+    auto *V = MetadataAsValue::getIfExists(C, MD);
+    if (V && !SeenValues.contains(V) &&
+        (!V->use_empty() || V->isUsedByMetadata()))
+      return false;
+    Bits.push_back(V != nullptr);
+  }
+  return true;
 }
