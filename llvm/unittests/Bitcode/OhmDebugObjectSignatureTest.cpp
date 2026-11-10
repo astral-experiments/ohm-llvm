@@ -145,6 +145,11 @@ static std::string machineKey(Module &M) {
 
 static bool canSaveMachineInput(Module &M) { return !machineKey(M).empty(); }
 
+static bool canSaveOptimizerInput(Module &M) {
+  SmallVector<char, 0> Bytes;
+  return writeClosedOptimizerInput(M, Bytes);
+}
+
 TEST(DebugObjectUsesTest, AuthenticatesAnUnreferencedInitializerUser) {
   LLVMContext Context;
   SMDiagnostic Error;
@@ -173,6 +178,7 @@ TEST(DebugObjectUsesTest, AuthenticatesAnUnreferencedInitializerUser) {
   EXPECT_FALSE(Init->hasOneUse());
   std::string WithLeaf = machineKey(*M);
   ASSERT_FALSE(WithLeaf.empty());
+  EXPECT_FALSE(canSaveOptimizerInput(*M));
   EXPECT_NE(OriginalKey, WithLeaf);
   // The private evidence block remains valid, readable LLVM bitcode.
   LLVMContext OtherContext;
@@ -189,6 +195,7 @@ TEST(DebugObjectUsesTest, AuthenticatesAnUnreferencedInitializerUser) {
   M->eraseNamedMetadata(Named);
   Unreferenced->destroyConstant();
   EXPECT_TRUE(canSaveMachineInput(*M));
+  EXPECT_TRUE(canSaveOptimizerInput(*M));
 }
 
 TEST(DebugObjectUsesTest, ChecksInstructionsBlocksAndMetadataOnlyOperands) {
@@ -314,6 +321,7 @@ TEST(DebugObjectUsesTest, AuthenticatesUnnumberedMetadataOperandOrder) {
   auto *Call = cast<CallInst>(&M->getFunction("f")->front().front());
   auto *Scope = cast<MetadataAsValue>(Call->getArgOperand(0));
   ASSERT_TRUE(Scope->hasNUses(2));
+  EXPECT_FALSE(canSaveOptimizerInput(*M));
   auto Ordinary = [&] {
     SmallVector<char, 0> Data;
     raw_svector_ostream OS(Data);

@@ -33,7 +33,7 @@ struct MachineUseState;
 
 class BitcodeWriter {
   friend bool writeDebugObjectBitcode(const Module &, SmallVectorImpl<char> &,
-                                      DebugObjectSourceMap *);
+                                      DebugObjectSourceMap *, bool);
   void writeModuleImpl(const Module &, bool, const ModuleSummaryIndex *, bool,
                        ModuleHash *, DebugObjectSourceMap *,
                        MachineUseState *Uses = nullptr);
@@ -143,6 +143,13 @@ LLVM_ABI void WriteBitcodeToFile(const Module &M, raw_ostream &Out,
                                  const ModuleSummaryIndex *Index = nullptr,
                                  bool GenerateHash = false,
                                  ModuleHash *ModHash = nullptr);
+
+/// Serialize a closed optimizer input with complete use-list ordering. Decline
+/// inputs whose machine key needs side records for users outside ordinary
+/// bitcode. Those records describe emission and do not establish optimizer
+/// equivalence.
+LLVM_ABI bool writeClosedOptimizerInput(const Module &M,
+                                        SmallVectorImpl<char> &Buffer);
 
 /// Write the specified thin link bitcode file (i.e., the minimized bitcode
 /// file) to the given raw output stream, where it will be written in a new

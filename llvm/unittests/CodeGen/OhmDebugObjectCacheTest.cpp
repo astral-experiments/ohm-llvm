@@ -10,6 +10,8 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Bitcode/OhmDebugObjectSignature.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/OhmOptimizerState.h"
+#include "llvm/IR/ValueHandle.h"
 #include "gtest/gtest.h"
 #if defined(__linux__) && defined(__x86_64__)
 #include <dlfcn.h>
@@ -141,4 +143,49 @@ TEST(OhmDebugObjectCache, ExactObjectInputKeepsUseListOrder) {
   EXPECT_NE(Before, Input());
   Callee.getCallee()->reverseUseList();
   EXPECT_EQ(Before, Input());
+}
+
+TEST(OhmEarlyObject, ContextWrappersAreIncludedInInput) {
+  LLVMContext C;
+  Module M("early", C);
+  auto *N = MDNode::get(C, MDString::get(C, "origin"));
+  M.getOrInsertNamedMetadata("test")->addOperand(N);
+  SmallVector<char> Before, After;
+  ASSERT_TRUE(ohm::getOptimizerContextState(M, Before));
+  MetadataAsValue::get(C, N);
+  ASSERT_TRUE(ohm::getOptimizerContextState(M, After));
+  EXPECT_NE(Before, After);
+}
+
+TEST(OhmEarlyObject, UnrepresentedMetadataOwnerDeclines) {
+  LLVMContext C;
+  Module M("early", C);
+  auto *V = ConstantInt::get(Type::getInt32Ty(C), 3);
+  auto *MD = ConstantAsMetadata::get(V);
+  auto *Root = MDNode::get(C, MD);
+  M.getOrInsertNamedMetadata("test")->addOperand(Root);
+  SmallVector<char> Bits;
+  ASSERT_TRUE(ohm::getOptimizerContextState(M, Bits));
+  MDNode::getDistinct(C, {MD, MDString::get(C, "unrepresented")});
+  Bits.clear();
+  EXPECT_FALSE(ohm::getOptimizerContextState(M, Bits));
+}
+
+TEST(OhmEarlyObject, ExternalContextStateDeclines) {
+  LLVMContext C;
+  Module M("early", C);
+  auto *F = Function::Create(FunctionType::get(Type::getVoidTy(C), false),
+                             GlobalValue::ExternalLinkage, "f", M);
+  SmallVector<char> Bits;
+  ASSERT_TRUE(ohm::getOptimizerContextState(M, Bits));
+  {
+    WeakTrackingVH Handle(F);
+    EXPECT_FALSE(ohm::getOptimizerContextState(M, Bits));
+  }
+  ValueAsMetadata::get(F);
+  EXPECT_FALSE(ohm::getOptimizerContextState(M, Bits));
+  LLVMContext T;
+  Module Other("early", T);
+  StructType::create(T, "unreferenced");
+  EXPECT_FALSE(ohm::getOptimizerContextState(Other, Bits));
 }

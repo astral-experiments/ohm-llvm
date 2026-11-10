@@ -5728,7 +5728,8 @@ void BitcodeWriter::writeModuleImpl(const Module &M,
 
 bool llvm::writeDebugObjectBitcode(const Module &M,
                                    SmallVectorImpl<char> &Buffer,
-                                   DebugObjectSourceMap *Map) {
+                                   DebugObjectSourceMap *Map,
+                                   bool AllowMachineOnlyUses) {
   // Use-list ordering can affect machine-code generation. If the process
   // explicitly forbids writing it, this compilation cannot supply a key.
   if (!M.isMaterialized() || !M.getTargetTriple().isOSBinFormatELF() ||
@@ -5745,6 +5746,8 @@ bool llvm::writeDebugObjectBitcode(const Module &M,
   if (!Uses.Complete || (Map && !Map->Valid))
     return false;
   if (!Uses.Leaves.empty() || !Uses.MetadataUses.empty()) {
+    if (!AllowMachineOnlyUses)
+      return false;
     // This private top-level block is part of a checked machine key only.
     // Ordinary bitcode readers skip unknown blocks.
     constexpr unsigned CheckedMachineUsesBlock = 0x4f484d;
@@ -5756,6 +5759,12 @@ bool llvm::writeDebugObjectBitcode(const Module &M,
     Writer.Stream->ExitBlock();
   }
   return true;
+}
+
+bool llvm::writeClosedOptimizerInput(const Module &M,
+                                     SmallVectorImpl<char> &Buffer) {
+  return writeDebugObjectBitcode(M, Buffer, nullptr,
+                                 /*AllowMachineOnlyUses=*/false);
 }
 
 void BitcodeWriter::writeIndex(
