@@ -13,8 +13,10 @@
 #include "llvm/Bitcode/BitcodeWriter.h"
 #include "ValueEnumerator.h"
 #include "DwarfLineCertificate.h"
+#include "llvm/Bitcode/ClosedModuleHash.h"
 #include "llvm/Bitcode/DwarfLineCertificate.h"
 #include "llvm/IR/ClosedOptimizerContext.h"
+#include "llvm/Support/BLAKE3.h"
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/ArrayRef.h"
@@ -5784,6 +5786,25 @@ bool llvm::writeClosedOptimizerInput(const Module &M,
                                      SmallVectorImpl<char> &Buffer) {
   return writeDebugObjectBitcode(M, Buffer, nullptr,
                                  /*AllowMachineOnlyUses=*/false);
+}
+
+bool llvm::getClosedModuleHashV1(const Module &M,
+                                 std::array<uint8_t, 32> &Digest) {
+  std::array<uint8_t, 32> Context;
+  if (!getClosedOptimizerContextV1(M, Context))
+    return false;
+
+  // A bitcode reader receives the module identifier from its caller.
+  BLAKE3 Hash;
+  Hash.update(arrayRefFromStringRef("llvm-closed-module-v1"));
+  Hash.update(Context);
+  Hash.update(BLAKE3::hash<32>(arrayRefFromStringRef(M.getModuleIdentifier())));
+  SmallVector<char, 0> Bytes;
+  raw_svector_ostream OS(Bytes);
+  WriteBitcodeToFile(M, OS, /*ShouldPreserveUseListOrder=*/true);
+  Hash.update(arrayRefFromStringRef(OS.str()));
+  Digest = Hash.final();
+  return true;
 }
 
 bool llvm::writeClosedDwarfLineCertificateV1(const Module &M, raw_ostream &Out) {
