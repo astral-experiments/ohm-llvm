@@ -182,11 +182,12 @@ public:
     return Mask;
   }
 
-  bool write(llvm::StringRef Bitcode, llvm::raw_ostream &Out) const {
+  bool write(llvm::StringRef Bitcode, llvm::StringRef ModuleIdentifier,
+             llvm::raw_ostream &Out) const {
     if (!Valid)
       return false;
     llvm::BLAKE3 Hash;
-    Hash.update(llvm::arrayRefFromStringRef("ohm-line-certificate-v2"));
+    Hash.update(llvm::arrayRefFromStringRef("ohm-line-certificate-v3"));
     auto HashField = [&](llvm::ArrayRef<uint8_t> Bytes) {
       uint64_t Size = Bytes.size();
       std::array<uint8_t, 8> Length;
@@ -197,6 +198,8 @@ public:
     };
     HashField(llvm::arrayRefFromStringRef(Bitcode));
     HashField(MaskedStrings);
+    // Bitcode readers assign the identifier, and native emitters can use it.
+    HashField(llvm::arrayRefFromStringRef(ModuleIdentifier));
     auto Digest = Hash.final();
 
     // The consumer caps a proof at 128 MiB before decoding it. Encode into a

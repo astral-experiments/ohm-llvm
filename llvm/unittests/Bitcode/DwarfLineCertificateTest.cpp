@@ -121,6 +121,20 @@ TEST_F(DwarfLineCertificateTest, ExactHashIncludesUsesAbsentFromOrderedBitcode) 
   EXPECT_NE(Before, After);
 }
 
+TEST_F(DwarfLineCertificateTest, BindsTheNativeModuleIdentifier) {
+  // The OCaml GC metadata printer incorporates the identifier into symbols.
+  M->getFunction("run")->setGC("ocaml");
+  M->setModuleIdentifier("alpha.bc");
+  auto Alpha = certificate();
+  ASSERT_TRUE(Alpha);
+  M->setModuleIdentifier("beta.bc");
+  auto Beta = certificate();
+  ASSERT_TRUE(Beta);
+  EXPECT_NE(*Alpha, *Beta);
+  M->setModuleIdentifier("alpha.bc");
+  EXPECT_EQ(Alpha, certificate());
+}
+
 TEST_F(DwarfLineCertificateTest, RejectsUnrepresentedFunctionUser) {
   addSlice(M->getFunction("run"));
   EXPECT_FALSE(certificate());
