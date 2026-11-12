@@ -10,4 +10,5 @@ add_llvm_unittest(BitcodeTests
   BitReaderTest.cpp
   DataLayoutUpgradeTest.cpp
   OhmDebugObjectSignatureTest.cpp
+  DwarfLineCertificateTest.cpp
   )

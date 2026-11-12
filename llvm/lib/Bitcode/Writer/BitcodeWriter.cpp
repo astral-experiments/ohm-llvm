@@ -12,6 +12,9 @@
 
 #include "llvm/Bitcode/BitcodeWriter.h"
 #include "ValueEnumerator.h"
+#include "DwarfLineCertificate.h"
+#include "llvm/Bitcode/DwarfLineCertificate.h"
+#include "llvm/IR/ClosedOptimizerContext.h"
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/ArrayRef.h"
@@ -298,6 +301,7 @@ private:
 
 /// Class to manage the bitcode writing for a module.
 class ModuleBitcodeWriter : public ModuleBitcodeWriterBase {
+  DwarfLineCertificate *LineCertificate;
   /// True if a module hash record should be written.
   bool GenerateHash;
 
@@ -318,11 +322,13 @@ public:
                       const ModuleSummaryIndex *Index, bool GenerateHash,
                       ModuleHash *ModHash = nullptr,
                       DebugObjectSourceMap *SourceMap = nullptr,
-                      MachineUseState *Uses = nullptr)
+                      MachineUseState *Uses = nullptr,
+                      DwarfLineCertificate *LineCertificate = nullptr)
       : ModuleBitcodeWriterBase(M, StrtabBuilder, Stream,
                                 ShouldPreserveUseListOrder, Index, Uses),
-        GenerateHash(GenerateHash), ModHash(ModHash),
+        LineCertificate(LineCertificate), GenerateHash(GenerateHash), ModHash(ModHash),
         BitcodeStartBit(Stream.GetCurrentBitNo()) {
+    assert(!(SourceMap && LineCertificate));
     VE.setSourceMap(SourceMap);
   }
 
@@ -1915,7 +1921,8 @@ void ModuleBitcodeWriter::writeDILocation(const DILocation *N,
     Abbrev = createDILocationAbbrev();
 
   Record.push_back(N->isDistinct());
-  Record.push_back(VE.debugLine(N, N->getLine()));
+  Record.push_back(LineCertificate ? LineCertificate->line(N->getFile(), N->getLine())
+                                   : VE.debugLine(N, N->getLine()));
   Record.push_back(N->getColumn());
   Record.push_back(VE.getMetadataID(N->getScope()));
   Record.push_back(VE.getMetadataOrNullID(N->getInlinedAt()));
@@ -2181,6 +2188,8 @@ void ModuleBitcodeWriter::writeDISubroutineType(
 void ModuleBitcodeWriter::writeDIFile(const DIFile *N,
                                       SmallVectorImpl<uint64_t> &Record,
                                       unsigned Abbrev) {
+  if (LineCertificate)
+    LineCertificate->file(N);
   Record.push_back(N->isDistinct());
   Record.push_back(VE.getMetadataOrNullID(N->getRawFilename()));
   Record.push_back(VE.getMetadataOrNullID(N->getRawDirectory()));
@@ -2251,9 +2260,11 @@ void ModuleBitcodeWriter::writeDISubprogram(const DISubprogram *N,
   Record.push_back(VE.getMetadataOrNullID(N->getRawName()));
   Record.push_back(VE.getMetadataOrNullID(N->getRawLinkageName()));
   Record.push_back(VE.getMetadataOrNullID(N->getFile()));
-  Record.push_back(VE.debugLine(N, N->getLine()));
+  Record.push_back(LineCertificate ? LineCertificate->line(N->getFile(), N->getLine())
+                                   : VE.debugLine(N, N->getLine()));
   Record.push_back(VE.getMetadataOrNullID(N->getType()));
-  Record.push_back(VE.debugLine(N, N->getScopeLine()));
+  Record.push_back(LineCertificate ? LineCertificate->line(N->getFile(), N->getScopeLine())
+                                   : VE.debugLine(N, N->getScopeLine()));
   Record.push_back(VE.getMetadataOrNullID(N->getContainingType()));
   Record.push_back(N->getSPFlags());
   Record.push_back(N->getVirtualIndex());
@@ -2278,7 +2289,8 @@ void ModuleBitcodeWriter::writeDILexicalBlock(const DILexicalBlock *N,
   Record.push_back(N->isDistinct());
   Record.push_back(VE.getMetadataOrNullID(N->getScope()));
   Record.push_back(VE.getMetadataOrNullID(N->getFile()));
-  Record.push_back(VE.debugLine(N, N->getLine()));
+  Record.push_back(LineCertificate ? LineCertificate->line(N->getFile(), N->getLine())
+                                   : VE.debugLine(N, N->getLine()));
   Record.push_back(N->getColumn());
 
   Stream.EmitRecord(bitc::METADATA_LEXICAL_BLOCK, Record, Abbrev);
@@ -2597,8 +2609,13 @@ void ModuleBitcodeWriter::writeMetadataStrings(
   Record.push_back(Blob.size());
 
   // Add the strings to the blob.
-  for (const Metadata *MD : Strings)
-    Blob.append(VE.debugString(cast<MDString>(MD)));
+  for (const Metadata *MD : Strings) {
+    auto *Str = cast<MDString>(MD);
+    if (LineCertificate && LineCertificate->mask(Str))
+      Blob.append(Str->getLength(), 0);
+    else
+      Blob.append(VE.debugString(Str));
+  }
 
   // Emit the final record.
   Stream.EmitRecordWithBlob(createMetadataStringsAbbrev(), Record, Blob);
@@ -3869,7 +3886,8 @@ void ModuleBitcodeWriter::writeFunction(
           // Just repeat the same debug loc as last time.
           Stream.EmitRecord(bitc::FUNC_CODE_DEBUG_LOC_AGAIN, Vals);
         } else {
-          Vals.push_back(VE.debugLine(DL, DL->getLine()));
+          Vals.push_back(LineCertificate ? LineCertificate->line(DL->getFile(), DL->getLine())
+                                     : VE.debugLine(DL, DL->getLine()));
           Vals.push_back(DL->getColumn());
           Vals.push_back(VE.getMetadataOrNullID(DL->getScope()));
           Vals.push_back(VE.getMetadataOrNullID(DL->getInlinedAt()));
@@ -5766,6 +5784,35 @@ bool llvm::writeClosedOptimizerInput(const Module &M,
                                      SmallVectorImpl<char> &Buffer) {
   return writeDebugObjectBitcode(M, Buffer, nullptr,
                                  /*AllowMachineOnlyUses=*/false);
+}
+
+bool llvm::writeClosedDwarfLineCertificateV1(const Module &M, raw_ostream &Out) {
+  if (!M.isMaterialized() || !M.getTargetTriple().isOSBinFormatELF() ||
+      (PreserveBitcodeUseListOrder.getNumOccurrences() && !PreserveBitcodeUseListOrder))
+    return false;
+  DwarfLineCertificate Certificate;
+  if (!Certificate.prepare(M))
+    return false;
+  std::array<uint8_t, 32> Context;
+  if (!getClosedOptimizerContextV1(M, Context))
+    return false;
+
+  SmallString<0> Bytes;
+  {
+    raw_svector_ostream Buffer(Bytes);
+    BitcodeWriter Writer(Buffer);
+    Writer.Mods.push_back(const_cast<Module *>(&M));
+    ModuleBitcodeWriter ModuleWriter(M, Writer.StrtabBuilder, *Writer.Stream,
+                                     /*ShouldPreserveUseListOrder=*/true, nullptr,
+                                     /*GenerateHash=*/false, nullptr,
+                                     /*SourceMap=*/nullptr, /*Uses=*/nullptr,
+                                     &Certificate);
+    ModuleWriter.write();
+    Writer.writeSymtab();
+    Writer.writeStrtab();
+  }
+  Bytes.append(StringRef(reinterpret_cast<const char *>(Context.data()), Context.size()));
+  return Certificate.write(Bytes, Out);
 }
 
 void BitcodeWriter::writeIndex(
