@@ -6,12 +6,13 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "llvm/Bitcode/DwarfLineCertificate.h"
 #include "llvm/AsmParser/Parser.h"
 #include "llvm/Bitcode/BitcodeWriter.h"
 #include "llvm/Bitcode/ClosedModuleHash.h"
-#include "llvm/Bitcode/DwarfLineCertificate.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DebugInfoMetadata.h"
+#include "llvm/IR/GlobalIFunc.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/OptBisect.h"
@@ -190,5 +191,48 @@ TEST_F(DwarfLineCertificateTest, IncludesOnlyTheDisabledDefaultPassGate) {
 TEST_F(DwarfLineCertificateTest, RejectsSecondModuleInSameContext) {
   Module Other("other", C);
   EXPECT_FALSE(certificate());
+}
+
+TEST(DwarfLineCertificateIFuncTest, SharedChecksumRemainsLiteral) {
+  auto Read = [](StringRef Checksum, std::array<uint8_t, 32> &Raw,
+                 std::string &Normalized) {
+    LLVMContext Context;
+    SMDiagnostic Error;
+    std::string IR = R"(
+      target triple = "x86_64-unknown-linux-gnu"
+      @redirect = ifunc i32 (), ptr @resolve
+      define ptr @resolve() { ret ptr @run }
+      define i32 @run() !dbg !3 { ret i32 0, !dbg !4 }
+      !llvm.dbg.cu = !{!0}
+      !llvm.module.flags = !{!2}
+      !0 = distinct !DICompileUnit(language: DW_LANG_Rust, file: !1, producer: "test", isOptimized: true, runtimeVersion: 0, emissionKind: LineTablesOnly)
+      !1 = !DIFile(filename: "a.rs", directory: "/src", checksumkind: CSK_MD5, checksum: "CHECKSUM")
+      !2 = !{i32 2, !"Debug Info Version", i32 3}
+      !3 = distinct !DISubprogram(name: "run", scope: !1, file: !1, line: 1, type: !5, scopeLine: 1, spFlags: DISPFlagDefinition, unit: !0)
+      !4 = !DILocation(line: 1, column: 1, scope: !3)
+      !5 = !DISubroutineType(types: !6)
+      !6 = !{}
+    )";
+    IR.replace(IR.find("CHECKSUM"), 8, Checksum);
+    auto M = parseAssemblyString(IR, Error, Context);
+    ASSERT_TRUE(M);
+    M->getNamedIFunc("redirect")
+        ->setMetadata("also.uses.checksum",
+                      MDNode::get(Context, MDString::get(Context, Checksum)));
+    ASSERT_TRUE(getClosedModuleHashV1(*M, Raw));
+    std::string Bytes;
+    raw_string_ostream Out(Bytes);
+    ASSERT_TRUE(writeClosedDwarfLineCertificateV1(*M, Out));
+    // The compilation directory "/src" is a length-prefixed string immediately
+    // followed by the normalized bitcode digest.
+    ASSERT_GT(Bytes.size(), 8u + Raw.size());
+    Normalized = Bytes.substr(8, Raw.size());
+  };
+  std::array<uint8_t, 32> RawA, RawB;
+  std::string NormalizedA, NormalizedB;
+  Read(std::string(32, 'a'), RawA, NormalizedA);
+  Read(std::string(32, 'b'), RawB, NormalizedB);
+  EXPECT_NE(RawA, RawB);
+  EXPECT_NE(NormalizedA, NormalizedB);
 }
 } // namespace

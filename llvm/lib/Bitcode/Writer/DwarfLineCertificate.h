@@ -120,6 +120,8 @@ public:
         visit(MD);
     for (const auto &G : M.globals())
       VisitAttachments(G);
+    for (const auto &IFunc : M.ifuncs())
+      VisitAttachments(IFunc);
     for (const auto &F : M) {
       VisitAttachments(F);
       for (const auto &BB : F) {
