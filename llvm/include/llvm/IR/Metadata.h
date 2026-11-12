@@ -415,6 +415,12 @@ public:
   hasOnlyRepresentedUsers(Metadata &MD, const DenseSet<Value *> &Values,
                           const DenseSet<Metadata *> &Nodes);
 
+  /// Describe the order and operand slots in which replacing this node notifies
+  /// its owners. Reject tracking references outside the represented graph.
+  static LLVM_ABI bool getRepresentedUserOrder(
+      Metadata &MD, const DenseMap<Value *, unsigned> &Values,
+      const DenseMap<Metadata *, unsigned> &Nodes, SmallVectorImpl<uint64_t> &Order);
+
   /// Replace all uses of this with MD.
   ///
   /// Replace all uses of this with \c MD, which is allowed to be null.

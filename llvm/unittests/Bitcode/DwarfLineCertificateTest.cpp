@@ -1,0 +1,136 @@
+//===- DwarfLineCertificateTest.cpp - Check live optimizer inputs ---------===//
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
+#include "llvm/AsmParser/Parser.h"
+#include "llvm/Bitcode/DwarfLineCertificate.h"
+#include "llvm/IR/Constants.h"
+#include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/Module.h"
+#include "llvm/IR/OptBisect.h"
+#include "llvm/Support/SourceMgr.h"
+#include "llvm/Support/raw_ostream.h"
+#include "gtest/gtest.h"
+
+using namespace llvm;
+
+namespace {
+class DwarfLineCertificateTest : public testing::Test {
+protected:
+  LLVMContext C;
+  std::unique_ptr<Module> M;
+
+  void SetUp() override {
+    SMDiagnostic Error;
+    M = parseAssemblyString(R"(
+      target triple = "x86_64-unknown-linux-gnu"
+      @storage = private constant [4 x i8] c"test"
+      @pointer = global ptr @storage
+      define i32 @run(i1 %choice) !dbg !5 {
+        br i1 %choice, label %a, label %b, !dbg !7
+      a: ret i32 1, !dbg !7
+      b: ret i32 2, !dbg !8
+      }
+      !llvm.dbg.cu = !{!0}
+      !llvm.module.flags = !{!9}
+      !0 = distinct !DICompileUnit(language: DW_LANG_Rust, file: !1, producer: "test", isOptimized: true, runtimeVersion: 0, emissionKind: LineTablesOnly)
+      !1 = !DIFile(filename: "crate.rs", directory: "/src")
+      !3 = !DISubroutineType(types: !4)
+      !4 = !{}
+      !5 = distinct !DISubprogram(name: "run", scope: !1, file: !1, line: 1, type: !3, scopeLine: 1, spFlags: DISPFlagDefinition, unit: !0)
+      !7 = !DILocation(line: 3, column: 1, scope: !5)
+      !8 = !DILocation(line: 4, column: 1, scope: !5)
+      !9 = !{i32 2, !"Debug Info Version", i32 3}
+    )", Error, C);
+    ASSERT_NE(M, nullptr);
+    ASSERT_TRUE(certificate());
+  }
+
+  std::optional<std::string> certificate() {
+    std::string Bytes;
+    raw_string_ostream Out(Bytes);
+    if (writeClosedDwarfLineCertificateV1(*M, Out))
+      return Bytes;
+    EXPECT_TRUE(Bytes.empty());
+    return std::nullopt;
+  }
+
+  void addSlice(Constant *Address) {
+    (void)ConstantStruct::getAnon(
+        {Address, PoisonValue::get(Type::getInt64Ty(C))});
+  }
+};
+
+TEST_F(DwarfLineCertificateTest, IncludesTerminalStorageSlice) {
+  auto Initial = certificate();
+  addSlice(M->getNamedGlobal("storage"));
+  auto WithSlice = certificate();
+  ASSERT_TRUE(WithSlice);
+  EXPECT_NE(Initial, WithSlice);
+  M->getNamedGlobal("storage")->reverseUseList();
+  auto OtherPosition = certificate();
+  ASSERT_TRUE(OtherPosition);
+  EXPECT_NE(OtherPosition, WithSlice);
+}
+
+TEST_F(DwarfLineCertificateTest, RejectsUnrepresentedFunctionUser) {
+  addSlice(M->getFunction("run"));
+  EXPECT_FALSE(certificate());
+}
+
+TEST_F(DwarfLineCertificateTest, RejectsUnrepresentedBlockAddress) {
+  auto *F = M->getFunction("run");
+  (void)BlockAddress::get(F, &F->back());
+  EXPECT_FALSE(certificate());
+}
+
+TEST_F(DwarfLineCertificateTest, RejectsDetachedConstantGraph) {
+  auto *Address = ConstantExpr::getIntToPtr(
+      ConstantInt::get(Type::getInt64Ty(C), 127), PointerType::getUnqual(C));
+  addSlice(Address);
+  EXPECT_FALSE(certificate());
+}
+
+TEST_F(DwarfLineCertificateTest, RejectsHiddenMetadataWrapper) {
+  (void)ValueAsMetadata::get(M->getNamedGlobal("storage"));
+  EXPECT_FALSE(certificate());
+}
+
+TEST_F(DwarfLineCertificateTest, RejectsDetachedScalarMetadataWrapper) {
+  (void)ValueAsMetadata::get(ConstantInt::get(Type::getInt64Ty(C), 217));
+  EXPECT_FALSE(certificate());
+}
+
+TEST_F(DwarfLineCertificateTest, IncludesTrackingOrderWithinMetadataOwner) {
+  auto *Value = ValueAsMetadata::get(M->getNamedGlobal("storage"));
+  auto *N = MDNode::get(C, {Value, Value});
+  M->getOrInsertNamedMetadata("test.tracking.order")->addOperand(N);
+  auto Initial = certificate();
+  ASSERT_TRUE(Initial);
+  // Replacing a ConstantAsMetadata with null makes this a distinct node.
+  // Keep the uniqued owner so changing the slot only changes callback order.
+  N->replaceOperandWith(0, MDString::get(C, "temporary operand"));
+  N->replaceOperandWith(0, Value);
+  auto OtherPosition = certificate();
+  ASSERT_TRUE(OtherPosition);
+  EXPECT_NE(Initial, OtherPosition);
+}
+
+TEST_F(DwarfLineCertificateTest, IncludesOnlyTheDisabledDefaultPassGate) {
+  auto Initial = certificate();
+  (void)C.getOptPassGate();
+  EXPECT_EQ(certificate(), Initial);
+  OptPassGate Other;
+  C.setOptPassGate(Other);
+  EXPECT_FALSE(certificate());
+}
+
+TEST_F(DwarfLineCertificateTest, RejectsSecondModuleInSameContext) {
+  Module Other("other", C);
+  EXPECT_FALSE(certificate());
+}
+} // namespace
