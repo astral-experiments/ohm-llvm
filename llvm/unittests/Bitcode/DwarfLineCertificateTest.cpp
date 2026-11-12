@@ -7,6 +7,8 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/AsmParser/Parser.h"
+#include "llvm/Bitcode/BitcodeWriter.h"
+#include "llvm/Bitcode/ClosedModuleHash.h"
 #include "llvm/Bitcode/DwarfLineCertificate.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DebugInfoMetadata.h"
@@ -76,6 +78,46 @@ TEST_F(DwarfLineCertificateTest, IncludesTerminalStorageSlice) {
   auto OtherPosition = certificate();
   ASSERT_TRUE(OtherPosition);
   EXPECT_NE(OtherPosition, WithSlice);
+}
+
+TEST_F(DwarfLineCertificateTest, ExactInputIncludesLocationsIdentifierAndLiveUses) {
+  std::array<uint8_t, 32> Initial, Other;
+  ASSERT_TRUE(getClosedModuleHashV1(*M, Initial));
+  ASSERT_TRUE(getClosedModuleHashV1(*M, Other));
+  EXPECT_EQ(Initial, Other);
+
+  auto OriginalID = M->getModuleIdentifier();
+  M->setModuleIdentifier("other-input");
+  ASSERT_TRUE(getClosedModuleHashV1(*M, Other));
+  EXPECT_NE(Initial, Other);
+  M->setModuleIdentifier(OriginalID);
+  ASSERT_TRUE(getClosedModuleHashV1(*M, Other));
+  EXPECT_EQ(Initial, Other);
+
+  auto *F = M->getFunction("run");
+  Instruction &I = *F->getEntryBlock().getTerminator();
+  I.setDebugLoc(DILocation::get(C, 7, 1, F->getSubprogram()));
+  ASSERT_TRUE(getClosedModuleHashV1(*M, Other));
+  EXPECT_NE(Initial, Other);
+
+  addSlice(F);
+  EXPECT_FALSE(getClosedModuleHashV1(*M, Other));
+}
+
+TEST_F(DwarfLineCertificateTest, ExactHashIncludesUsesAbsentFromOrderedBitcode) {
+  auto Bitcode = [&]() {
+    std::string Bytes;
+    raw_string_ostream OS(Bytes);
+    WriteBitcodeToFile(*M, OS, /*ShouldPreserveUseListOrder=*/true);
+    return Bytes;
+  };
+  auto Original = Bitcode();
+  std::array<uint8_t, 32> Before, After;
+  ASSERT_TRUE(getClosedModuleHashV1(*M, Before));
+  addSlice(M->getNamedGlobal("storage"));
+  EXPECT_EQ(Original, Bitcode());
+  ASSERT_TRUE(getClosedModuleHashV1(*M, After));
+  EXPECT_NE(Before, After);
 }
 
 TEST_F(DwarfLineCertificateTest, RejectsUnrepresentedFunctionUser) {
