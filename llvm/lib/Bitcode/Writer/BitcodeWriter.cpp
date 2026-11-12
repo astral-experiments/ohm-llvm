@@ -123,6 +123,12 @@ static cl::opt<bool> PreserveBitcodeUseListOrder(
     "preserve-bc-uselistorder", cl::Hidden, cl::init(true),
     cl::desc("Preserve use-list order when writing LLVM bitcode."));
 
+static bool preserveUseListOrder(bool Requested) {
+  return PreserveBitcodeUseListOrder.getNumOccurrences()
+             ? PreserveBitcodeUseListOrder.getValue()
+             : Requested;
+}
+
 namespace llvm {
 extern FunctionSummary::ForceSummaryHotnessType ForceSummaryEdgesCold;
 }
@@ -224,11 +230,7 @@ public:
                           const ModuleSummaryIndex *Index,
                           MachineUseState *Uses = nullptr)
       : BitcodeWriterBase(Stream, StrtabBuilder), M(M),
-        VE(M,
-           PreserveBitcodeUseListOrder.getNumOccurrences()
-               ? PreserveBitcodeUseListOrder
-               : ShouldPreserveUseListOrder,
-           Uses),
+        VE(M, preserveUseListOrder(ShouldPreserveUseListOrder), Uses),
         Index(Index) {
     // Assign ValueIds to any callee values in the index that came from
     // indirect call profiles and were recorded as a GUID not a Value*
@@ -5753,8 +5755,7 @@ bool llvm::writeDebugObjectBitcode(const Module &M,
   // Use-list ordering can affect machine-code generation. If the process
   // explicitly forbids writing it, this compilation cannot supply a key.
   if (!M.isMaterialized() || !M.getTargetTriple().isOSBinFormatELF() ||
-      (PreserveBitcodeUseListOrder.getNumOccurrences() &&
-       !PreserveBitcodeUseListOrder))
+      !preserveUseListOrder(true))
     return false;
   if (Map)
     Map->prepare();
@@ -5791,7 +5792,7 @@ bool llvm::writeClosedOptimizerInput(const Module &M,
 bool llvm::getClosedModuleHashV1(const Module &M,
                                  std::array<uint8_t, 32> &Digest) {
   std::array<uint8_t, 32> Context;
-  if (!getClosedOptimizerContextV1(M, Context))
+  if (!preserveUseListOrder(true) || !getClosedOptimizerContextV1(M, Context))
     return false;
 
   // A bitcode reader receives the module identifier from its caller.
@@ -5809,7 +5810,7 @@ bool llvm::getClosedModuleHashV1(const Module &M,
 
 bool llvm::writeClosedDwarfLineCertificateV1(const Module &M, raw_ostream &Out) {
   if (!M.isMaterialized() || !M.getTargetTriple().isOSBinFormatELF() ||
-      (PreserveBitcodeUseListOrder.getNumOccurrences() && !PreserveBitcodeUseListOrder))
+      !preserveUseListOrder(true))
     return false;
   DwarfLineCertificate Certificate;
   if (!Certificate.prepare(M))
