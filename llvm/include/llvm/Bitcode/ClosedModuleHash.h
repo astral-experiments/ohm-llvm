@@ -18,10 +18,10 @@ namespace llvm {
 class Module;
 
 /// Hash the module identifier, ordered bitcode (including debug locations),
-/// and live optimizer state. Return false when the context has an input that
-/// cannot be represented. Call before creating analyses. An object cache must
-/// independently identify its compiler, target machine, options and external
-/// inputs before reusing an output.
+/// and live optimizer state. Return false if the writer cannot preserve use-list
+/// order or the context has an unrepresented input. Call before creating
+/// analyses. An object cache must independently identify its compiler, target
+/// machine, options and external inputs before reusing an output.
 LLVM_ABI bool getClosedModuleHashV1(const Module &M,
                                     std::array<uint8_t, 32> &Digest);
 } // namespace llvm

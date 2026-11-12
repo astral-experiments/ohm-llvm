@@ -16,6 +16,7 @@
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/OptBisect.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/raw_ostream.h"
 #include "gtest/gtest.h"
@@ -103,6 +104,21 @@ TEST_F(DwarfLineCertificateTest, ExactInputIncludesLocationsIdentifierAndLiveUse
 
   addSlice(F);
   EXPECT_FALSE(getClosedModuleHashV1(*M, Other));
+}
+
+TEST_F(DwarfLineCertificateTest, RejectsExplicitlyDisabledUseListOrder) {
+  std::array<uint8_t, 32> Digest;
+  ASSERT_TRUE(getClosedModuleHashV1(*M, Digest));
+  const StringRef Name = "preserve-bc-uselistorder";
+  cl::Option *Option = cl::getRegisteredOptions().lookup(Name);
+  ASSERT_NE(Option, nullptr);
+  ASSERT_EQ(Option->getNumOccurrences(), 0);
+
+  EXPECT_FALSE(Option->addOccurrence(0, Name, "false"));
+  EXPECT_FALSE(getClosedModuleHashV1(*M, Digest));
+  EXPECT_FALSE(certificate());
+  Option->reset();
+  EXPECT_TRUE(getClosedModuleHashV1(*M, Digest));
 }
 
 TEST_F(DwarfLineCertificateTest, ExactHashIncludesUsesAbsentFromOrderedBitcode) {
