@@ -5833,7 +5833,7 @@ bool llvm::writeClosedDwarfLineCertificateV1(const Module &M, raw_ostream &Out) 
     Writer.writeStrtab();
   }
   Bytes.append(StringRef(reinterpret_cast<const char *>(Context.data()), Context.size()));
-  return Certificate.write(Bytes, Out);
+  return Certificate.write(Bytes, M.getModuleIdentifier(), Out);
 }
 
 void BitcodeWriter::writeIndex(
