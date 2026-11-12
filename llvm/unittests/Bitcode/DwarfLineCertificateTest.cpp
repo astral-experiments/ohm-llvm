@@ -9,6 +9,7 @@
 #include "llvm/AsmParser/Parser.h"
 #include "llvm/Bitcode/DwarfLineCertificate.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/OptBisect.h"
@@ -79,6 +80,21 @@ TEST_F(DwarfLineCertificateTest, IncludesTerminalStorageSlice) {
 
 TEST_F(DwarfLineCertificateTest, RejectsUnrepresentedFunctionUser) {
   addSlice(M->getFunction("run"));
+  EXPECT_FALSE(certificate());
+}
+
+TEST_F(DwarfLineCertificateTest, RequiresLexicalBlockFileToOwnNestedLines) {
+  Function *F = M->getFunction("run");
+  auto *SP = F->getSubprogram();
+  auto *MacroFile = DIFile::get(C, "macro.rs", "/src");
+  auto *Wrapper = DILexicalBlockFile::get(C, SP, MacroFile, 0);
+  auto &Term = *F->getEntryBlock().getTerminator();
+  auto *SameFile = DILexicalBlock::get(C, Wrapper, MacroFile, 10, 1);
+  Term.setDebugLoc(DILocation::get(C, 10, 1, SameFile));
+  EXPECT_TRUE(certificate());
+
+  auto *Inner = DILexicalBlock::get(C, SameFile, SP->getFile(), 10, 1);
+  Term.setDebugLoc(DILocation::get(C, 10, 1, Inner));
   EXPECT_FALSE(certificate());
 }
 
