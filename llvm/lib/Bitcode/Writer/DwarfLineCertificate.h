@@ -37,6 +37,28 @@ class DwarfLineCertificate {
   llvm::StringRef CompilationDirectory;
   bool Valid = true;
 
+  // DILocation::getMergedLocation may unwrap a lexical block file when it
+  // combines instructions. A line originating in a different file can then
+  // select a different output scope after an otherwise monotone source edit.
+  static bool hasReplayableFile(const llvm::DILexicalBlockBase &Scope) {
+    const File *F = Scope.getFile();
+    if (llvm::isa<llvm::DILexicalBlockFile>(Scope) && !F)
+      return false;
+    auto *Parent = Scope.getRawScope();
+    for (unsigned Depth = 0; Depth <= 128; ++Depth) {
+      if (llvm::isa_and_nonnull<llvm::DISubprogram>(Parent))
+        return true;
+      const auto *Block =
+          llvm::dyn_cast_or_null<llvm::DILexicalBlockBase>(Parent);
+      if (!Block)
+        return false;
+      if (llvm::isa<llvm::DILexicalBlockFile>(Block))
+        return F && F == Block->getFile();
+      Parent = Block->getRawScope();
+    }
+    return false;
+  }
+
   void visit(const Metadata *MD, unsigned Depth = 0) {
     if (!MD || !Visited.insert(MD).second)
       return;
@@ -48,6 +70,11 @@ class DwarfLineCertificate {
     const auto *Node = llvm::dyn_cast<llvm::MDNode>(MD);
     if (!Node)
       return;
+    if (const auto *Scope = llvm::dyn_cast<llvm::DILexicalBlockBase>(Node);
+        Scope && !hasReplayableFile(*Scope)) {
+      Valid = false;
+      return;
+    }
     const auto *F = llvm::dyn_cast<File>(Node);
     for (auto [Index, Operand] : llvm::enumerate(Node->operands())) {
       const auto *Str = llvm::dyn_cast_or_null<MDString>(Operand.get());
@@ -93,6 +120,8 @@ public:
         visit(MD);
     for (const auto &G : M.globals())
       VisitAttachments(G);
+    for (const auto &IFunc : M.ifuncs())
+      VisitAttachments(IFunc);
     for (const auto &F : M) {
       VisitAttachments(F);
       for (const auto &BB : F) {
@@ -153,11 +182,12 @@ public:
     return Mask;
   }
 
-  bool write(llvm::StringRef Bitcode, llvm::raw_ostream &Out) const {
+  bool write(llvm::StringRef Bitcode, llvm::StringRef ModuleIdentifier,
+             llvm::raw_ostream &Out) const {
     if (!Valid)
       return false;
     llvm::BLAKE3 Hash;
-    Hash.update(llvm::arrayRefFromStringRef("ohm-line-certificate-v2"));
+    Hash.update(llvm::arrayRefFromStringRef("ohm-line-certificate-v3"));
     auto HashField = [&](llvm::ArrayRef<uint8_t> Bytes) {
       uint64_t Size = Bytes.size();
       std::array<uint8_t, 8> Length;
@@ -168,6 +198,8 @@ public:
     };
     HashField(llvm::arrayRefFromStringRef(Bitcode));
     HashField(MaskedStrings);
+    // Bitcode readers assign the identifier, and native emitters can use it.
+    HashField(llvm::arrayRefFromStringRef(ModuleIdentifier));
     auto Digest = Hash.final();
 
     // The consumer caps a proof at 128 MiB before decoding it. Encode into a
