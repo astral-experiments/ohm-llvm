@@ -75,6 +75,38 @@ LineForm lineForm(int64_t Delta, uint64_t Address, int Base, unsigned Range,
   return LineForm::AdvancePC;
 }
 
+// Emit the x86 MC row forms that carry their whole address delta in the
+// final opcode. A larger address may require a separate advance_pc.
+std::optional<std::string> shortLineRow(int64_t Delta, uint64_t Address,
+                                        int Base, unsigned Range,
+                                        unsigned OpcodeBase) {
+  if (Address > (255 - OpcodeBase) / Range)
+    return std::nullopt;
+  int64_t Biased;
+  if (SubOverflow(Delta, int64_t(Base), Biased))
+    return std::nullopt;
+  std::string Bytes;
+  if (Biased < 0 || Biased >= Range || Biased + OpcodeBase > 255) {
+    uint8_t Operand[16];
+    const unsigned Size = encodeSLEB128(Delta, Operand);
+    Bytes.push_back(dwarf::DW_LNS_advance_line);
+    Bytes.append(reinterpret_cast<const char *>(Operand), Size);
+    Delta = 0;
+    Biased = -Base;
+  }
+  if (!Delta && !Address) {
+    Bytes.push_back(dwarf::DW_LNS_copy);
+    return Bytes;
+  }
+  if (Biased < 0 || Biased >= Range)
+    return std::nullopt;
+  const uint64_t Opcode = OpcodeBase + Address * Range + uint64_t(Biased);
+  if (Opcode > 255)
+    return std::nullopt;
+  Bytes.push_back(static_cast<char>(Opcode));
+  return Bytes;
+}
+
 class Cursor {
   StringRef Data;
   std::string &Problem;
@@ -393,6 +425,7 @@ class Rewriter {
     bool RepeatedAdvance = false;
     uint64_t Address = 0;
     bool NonScaledAddress = false;
+    bool SeparatePC = false;
     bool Ended = false;
     auto move = [&](int64_t Delta) {
       if (AddOverflow(Before, Delta, Before) ||
@@ -439,6 +472,7 @@ class Rewriter {
           Row = true;
           break;
         case dwarf::DW_LNS_advance_pc:
+          SeparatePC = true;
           Address = SaturatingAdd(Address, Ops.uleb());
           break;
         case dwarf::DW_LNS_set_column:
@@ -460,12 +494,14 @@ class Rewriter {
             return fail("invalid line-program file");
           break;
         case dwarf::DW_LNS_fixed_advance_pc: {
+          SeparatePC = true;
           uint64_t Bytes = Ops.fixed(2);
           NonScaledAddress |= Bytes % Min != 0;
           Address = SaturatingAdd(Address, Bytes / Min);
           break;
         }
         case dwarf::DW_LNS_const_add_pc:
+          SeparatePC = true;
           Address = SaturatingAdd(Address, uint64_t((255 - OpBase) / Range));
           break;
         case dwarf::DW_LNS_negate_stmt:
@@ -499,10 +535,17 @@ class Rewriter {
           return fail("unsupported line program advance");
         auto BeforeForm = lineForm(OldDelta, Address, LineBase, Range, OpBase);
         auto AfterForm = lineForm(NewDelta, Address, LineBase, Range, OpBase);
-        if (BeforeForm != AfterForm ||
-            (Last && (BeforeForm != LineForm::AdvanceLine || RowDelta)))
-          return fail("row would change the native MC line opcode form");
-        if (Last) {
+        if (BeforeForm != AfterForm) {
+          const size_t Begin = Last ? Last->Begin - 1 : Start;
+          auto Old = shortLineRow(OldDelta, Address, LineBase, Range, OpBase);
+          auto New = shortLineRow(NewDelta, Address, LineBase, Range, OpBase);
+          if (SeparatePC || EndSequence || (Last && Last->End != Start) ||
+              !Old || !New || Data.slice(Begin, Ops.At) != *Old)
+            return fail("row would change the native MC line opcode form");
+          Resized.push_back({Begin, Ops.At, std::move(*New)});
+        } else if (Last) {
+          if (BeforeForm != LineForm::AdvanceLine || RowDelta)
+            return fail("row would change the native MC line opcode form");
           int64_t V;
           if (AddOverflow(Last->Value, Change, V))
             return fail("advance_line operand overflow");
@@ -539,6 +582,7 @@ class Rewriter {
       RepeatedAdvance = false;
       Address = 0;
       NonScaledAddress = false;
+      SeparatePC = false;
       if (EndSequence) {
         Before = After = 1;
         File = 1;
