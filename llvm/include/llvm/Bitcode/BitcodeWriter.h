@@ -39,6 +39,7 @@ class BitcodeWriter {
                        MachineUseState *Uses = nullptr);
 
   friend bool writeClosedDwarfLineCertificateV1(const Module &, raw_ostream &);
+  friend bool writeClosedCallerLineCertificateV1(const Module &, raw_ostream &);
 
   std::unique_ptr<BitstreamWriter> Stream;
 

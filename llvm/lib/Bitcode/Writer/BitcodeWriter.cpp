@@ -13,6 +13,7 @@
 #include "llvm/Bitcode/BitcodeWriter.h"
 #include "ValueEnumerator.h"
 #include "DwarfLineCertificate.h"
+#include "OhmCallerLocationProof.h"
 #include "llvm/Bitcode/ClosedModuleHash.h"
 #include "llvm/Bitcode/DwarfLineCertificate.h"
 #include "llvm/IR/ClosedOptimizerContext.h"
@@ -72,6 +73,7 @@
 #include "llvm/Support/AtomicOrdering.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/CommandLine.h"
+#include "llvm/Support/JSON.h"
 #include "llvm/Support/Compiler.h"
 #include "llvm/Support/Endian.h"
 #include "llvm/Support/Error.h"
@@ -332,7 +334,10 @@ public:
                                 ShouldPreserveUseListOrder, Index, Uses),
         LineCertificate(LineCertificate), GenerateHash(GenerateHash), ModHash(ModHash),
         BitcodeStartBit(Stream.GetCurrentBitNo()) {
-    assert(!(SourceMap && LineCertificate));
+    // The line certificate owns all DIFile and DILocation substitutions.
+    // A caller-only source map changes constant data and leaves those alone.
+    assert(!SourceMap || !LineCertificate ||
+           (SourceMap->Files.empty() && SourceMap->Strings.empty()));
     VE.setSourceMap(SourceMap);
   }
 
@@ -5835,6 +5840,139 @@ bool llvm::writeClosedDwarfLineCertificateV1(const Module &M, raw_ostream &Out) 
   }
   Bytes.append(StringRef(reinterpret_cast<const char *>(Context.data()), Context.size()));
   return Certificate.write(Bytes, M.getModuleIdentifier(), Out);
+}
+
+namespace {
+bool collectCallerProjection(const Module &M, DebugObjectSourceMap &P,
+                            json::Array &Shape, json::Array &Lines) {
+  const auto &T = M.getTargetTriple();
+  const auto &DL = M.getDataLayout();
+  if (T.getArch() != Triple::x86_64 || !T.isOSLinux() ||
+      !T.isOSBinFormatELF() || !DL.isLittleEndian() ||
+      DL.getPointerSizeInBits() != 64)
+    return false;
+  auto *CUList = M.getNamedMetadata("llvm.dbg.cu");
+  if (!CUList || CUList->getNumOperands() != 1)
+    return false;
+  auto *CU = dyn_cast<DICompileUnit>(CUList->getOperand(0));
+  if (!CU || CU->getEmissionKind() != DICompileUnit::LineTablesOnly)
+    return false;
+  using Key = std::pair<StringRef, std::pair<uint32_t, uint64_t>>;
+  using Record = ohm_location::Record;
+  auto KeyFor = [](const Record &R) -> Key {
+    StringRef B = R.Tail->getAsString();
+    uint32_t Line = support::endian::read32le(B.data() + 8);
+    uint64_t Column = R.HasColumn ? 1ULL + support::endian::read32le(B.data() + 12) : 0;
+    return {R.Path, {Line, Column}};
+  };
+  DenseMap<const GlobalVariable *, unsigned> Indices;
+  DenseMap<Key, bool> Unique;
+  SmallVector<std::pair<const GlobalVariable *, Record>, 16> Records;
+  for (const auto &G : M.globals()) {
+    if (Indices.size() == UINT_MAX)
+      return false;
+    Indices[&G] = Indices.size();
+    if (auto R = ohm_location::readRecord(G)) {
+      if (Records.size() == 65536)
+        return false;
+      auto [It, Inserted] = Unique.try_emplace(KeyFor(*R), true);
+      if (!Inserted)
+        It->second = false;
+      Records.emplace_back(&G, *R);
+    }
+  }
+  // Each emitted slot is explicitly bound to its module-global position and
+  // its file-global position. Existing source and native checks bind the line.
+  for (const auto &Pair : Records) {
+    const auto &G = *Pair.first;
+    const auto *R = &Pair.second;
+    if (!Unique.lookup(KeyFor(*R)) || !(R->HasColumn ? ohm_location::addressOnly(G)
+                             : ohm_location::returnedAddress(G)) ||
+        !G.getInitializer()->hasOneUse() || G.getInitializer()->isUsedByMetadata())
+      continue;
+    StringRef Tail = R->Tail->getAsString();
+    auto Line = support::endian::read32le(Tail.data() + 8);
+    if (!Line)
+      continue;
+    std::string Canonical = Tail.str();
+    support::endian::write32le(Canonical.data() + 8, 0);
+    P.CallerInitializers.insert(G.getInitializer());
+    auto Point = P.CallerTails.try_emplace(R->Tail, Canonical);
+    if (!Point.second && Point.first->second != Canonical)
+      return false;
+    json::Array Row{int64_t(Indices.lookup(&G)), int64_t(Indices.lookup(R->File)),
+                          G.getName(), R->File->getName(), CU->getDirectory(),
+                          R->Path, R->HasColumn};
+    if (R->HasColumn)
+      Row.emplace_back(int64_t(support::endian::read32le(Tail.data() + 12)));
+    Shape.emplace_back(std::move(Row));
+    Lines.emplace_back(int64_t(Line));
+  }
+  return true;
+}
+
+void appendCallerField(raw_ostream &OS, StringRef Field) {
+  uint64_t Size = Field.size();
+  char N[8];
+  support::endian::write64le(N, Size);
+  OS.write(N, sizeof(N));
+  OS << Field;
+}
+} // namespace
+
+bool llvm::writeClosedCallerLineCertificateV1(const Module &M, raw_ostream &Out) {
+  if (!M.isMaterialized() || !M.getTargetTriple().isOSBinFormatELF() ||
+      !preserveUseListOrder(true))
+    return false;
+  DwarfLineCertificate Certificate;
+  if (!Certificate.prepare(M))
+    return false;
+  DebugObjectSourceMap Map;
+  json::Array Shape, Lines;
+  if (!collectCallerProjection(M, Map, Shape, Lines) || Shape.empty())
+    return false;
+  std::array<uint8_t, 32> Context;
+  if (!getClosedOptimizerContextV1(M, Context))
+    return false;
+  SmallVector<char, 0> Bytes;
+  MachineUseState Uses;
+  Uses.OptimizerInput = true;
+  {
+    BitcodeWriter Writer(Bytes);
+    Writer.Mods.push_back(const_cast<Module *>(&M));
+    ModuleBitcodeWriter MW(M, Writer.StrtabBuilder, *Writer.Stream, true, nullptr,
+                           false, nullptr, &Map, &Uses, &Certificate);
+    if (!Uses.Complete)
+      return false;
+    MW.write();
+    Writer.writeSymtab();
+    Writer.writeStrtab();
+    if (!Map.Valid)
+      return false;
+    // The ordinary optimizer can observe users that machine-only input omits.
+    if (!Uses.MetadataUses.empty())
+      return false;
+    if (!Uses.Leaves.empty()) {
+      Writer.Stream->EnterSubblock(0x4f484d, 3);
+      Writer.Stream->EmitRecord(1, Uses.Leaves);
+      Writer.Stream->ExitBlock();
+    }
+  }
+  SmallString<0> ShapeString, LineString;
+  raw_svector_ostream(ShapeString) << json::Value(std::move(Shape));
+  raw_svector_ostream(LineString) << json::Value(std::move(Lines));
+  Bytes.append(reinterpret_cast<const char *>(Context.data()),
+               reinterpret_cast<const char *>(Context.data()+Context.size()));
+  SmallString<0> E3;
+  raw_svector_ostream Stream(E3);
+  if (!Certificate.write(StringRef(Bytes.data(), Bytes.size()),
+                         M.getModuleIdentifier(), Stream))
+    return false;
+  Out << "OHMTLC01";
+  appendCallerField(Out, E3);
+  appendCallerField(Out, ShapeString);
+  appendCallerField(Out, LineString);
+  return true;
 }
 
 void BitcodeWriter::writeIndex(
