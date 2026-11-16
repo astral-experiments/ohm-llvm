@@ -419,13 +419,19 @@ extern "C" int ohm_debug_rebase_locations_v1(const void *M, size_t MS,
       return Miss(reject("unable to copy the packed ELF object"));
     Old = Aligned->getMemBufferRef();
   }
-  auto Result = ohm::rebaseDwarf4(Old, *Map);
-  if (!Result)
-    return Miss(Result.takeError());
+  // Bind every updated word against the original ELF before the line table
+  // rewriter can resize the object or move another section's file offset.
+  std::vector<char> LocationBytes(Old.getBufferStart(), Old.getBufferEnd());
   if (Error E = ohm::rebaseRuntimeLocations(
           Old, *Map, StringRef(static_cast<const char *>(L), LS),
-          Result->Bytes))
+          LocationBytes))
     return Miss(std::move(E));
+  MemoryBufferRef Relocated(
+      StringRef(LocationBytes.data(), LocationBytes.size()),
+      Old.getBufferIdentifier());
+  auto Result = ohm::rebaseDwarf4(Relocated, *Map);
+  if (!Result)
+    return Miss(Result.takeError());
   auto Bytes = StringRef(Result->Bytes.data(), Result->Bytes.size());
   *Output = reinterpret_cast<LLVMMemoryBufferRef>(
       MemoryBuffer::getMemBufferCopy(Bytes).release());
