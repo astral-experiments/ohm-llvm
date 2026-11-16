@@ -7,8 +7,10 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/DebugInfo/DWARF/OhmDwarfRebase.h"
+#include "llvm-c/Core.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringExtras.h"
+#include "llvm/DebugInfo/DWARF/OhmRuntimeLocations.h"
 #include "llvm/Object/ObjectFile.h"
 #include "llvm/ObjectYAML/yaml2obj.h"
 #include "llvm/Support/LEB128.h"
@@ -195,6 +197,30 @@ TEST(OhmDwarfRebase, MatchesIndependentlyEmittedFullObject) {
   EXPECT_EQ(R->DeclLines, 1u);
   EXPECT_EQ(R->CallLines, 1u);
 }
+TEST(OhmDwarfRebase, AcceptsAnObjectAtAnOddPacketOffset) {
+  SmallString<0> Old, Native, Packet;
+  ASSERT_TRUE(fixture(Old, 20, 20, 20));
+  ASSERT_TRUE(fixture(Native, 22, 22, 22));
+  Packet.push_back('\0');
+  Packet.append(Old);
+  StringRef Input = Packet.str().drop_front();
+  ASSERT_EQ(reinterpret_cast<uintptr_t>(Input.data()) % 2, 1u);
+
+  StringRef Map =
+      R"({"version":1,"files":[{"directory":"/fixture","filename":"src/same.rs","lines":[[20,22]]}]})";
+  StringRef Locations = "[]";
+  LLVMMemoryBufferRef Output = nullptr;
+  const char *Reason = nullptr;
+  ASSERT_EQ(0, ohm_debug_rebase_locations_v1(
+                   Map.data(), Map.size(), Locations.data(), Locations.size(),
+                   Input.data(), Input.size(), &Output, &Reason))
+      << (Reason ? Reason : "");
+  ASSERT_NE(Output, nullptr);
+  EXPECT_EQ(Native.str(),
+            StringRef(LLVMGetBufferStart(Output), LLVMGetBufferSize(Output)));
+  LLVMDisposeMemoryBuffer(Output);
+}
+
 TEST(OhmDwarfRebase, RejectsUnrepresentableDIEAndInheritedFile) {
   SmallString<0> Old;
   ASSERT_TRUE(fixture(Old, 250, 20, 20));
