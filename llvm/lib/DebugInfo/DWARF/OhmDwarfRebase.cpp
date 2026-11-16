@@ -480,14 +480,15 @@ class Rewriter {
         return false;
       if (!Row)
         continue;
-      if (Before < 0 || uint64_t(Before) > UINT32_MAX || After < 0 ||
-          uint64_t(After) > UINT32_MAX)
+      if (Before < 0 || uint64_t(Before) > UINT32_MAX)
         return fail("invalid emitted source line");
       int64_t Want = Before;
       if (const auto *M = U.Files[File])
         if (auto I = M->find(uint32_t(Before)); I != M->end())
           Want = I->second;
-      int64_t Change = Want - After;
+      int64_t Change;
+      if (SubOverflow(Want, After, Change))
+        return fail("DWARF requested line delta overflow");
       if (Change) {
         const int64_t RowDelta =
             Op >= OpBase ? LineBase + int((Op - OpBase) % Range) : 0;
