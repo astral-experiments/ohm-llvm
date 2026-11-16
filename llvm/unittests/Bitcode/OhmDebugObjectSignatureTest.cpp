@@ -606,6 +606,34 @@ TEST_F(DebugObjectSignatureTest, ChecksRuntimeLocationAgainstOriginalObject) {
   EXPECT_EQ(relocatable(*B, decline, nullptr), 0);
 }
 
+TEST_F(DebugObjectSignatureTest, ForwardsTheOpaqueLocationThroughALocalCall) {
+  for (bool InspectMemory : {false, true}) {
+    SCOPED_TRACE(InspectMemory);
+    LLVMContext Before, After;
+    auto A = module(Before, OldSum, 3, "payload");
+    auto B = module(After, NewSum, 4, "payload");
+    ASSERT_TRUE(A && B);
+    location(*A, 3);
+    location(*B, 4);
+    for (auto *M : {A.get(), B.get()}) {
+      Function *Sink = M->getFunction("_Ropaque");
+      auto *Call = cast<CallInst>(*Sink->user_begin());
+      auto *Local = Function::Create(Sink->getFunctionType(),
+                                     GlobalValue::InternalLinkage,
+                                     "_Rlocal", M);
+      IRBuilder<> Builder(BasicBlock::Create(M->getContext(), "entry", Local));
+      if (InspectMemory)
+        Builder.CreateLoad(Builder.getInt8Ty(), Local->getArg(0), true);
+      Builder.CreateCall(Sink, {Local->getArg(0)});
+      Builder.CreateRetVoid();
+      Call->setCalledFunction(Local);
+    }
+    train(*A);
+    std::string Records;
+    EXPECT_EQ(relocatable(*B, accept, &Records), InspectMemory ? 0 : 2);
+  }
+}
+
 TEST_F(DebugObjectSignatureTest, PreservesAnUnchangedRuntimeWord) {
   LLVMContext C1, C2;
   auto A = module(C1, OldSum, 3, "payload");
