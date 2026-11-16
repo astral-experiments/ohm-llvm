@@ -1,6 +1,6 @@
 ; RUN: opt -disable-output -passes=o1-local-inliner -debug-pass-manager %s 2>&1 | FileCheck %s --check-prefix=ORDER --implicit-check-not="SROAPass on erased"
 ; RUN: opt -S -passes=o1-local-inliner %s | FileCheck %s --check-prefix=IR
-; RUN: opt -disable-output -passes='default<O1>' -print-pipeline-passes %s | FileCheck %s --check-prefix=PRINT
+; RUN: opt -disable-output -passes='default<O1>' -print-pipeline-passes %s | FileCheck %s --check-prefix=PRINT --implicit-check-not=o1-local-inliner
 ; RUN: opt -disable-output -passes='default<O1>' -passes-ep-scalar-optimizer-late='no-op-function' -print-pipeline-passes %s | FileCheck %s --check-prefix=EXT --implicit-check-not=o1-local-inliner
 ;
 ; The call-only definition that remains after inlining still gets the full
@@ -17,7 +17,7 @@
 ; IR: call {{.*}}i32 @retained(
 ; IR-NOT: call {{.*}} @erased(
 ; IR: ret i32
-; PRINT: o1-local-inliner
+; PRINT: cgscc
 ; EXT: no-op-function
 
 @address = global ptr @addressed

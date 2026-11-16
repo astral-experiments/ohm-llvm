@@ -1434,8 +1434,6 @@ PassBuilder::buildModuleSimplificationPipeline(OptimizationLevel Level,
 
   if (EnableModuleInliner)
     MPM.addPass(buildModuleInlinerPipeline(Level, Phase));
-  else if (deferLocalSimplification(Level, Phase))
-    MPM.addPass(buildO1LocalInlinerPipeline());
   else
     MPM.addPass(buildInlinerPipeline(Level, Phase));
 
