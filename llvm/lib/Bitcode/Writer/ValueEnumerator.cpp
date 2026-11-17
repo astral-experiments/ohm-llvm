@@ -529,7 +529,23 @@ void ValueEnumerator::setInstructionID(const Instruction *I) {
   InstructionMap[I] = InstructionCount++;
 }
 
+unsigned ValueEnumerator::getAggregateOperandID(const Constant *C,
+                                                    unsigned Operand) const {
+  const Value *V = C->getOperand(Operand);
+  if (SourceMap && Operand == 1 && SourceMap->CallerInitializers.contains(C))
+    return getRawValueID(V);
+  return getValueID(V);
+}
+
 unsigned ValueEnumerator::getValueID(const Value *V) const {
+  if (SourceMap && !SourceMap->CallerTails.empty())
+    if (auto *Data = dyn_cast<ConstantDataSequential>(V))
+      if (SourceMap->CallerTails.contains(Data))
+        SourceMap->Valid = false;
+  return getRawValueID(V);
+}
+
+unsigned ValueEnumerator::getRawValueID(const Value *V) const {
   if (auto *MD = dyn_cast<MetadataAsValue>(V))
     return getMetadataID(MD->getMetadata());
 

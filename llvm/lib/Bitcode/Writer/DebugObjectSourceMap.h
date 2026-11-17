@@ -5,8 +5,10 @@
 #ifndef LLVM_LIB_BITCODE_WRITER_DEBUGOBJECTSOURCEMAP_H
 #define LLVM_LIB_BITCODE_WRITER_DEBUGOBJECTSOURCEMAP_H
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/IR/Constants.h"
 #include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/IR/Metadata.h"
 #include <map>
@@ -24,6 +26,8 @@ struct DebugObjectSourceMap {
   std::map<std::pair<std::string, std::string>, DebugObjectFile> Files;
   llvm::DenseMap<const llvm::DIFile *, const DebugObjectFile *> Resolved;
   llvm::StringMap<std::string> Strings;
+  llvm::DenseMap<const llvm::ConstantDataSequential *, std::string> CallerTails;
+  llvm::SmallPtrSet<const llvm::Constant *, 32> CallerInitializers;
   bool Valid = true;
 
   void prepare();
