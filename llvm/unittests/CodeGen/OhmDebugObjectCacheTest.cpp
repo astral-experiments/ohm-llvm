@@ -8,6 +8,7 @@
 
 #include "../../lib/CodeGen/OhmDebugObjectCache.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/Bitcode/OhmDebugObjectSignature.h"
 #include "llvm/IR/IRBuilder.h"
 #include "gtest/gtest.h"
 #if defined(__linux__) && defined(__x86_64__)
@@ -98,4 +99,46 @@ TEST(OhmDebugObjectCache, AdmissionCountsManyShortBlocks) {
   EXPECT_TRUE(ohm::isLargeDebugObjectInput(M));
   B.CreateCall(Callee);
   EXPECT_FALSE(ohm::isLargeDebugObjectInput(M));
+}
+
+TEST(OhmDebugObjectCache, ExactObjectAdmissionHasLowerInstructionFloor) {
+  LLVMContext C;
+  Module M("small", C);
+  auto *Ty = FunctionType::get(Type::getVoidTy(C), false);
+  auto Callee = M.getOrInsertFunction("opaque", Ty);
+  auto *F = Function::Create(Ty, GlobalValue::ExternalLinkage, "f", M);
+  IRBuilder<> B(BasicBlock::Create(C, "entry", F));
+  for (unsigned I = 0; I < 2046; ++I)
+    B.CreateCall(Callee);
+  auto *Ret = B.CreateRetVoid();
+  EXPECT_FALSE(ohm::isLargeDebugObjectInput(M, true));
+  B.SetInsertPoint(Ret);
+  B.CreateCall(Callee);
+  EXPECT_TRUE(ohm::isLargeDebugObjectInput(M, true));
+  EXPECT_FALSE(ohm::isLargeDebugObjectInput(M));
+}
+
+TEST(OhmDebugObjectCache, ExactObjectInputKeepsUseListOrder) {
+  LLVMContext C;
+  Module M("order", C);
+  auto *Ty = FunctionType::get(Type::getVoidTy(C), false);
+  auto Callee = M.getOrInsertFunction("opaque", Ty);
+  auto *F = Function::Create(Ty, GlobalValue::ExternalLinkage, "f", M);
+  IRBuilder<> B(BasicBlock::Create(C, "entry", F));
+  B.CreateCall(Callee);
+  B.CreateCall(Callee);
+  B.CreateRetVoid();
+  auto Input = [&] {
+    char *Bytes = nullptr;
+    size_t Length = 0;
+    EXPECT_EQ(1, ohm_bc_save_v1(wrap(&M), &Bytes, &Length));
+    std::string S(Bytes, Length);
+    ohm_bc_free_v1(Bytes);
+    return S;
+  };
+  std::string Before = Input();
+  Callee.getCallee()->reverseUseList();
+  EXPECT_NE(Before, Input());
+  Callee.getCallee()->reverseUseList();
+  EXPECT_EQ(Before, Input());
 }
