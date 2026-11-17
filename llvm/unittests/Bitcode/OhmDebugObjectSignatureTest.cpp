@@ -21,22 +21,33 @@ class DebugObjectSignatureTest : public testing::Test {
 protected:
   const std::string OldSum = std::string(32, 'a');
   const std::string NewSum = std::string(32, 'b');
-  const std::string Mapping =
+  std::string Mapping =
       R"({"version":1,"files":[{"directory":"/src","filename":"f.c","lines":[[3,4]]}]})";
   std::string Proof;
   char *Origin = nullptr;
   size_t OriginSize = 0;
 
-  void SetUp() override {
+  void setProof(unsigned Version, unsigned OldLines, unsigned NewLines) {
     auto Digest = toHex(SHA256::hash(arrayRefFromStringRef(Mapping)), true);
     auto File =
         formatv(
-            R"("directory":"/src","filename":"f.c","ordered_byte_identical_old_lines":3,"new_lines":4,"old":{{"md5":"{0}","sha1":"{2}","sha256":"{3}"},"new":{{"md5":"{1}","sha1":"{2}","sha256":"{3}"})",
-            OldSum, NewSum, std::string(40, '1'), std::string(64, '2'))
+            R"("directory":"/src","filename":"f.c","{4}":{5},"new_lines":{6},"old":{{"md5":"{0}","sha1":"{2}","sha256":"{3}"},"new":{{"md5":"{1}","sha1":"{2}","sha256":"{3}"})",
+            OldSum, NewSum, std::string(40, '1'), std::string(64, '2'),
+            Version == 1 ? "ordered_byte_identical_old_lines" : "old_lines",
+            OldLines, NewLines)
             .str();
-    Proof = formatv(R"({{"version":1,"map_sha256":"{0}","files":[{{{1}}]})",
-                    Digest, File)
+    Proof = formatv(R"({{"version":{2},"map_sha256":"{0}","files":[{{{1}}]})",
+                    Digest, File, Version)
                 .str();
+  }
+
+  void SetUp() override { setProof(1, 3, 4); }
+
+  void partialMap(StringRef Lines, unsigned OldLines, unsigned NewLines) {
+    Mapping = formatv(
+        R"({{"version":1,"files":[{{"directory":"/src","filename":"f.c","lines":{0}}]})",
+        Lines).str();
+    setProof(2, OldLines, NewLines);
   }
 
   ~DebugObjectSignatureTest() override { ohm_bc_free_v1(Origin); }
@@ -128,6 +139,53 @@ TEST_F(DebugObjectSignatureTest, MatchesOnlyExistingSourceCoordinates) {
   EXPECT_FALSE(matches(*Insertion));
   Proof.clear();
   EXPECT_FALSE(matches(*Moved));
+}
+
+TEST_F(DebugObjectSignatureTest, IgnoresAnUnreferencedReplacement) {
+  LLVMContext Before, After;
+  auto Old = module(Before, OldSum, 3, "same");
+  auto New = module(After, NewSum, 3, "same");
+  ASSERT_TRUE(Old && New);
+  train(*Old);
+  partialMap("[[1,1],[3,3]]", 3, 3);
+  EXPECT_TRUE(matches(*New));
+}
+
+TEST_F(DebugObjectSignatureTest, RejectsSameOrdinalInReplacedSource) {
+  LLVMContext Before, After;
+  auto Old = module(Before, OldSum, 2, "same");
+  auto New = module(After, NewSum, 2, "same");
+  ASSERT_TRUE(Old && New);
+  train(*Old);
+  partialMap("[[1,1],[3,3]]", 3, 3);
+  EXPECT_FALSE(matches(*New));
+}
+
+TEST_F(DebugObjectSignatureTest, MovesLinesBackAfterADeletion) {
+  LLVMContext Before, After;
+  auto Old = module(Before, OldSum, 4, "same");
+  auto New = module(After, NewSum, 2, "same");
+  ASSERT_TRUE(Old && New);
+  train(*Old);
+  partialMap("[[1,1],[4,2]]", 4, 2);
+  EXPECT_TRUE(matches(*New));
+}
+
+TEST_F(DebugObjectSignatureTest, RejectsInvalidPartialMappings) {
+  LLVMContext Before, After;
+  auto Old = module(Before, OldSum, 3, "same");
+  auto New = module(After, NewSum, 4, "same");
+  ASSERT_TRUE(Old && New);
+  train(*Old);
+  for (StringRef Lines : {"[[1,1],[2,3],[3,4],[4,2]]",
+                          "[[1,1],[2,3],[3,4],[4,3]]",
+                          "[[1,1],[2,2],[2,3],[3,4]]",
+                          "[[1,1],[3,4],[5,5]]",
+                          "[[0,0],[1,1],[3,4]]"}) {
+    SCOPED_TRACE(Lines.str());
+    partialMap(Lines, 4, 4);
+    EXPECT_FALSE(matches(*New));
+  }
 }
 
 TEST_F(DebugObjectSignatureTest, RejectsChecksumAlsoUsedAsOrdinaryMetadata) {
