@@ -507,7 +507,7 @@ protected:
                    unsigned NumArgs);
   bool lowerCallTo(CallLoweringInfo &CLI);
 
-  bool lowerCall(const CallInst *I);
+  MachineInstr *lowerCall(const CallBase *CB);
   /// Select and emit code for a binary operator instruction, which has
   /// an opcode which directly corresponds to the given ISD opcode.
   bool selectBinaryOp(const User *I, unsigned ISDOpcode);
