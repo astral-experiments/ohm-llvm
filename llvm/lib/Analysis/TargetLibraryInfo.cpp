@@ -19,6 +19,8 @@
 #include "llvm/IR/SystemLibraries.h"
 #include "llvm/InitializePasses.h"
 #include "llvm/TargetParser/Triple.h"
+#include <tuple>
+
 using namespace llvm;
 
 #define GET_TARGET_LIBRARY_INFO_STRING_TABLE
@@ -1479,6 +1481,32 @@ AnalysisKey TargetLibraryAnalysis::Key;
 INITIALIZE_PASS(TargetLibraryInfoWrapperPass, "targetlibinfo",
                 "Target Library Information", false, true)
 char TargetLibraryInfoWrapperPass::ID = 0;
+
+bool TargetLibraryInfoWrapperPass::hasBaseline(
+    const TargetLibraryInfoImpl &Expected) const {
+  if (!TLA.BaselineInfoImpl)
+    return false;
+  const auto &Actual = *TLA.BaselineInfoImpl;
+  auto ABI = [](const TargetLibraryInfoImpl &M) {
+    return std::tie(M.ShouldExtI32Param, M.ShouldExtI32Return,
+                    M.ShouldSignExtI32Param, M.ShouldSignExtI32Return,
+                    M.SizeOfInt);
+  };
+  auto SameVector = [](const VecDesc &A, const VecDesc &B) {
+    return A.getScalarFnName() == B.getScalarFnName() &&
+           A.getVectorFnName() == B.getVectorFnName() &&
+           A.getVectorizationFactor() == B.getVectorizationFactor() &&
+           A.isMasked() == B.isMasked() &&
+           A.getVABIPrefix() == B.getVABIPrefix() &&
+           A.getCallingConv() == B.getCallingConv();
+  };
+  return memcmp(Actual.AvailableArray, Expected.AvailableArray,
+                sizeof(Actual.AvailableArray)) == 0 &&
+         Actual.CustomNames == Expected.CustomNames &&
+         ABI(Actual) == ABI(Expected) &&
+         llvm::equal(Actual.VectorDescs, Expected.VectorDescs, SameVector) &&
+         llvm::equal(Actual.ScalarDescs, Expected.ScalarDescs, SameVector);
+}
 
 void TargetLibraryInfoWrapperPass::anchor() {}
 
