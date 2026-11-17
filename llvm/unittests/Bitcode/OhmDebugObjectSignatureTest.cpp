@@ -9,6 +9,7 @@
 #include "llvm/Bitcode/BitcodeWriter.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/OhmOptimizerState.h"
 #include "llvm/Support/Endian.h"
 #include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/MemoryBufferRef.h"
@@ -145,9 +146,144 @@ static std::string machineKey(Module &M) {
 
 static bool canSaveMachineInput(Module &M) { return !machineKey(M).empty(); }
 
-static bool canSaveOptimizerInput(Module &M) {
+static std::string optimizerKey(Module &M) {
   SmallVector<char, 0> Bytes;
-  return writeClosedOptimizerInput(M, Bytes);
+  if (!writeClosedOptimizerInput(M, Bytes))
+    return {};
+  return std::string(Bytes.begin(), Bytes.end());
+}
+
+static bool canSaveOptimizerInput(Module &M) {
+  return !optimizerKey(M).empty();
+}
+
+TEST(DebugObjectUsesTest, OptimizerSliceLeafRecordsStorageAndUseOrder) {
+  LLVMContext C;
+  SMDiagnostic Error;
+  auto M = parseAssemblyString(R"(
+    target triple = "x86_64-unknown-linux-gnu"
+    @a = private constant i8 1
+    @b = private constant i8 2
+    @keep = constant ptr @a
+  )",
+                               Error, C);
+  ASSERT_TRUE(M);
+  auto *A = M->getNamedGlobal("a");
+  auto *B = M->getNamedGlobal("b");
+  auto *Length = PoisonValue::get(Type::getInt64Ty(C));
+  std::string Original = optimizerKey(*M);
+  ASSERT_FALSE(Original.empty());
+  auto *Slice = ConstantStruct::getAnon({A, Length});
+  std::string WithSlice = optimizerKey(*M);
+  ASSERT_FALSE(WithSlice.empty());
+  EXPECT_NE(Original, WithSlice);
+  A->reverseUseList();
+  std::string Reordered = optimizerKey(*M);
+  EXPECT_FALSE(Reordered.empty());
+  EXPECT_NE(WithSlice, Reordered);
+  A->reverseUseList();
+  EXPECT_EQ(WithSlice, optimizerKey(*M));
+  Slice->destroyConstant();
+  auto *Other = ConstantStruct::getAnon({B, Length});
+  std::string OtherKey = optimizerKey(*M);
+  EXPECT_FALSE(OtherKey.empty());
+  EXPECT_NE(WithSlice, OtherKey);
+  Other->destroyConstant();
+  EXPECT_EQ(Original, optimizerKey(*M));
+}
+
+TEST(DebugObjectUsesTest, OptimizerSliceLeafRecordsNumberedIntegerAddress) {
+  LLVMContext C;
+  SMDiagnostic Error;
+  auto M = parseAssemblyString(R"(
+    target triple = "x86_64-unknown-linux-gnu"
+    @one = constant ptr inttoptr (i64 1 to ptr)
+    @eight = constant ptr inttoptr (i64 8 to ptr)
+  )",
+                               Error, C);
+  ASSERT_TRUE(M);
+  auto *One = M->getNamedGlobal("one")->getInitializer();
+  auto *Eight = M->getNamedGlobal("eight")->getInitializer();
+  auto *Length = PoisonValue::get(Type::getInt64Ty(C));
+  const std::string Original = optimizerKey(*M);
+  ASSERT_FALSE(Original.empty());
+  auto *First = ConstantStruct::getAnon({One, Length});
+  const std::string OneKey = optimizerKey(*M);
+  ASSERT_FALSE(OneKey.empty());
+  EXPECT_NE(OneKey, Original);
+  First->destroyConstant();
+  auto *Second = ConstantStruct::getAnon({Eight, Length});
+  const std::string EightKey = optimizerKey(*M);
+  ASSERT_FALSE(EightKey.empty());
+  EXPECT_NE(EightKey, OneKey);
+  Eight->reverseUseList();
+  const std::string Reordered = optimizerKey(*M);
+  EXPECT_FALSE(Reordered.empty());
+  EXPECT_NE(Reordered, EightKey);
+  Second->destroyConstant();
+  EXPECT_EQ(Original, optimizerKey(*M));
+}
+
+TEST(DebugObjectUsesTest, OptimizerDeclinesDetachedIntegerAddressObserver) {
+  LLVMContext C;
+  Module M("context", C);
+  auto ContextIsAccountedFor = [&] {
+    SmallVector<char, 0> State;
+    return ohm::getOptimizerContextState(M, State);
+  };
+  auto *Ptr = PointerType::getUnqual(C);
+  auto *I64 = Type::getInt64Ty(C);
+  auto *Length = PoisonValue::get(I64);
+  auto *Null = ConstantPointerNull::get(Ptr);
+  auto *Inert = ConstantStruct::getAnon({Null, Length});
+  ASSERT_FALSE(Null->hasUseList());
+  ASSERT_FALSE(Length->hasUseList());
+  ASSERT_TRUE(ContextIsAccountedFor());
+  const std::string Original = optimizerKey(M);
+  ASSERT_FALSE(Original.empty());
+  auto Address = [&] {
+    return ConstantExpr::getIntToPtr(ConstantInt::get(I64, 8), Ptr);
+  };
+  auto *Detached = ConstantStruct::getAnon({Address(), Length});
+  EXPECT_EQ(Original, optimizerKey(M));
+  EXPECT_TRUE(Address()->hasOneUse());
+  EXPECT_FALSE(ContextIsAccountedFor());
+  Detached->destroyConstant();
+  EXPECT_TRUE(ContextIsAccountedFor());
+  Inert->destroyConstant();
+}
+
+TEST(DebugObjectUsesTest, OptimizerSliceLeafDeclinesOtherObserversAndForms) {
+  LLVMContext C;
+  SMDiagnostic Error;
+  auto M = parseAssemblyString(R"(
+    target triple = "x86_64-unknown-linux-gnu"
+    @data = private constant i8 0
+    @writable = private global i8 0
+    @ext = external constant i8
+  )",
+                               Error, C);
+  ASSERT_TRUE(M);
+  auto *Storage = M->getNamedGlobal("data");
+  auto *I64 = Type::getInt64Ty(C);
+  auto *Length = PoisonValue::get(I64);
+  auto Declined = [&](Constant *Leaf) {
+    EXPECT_FALSE(canSaveOptimizerInput(*M));
+    Leaf->destroyConstant();
+  };
+  Declined(ConstantStruct::getAnon({M->getNamedGlobal("writable"), Length}));
+  Declined(ConstantStruct::getAnon({M->getNamedGlobal("ext"), Length}));
+  Declined(ConstantStruct::getAnon({Storage, Length}, /*Packed=*/true));
+  Declined(ConstantStruct::getAnon({Storage, UndefValue::get(I64)}));
+  Declined(ConstantStruct::getAnon({Storage, ConstantInt::get(I64, 4)}));
+  auto *Slice = ConstantStruct::getAnon({Storage, Length});
+  ASSERT_TRUE(canSaveOptimizerInput(*M));
+  auto *Observer = ConstantStruct::getAnon({Slice});
+  EXPECT_FALSE(canSaveOptimizerInput(*M));
+  Observer->destroyConstant();
+  ASSERT_TRUE(canSaveOptimizerInput(*M));
+  (void)ConstantAsMetadata::get(Length);
+  EXPECT_FALSE(canSaveOptimizerInput(*M));
 }
 
 TEST(DebugObjectUsesTest, AuthenticatesAnUnreferencedInitializerUser) {

@@ -43,6 +43,7 @@ class ValueSymbolTable;
 
 struct MachineUseState {
   bool Complete = false;
+  bool OptimizerInput = false;
   SmallVector<uint64_t, 0> Leaves;
   SmallVector<SmallVector<uint64_t, 8>, 0> MetadataUses;
 };
