@@ -8200,7 +8200,7 @@ static SDValue ExtendSrcToDst(SDNode *N, SelectionDAG &DAG, unsigned ExtendOp) {
     return SDValue();
 
   MVT WidenEltVT = MVT::getIntegerVT(DstEltBits);
-  MVT WidenSrcVT = MVT::getVectorVT(WidenEltVT, DstElts);
+  EVT WidenSrcVT = EVT::getVectorVT(*DAG.getContext(), WidenEltVT, DstElts);
 
   SDValue Extend = DAG.getNode(ExtendOp, DL, WidenSrcVT, Src);
   return DAG.getNode(N->getOpcode(), DL, VT, Extend);
@@ -8286,6 +8286,10 @@ static SDValue performSINT_TO_FPCombine(SDNode *N, SelectionDAG &DAG,
       return SDValue();
 
     if (!SrcVT.isSimple() || !VT.isSimple())
+      return SDValue();
+
+    // [x]vffint.s.l needs LSX and at least one full 128-bit source register.
+    if (!Subtarget.hasExtLSX() || SrcVT.getSizeInBits() < 128)
       return SDValue();
 
     // Combine [x]vffint.s.l for vector si64 to float conversion.

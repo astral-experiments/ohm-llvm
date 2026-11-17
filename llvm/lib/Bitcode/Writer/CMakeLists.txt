@@ -2,6 +2,7 @@ add_llvm_component_library(LLVMBitWriter
   BitWriter.cpp
   BitcodeWriter.cpp
   BitcodeWriterPass.cpp
+  OhmDebugObjectSignature.cpp
   ValueEnumerator.cpp
 
   DEPENDS

@@ -27,6 +27,7 @@
 #include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/CodeGen/MachineModuleInfo.h"
 #include "llvm/CodeGen/MachineOperand.h"
+#include "llvm/CodeGen/OhmLineCertificate.h"
 #include "llvm/CodeGen/TargetInstrInfo.h"
 #include "llvm/CodeGen/TargetLowering.h"
 #include "llvm/CodeGen/TargetRegisterInfo.h"
@@ -1251,6 +1252,7 @@ sortGlobalExprs(SmallVectorImpl<DwarfCompileUnit::GlobalExpr> &GVEs) {
 // global DIEs and emit initial debug info sections. This is invoked by
 // the target AsmPrinter.
 void DwarfDebug::beginModule(Module *M) {
+  ohm_line_record_module_v1(M);
   DebugHandlerBase::beginModule(M);
 
   if (!Asm)
@@ -1483,6 +1485,9 @@ void DwarfDebug::finalizeModuleInfo() {
 
 // Emit all Dwarf sections that should come after the content.
 void DwarfDebug::endModule() {
+  struct FinishLineCertificate {
+    ~FinishLineCertificate() { ohm_line_record_end_module_v1(); }
+  } Finish;
   // Terminate the pending line table.
   if (PrevCU)
     terminateLineTable(PrevCU);
@@ -2294,6 +2299,14 @@ void DwarfDebug::beginInstruction(const MachineInstr *MI) {
     // If the line changed, we call that a new statement; unless we went to
     // line 0 and came back, in which case it is not a new statement.
     unsigned OldLine = PrevInstLoc ? PrevInstLoc.getLine() : LastAsmLine;
+    if (!ForceIsStmt && !(Flags & DWARF2_FLAG_IS_STMT))
+      ohm_line_record_pair_v1(DL->getFile(), DL.getLine(),
+                              PrevInstLoc ? PrevInstLoc->getFile() : nullptr,
+                              OldLine,
+                              PrevInstLoc ? 0
+                                          : Asm->OutStreamer->getContext()
+                                                .getCurrentDwarfLoc()
+                                                .getFileNum());
     if (DL.getLine() && (DL.getLine() != OldLine || ForceIsStmt))
       Flags |= DWARF2_FLAG_IS_STMT;
   }
@@ -2485,6 +2498,8 @@ static void recordSourceLine(AsmPrinter &Asm, unsigned Line, unsigned Col,
     FileNo = static_cast<DwarfCompileUnit &>(*DCUs[CUID])
                  .getOrCreateSourceID(Scope->getFile());
   }
+  if (auto *FileScope = dyn_cast_or_null<DIScope>(S))
+    ohm_line_record_file_v1(FileNo, FileScope->getFile());
   Asm.OutStreamer->emitDwarfLocDirective(FileNo, Line, Col, Flags, 0,
                                          Discriminator, Fn, Comment);
 }
@@ -2716,11 +2731,15 @@ void DwarfDebug::findForceIsStmtInstrs(const MachineFunction *MF) {
   // multiple branches that each have their own source location); otherwise we
   // just use the last line in the block.
   for (auto *MBB : PredMBBsToExamine) {
-    auto CheckMBBEdge = [&](MachineBasicBlock *Succ, unsigned OutgoingLine) {
+    auto CheckMBBEdge = [&](MachineBasicBlock *Succ, unsigned OutgoingLine,
+                            const DIFile *OutgoingFile) {
       auto MBBInstrIt = PotentialIsStmtMBBInstrs.find(Succ);
       if (MBBInstrIt == PotentialIsStmtMBBInstrs.end())
         return;
       MachineInstr *MI = MBBInstrIt->second;
+      ohm_line_record_pair_v1(MI->getDebugLoc()->getFile(),
+                              MI->getDebugLoc()->getLine(), OutgoingFile,
+                              OutgoingLine, 0);
       if (MI->getDebugLoc()->getLine() == OutgoingLine)
         return;
       PotentialIsStmtMBBInstrs.erase(MBBInstrIt);
@@ -2731,7 +2750,7 @@ void DwarfDebug::findForceIsStmtInstrs(const MachineFunction *MF) {
     // has a consistent entry line, but this seems unlikely to be worthwhile.
     if (MBB->empty()) {
       for (auto *Succ : MBB->successors())
-        CheckMBBEdge(Succ, 0);
+        CheckMBBEdge(Succ, 0, nullptr);
       continue;
     }
     // If MBB has no successors that are in the "potential" set, due to one or
@@ -2756,7 +2775,7 @@ void DwarfDebug::findForceIsStmtInstrs(const MachineFunction *MF) {
           MBB->back().getDebugLoc() && MBB->back().getDebugLoc()->getLine()) {
         unsigned FBBLine = MBB->back().getDebugLoc()->getLine();
         assert(MIIt->isBranch() && "Bad result from analyzeBranch?");
-        CheckMBBEdge(FBB, FBBLine);
+        CheckMBBEdge(FBB, FBBLine, MBB->back().getDebugLoc()->getFile());
         ++MIIt;
         SuccessorBBs.push_back(TBB);
       } else {
@@ -2781,15 +2800,17 @@ void DwarfDebug::findForceIsStmtInstrs(const MachineFunction *MF) {
     // analysis would be expensive, and these situations are probably not common
     // enough for this to be worthwhile.
     unsigned LastLine = 0;
+    const DIFile *LastFile = nullptr;
     while (MIIt != MBB->rend()) {
       if (auto DL = MIIt->getDebugLoc(); DL && DL->getLine()) {
         LastLine = DL->getLine();
+        LastFile = DL->getFile();
         break;
       }
       ++MIIt;
     }
     for (auto *Succ : SuccessorBBs)
-      CheckMBBEdge(Succ, LastLine);
+      CheckMBBEdge(Succ, LastLine, LastFile);
   }
 }
 
