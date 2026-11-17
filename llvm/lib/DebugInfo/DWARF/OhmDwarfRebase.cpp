@@ -809,6 +809,73 @@ class Rewriter {
     return true;
   }
 
+  // LLVM can place the symbol and relocation tables immediately after
+  // .debug_line. Their contents refer to section indices and section-relative
+  // offsets. Moving these tables changes only their offsets in the ELF header
+  // table. All allocated sections keep their original locations.
+  bool repackTrailingTables(const ELF64LE::Ehdr &Header,
+                            ArrayRef<ELF64LE::Shdr> Headers, StringRef New) {
+    const size_t Table = Header.e_shoff;
+    if (Table < Line->Offset + Line->Size ||
+        Raw.size() - Table != Headers.size() * sizeof(ELF64LE::Shdr) ||
+        Raw.size() > Out.Bytes.max_size() / 2)
+      return fail("resized lines require a final ELF section table");
+    SmallVector<unsigned> Tail;
+    for (auto [I, S] : llvm::enumerate(Headers)) {
+      if (S.sh_offset <= Line->Offset)
+        continue;
+      if (!S.sh_size || (S.sh_flags & ELF::SHF_ALLOC) ||
+          (S.sh_type != ELF::SHT_GROUP && S.sh_type != ELF::SHT_SYMTAB &&
+           S.sh_type != ELF::SHT_RELA && S.sh_type != ELF::SHT_STRTAB))
+        return fail("unsupported section following resized lines");
+      Tail.push_back(I);
+    }
+    llvm::sort(Tail, [&](unsigned A, unsigned B) {
+      return Headers[A].sh_offset < Headers[B].sh_offset;
+    });
+
+    // Check the old writer's padding before reproducing its layout. Bound
+    // padding growth even if the input asks for an unusually large alignment.
+    const size_t Limit = Raw.size() * 2;
+    if (New.size() > Limit - Line->Offset)
+      return fail("resized ELF object is too large");
+    std::vector<char> Packed(Out.Bytes.begin(),
+                             Out.Bytes.begin() + Line->Offset);
+    Packed.insert(Packed.end(), New.begin(), New.end());
+    size_t OldEnd = Line->Offset + Line->Size;
+    auto Copy = [&](size_t Offset, size_t Size, uint64_t Align,
+                    size_t &NewOffset) {
+      if (!isPowerOf2_64(Align) || Align > Raw.size() || Offset < OldEnd ||
+          Offset != alignTo(OldEnd, Align) ||
+          !llvm::all_of(Raw.slice(OldEnd, Offset), [](char C) { return !C; }))
+        return false;
+      NewOffset = alignTo(Packed.size(), Align);
+      if (NewOffset > Limit || Size > Limit - NewOffset)
+        return false;
+      Packed.resize(NewOffset);
+      Packed.insert(Packed.end(), Out.Bytes.begin() + Offset,
+                    Out.Bytes.begin() + Offset + Size);
+      OldEnd = Offset + Size;
+      return true;
+    };
+    for (unsigned I : Tail) {
+      const auto &S = Headers[I];
+      size_t Offset;
+      if (!Copy(S.sh_offset, S.sh_size, std::max<uint64_t>(1, S.sh_addralign),
+                Offset))
+        return fail("noncanonical ELF section layout after resized lines");
+      auto Field = reinterpret_cast<const char *>(&S.sh_offset) - Raw.data();
+      support::endian::write64le(Out.Bytes.data() + Field, Offset);
+    }
+    size_t NewTable;
+    if (!Copy(Table, Raw.size() - Table, 8, NewTable))
+      return fail("noncanonical final ELF section table");
+    support::endian::write64le(Packed.data() + offsetof(ELF64LE::Ehdr, e_shoff),
+                               NewTable);
+    Out.Bytes = std::move(Packed);
+    return true;
+  }
+
   bool finishResizedLines(const ELF64LEObjectFile &Obj) {
     if (Resized.empty())
       return true;
@@ -850,7 +917,6 @@ class Rewriter {
     if (New.size() > Raw.size() - Line->Offset || !isPowerOf2_64(Alignment) ||
         Next < Line->Offset + Line->Size ||
         alignTo(Line->Offset + Line->Size, Alignment) != Next ||
-        alignTo(Line->Offset + New.size(), Alignment) != Next ||
         !llvm::all_of(Raw.slice(Line->Offset + Line->Size, Next),
                       [](char V) { return V == 0; }))
       return fail("resized line table would move a following ELF section");
@@ -913,6 +979,8 @@ class Rewriter {
     }
     support::endian::write64le(OutputOffset(&(*All)[LineIndex].sh_size),
                                New.size());
+    if (alignTo(Line->Offset + New.size(), Alignment) != Next)
+      return repackTrailingTables(EF.getHeader(), *All, New);
     std::copy(New.begin(), New.end(), Out.Bytes.begin() + Line->Offset);
     std::fill(Out.Bytes.begin() + Line->Offset + New.size(),
               Out.Bytes.begin() + Next, 0);
