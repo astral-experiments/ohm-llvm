@@ -28,6 +28,7 @@ using Name = std::pair<std::string, std::string>;
 using Edge = std::array<uint32_t, 4>;
 struct Recorder {
   bool Valid = true, Began = false, Finished = false;
+  size_t Observers = 1;
   DenseMap<unsigned, const DIFile *> Numbers;
   DenseMap<const DIFile *, uint32_t> IDs;
   std::vector<Name> Names;
@@ -103,7 +104,10 @@ struct Transfer {
 } // namespace
 extern "C" void ohm_line_certificate_begin_v1() {
   if (Active) {
-    Active->Valid = false;
+    ++Active->Observers;
+    // A new observer must see the entire emission, including its file table.
+    if (Active->Began || !Active->Numbers.empty() || !Active->Names.empty())
+      Active->Valid = false;
     return;
   }
   Active = std::make_unique<Recorder>();
@@ -131,6 +135,10 @@ extern "C" void ohm_line_record_end_module_v1() {
 extern "C" void ohm_line_record_file_v1(unsigned Number, const void *Arg) {
   if (!Active || !Active->Valid || !Arg)
     return;
+  if (Active->Finished) {
+    Active->Valid = false;
+    return;
+  }
   const auto *F = static_cast<const DIFile *>(Arg);
   auto It = Active->Numbers.find(Number);
   if (It == Active->Numbers.end())
@@ -145,6 +153,10 @@ extern "C" void ohm_line_record_pair_v1(const void *ArgA, unsigned LA,
                                         unsigned DwarfB) {
   if (!Active || !Active->Valid || !LA || !LB)
     return;
+  if (Active->Finished) {
+    Active->Valid = false;
+    return;
+  }
   const auto *A = static_cast<const DIFile *>(ArgA);
   const auto *B = static_cast<const DIFile *>(ArgB);
   if (!B && DwarfB)
@@ -165,8 +177,11 @@ extern "C" void ohm_line_record_pair_v1(const void *ArgA, unsigned LA,
 extern "C" LLVMMemoryBufferRef ohm_line_certificate_end_v1() {
   if (!Active)
     return nullptr;
-  auto R = std::move(Active);
-  auto Out = encode(*R);
+  if (!Active->Finished)
+    Active->Valid = false;
+  auto Out = encode(*Active);
+  if (--Active->Observers == 0)
+    Active.reset();
   if (Out.empty())
     return nullptr;
   return reinterpret_cast<LLVMMemoryBufferRef>(

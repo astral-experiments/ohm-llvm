@@ -15,8 +15,8 @@
 extern "C" {
 #endif
 /* Begin and finish at the actual synchronous machine-emission boundary.
-   An origin and its object share one compiler thread. The returned buffer
-   belongs to the caller, which releases it via LLVMDisposeMemoryBuffer. */
+   Nested observers on the same thread may cover the same complete emission.
+   Each caller releases its own returned buffer via LLVMDisposeMemoryBuffer. */
 LLVM_C_ABI void ohm_line_certificate_begin_v1(void);
 LLVM_C_ABI LLVMMemoryBufferRef ohm_line_certificate_end_v1(void);
 LLVM_C_ABI int ohm_line_certificate_check_v1(const void *certificate,
