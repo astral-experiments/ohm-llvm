@@ -44,7 +44,9 @@ enum Case {
   InteriorRef,
   CrossFileMCForm,
   ConstToSpecial,
-  AdvanceToConst
+  AdvanceToConst,
+  NextRowZero,
+  NegativeSourceRow
 };
 std::unique_ptr<object::ObjectFile> fixture(SmallString<0> &Storage,
                                             unsigned Decl, unsigned Call,
@@ -117,6 +119,12 @@ std::unique_ptr<object::ObjectFile> fixture(SmallString<0> &Storage,
     AddressOffset = 4 + Line.size();
     Line.append(8, '\0');
     bytes(Line, {2, 1, 0, 1, 1});
+  } else if (Kind == NextRowZero || Kind == NegativeSourceRow) {
+    // The native encoder emits two one-byte SLEB128 advance_line operands.
+    // The second row is zero, or malformed when testing invalid old input.
+    bytes(Line, {3, static_cast<uint8_t>(Row - 1), 1, 3,
+                 static_cast<uint8_t>(128 - Row - (Kind == NegativeSourceRow)),
+                 1, 2, 1, 0, 1, 1});
   } else if (Kind == CrossFileMCForm) {
     // File 1, line 20, then file 2, line 50. The native second delta
     // changes from +30 to +5 after inserting 25 lines in file 1.
@@ -211,6 +219,23 @@ TEST(OhmDwarfRebase, TruncatedDIECannotRewriteFollowingUnitLength) {
   EXPECT_NE(toString(R.takeError()).find("compilation-unit boundary"),
             std::string::npos);
 }
+TEST(OhmDwarfRebase, MovesBackBeforeAnUnchangedZeroLine) {
+  SmallString<0> Old, Future;
+  ASSERT_TRUE(fixture(Old, 20, 20, 20, NextRowZero));
+  ASSERT_TRUE(fixture(Future, 16, 16, 16, NextRowZero));
+  ohm::SourceMap Map{{"/fixture/src/same.rs", {{20, 16}}}};
+  auto Rebased = ohm::rebaseDwarf4({Old, "original"}, Map);
+  ASSERT_TRUE(bool(Rebased)) << toString(Rebased.takeError());
+  EXPECT_EQ(Future.str(), StringRef(Rebased->Bytes.data(), Rebased->Bytes.size()));
+
+  Old.clear();
+  ASSERT_TRUE(fixture(Old, 20, 20, 20, NegativeSourceRow));
+  auto Invalid = ohm::rebaseDwarf4({Old, "malformed"}, Map);
+  ASSERT_FALSE(bool(Invalid));
+  EXPECT_NE(toString(Invalid.takeError()).find("invalid emitted source line"),
+            std::string::npos);
+}
+
 TEST(OhmDwarfRebase, ResizesAnExplicitLineOperandAndRelocatesAddresses) {
   SmallString<0> Old, Future;
   ASSERT_TRUE(fixture(Old, 20, 20, 60, ResizedLine));
