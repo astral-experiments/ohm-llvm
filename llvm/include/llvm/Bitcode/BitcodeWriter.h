@@ -38,6 +38,8 @@ class BitcodeWriter {
                        ModuleHash *, DebugObjectSourceMap *,
                        MachineUseState *Uses = nullptr);
 
+  friend bool writeClosedDwarfLineCertificateV1(const Module &, raw_ostream &);
+
   std::unique_ptr<BitstreamWriter> Stream;
 
   StringTableBuilder StrtabBuilder{StringTableBuilder::RAW};
