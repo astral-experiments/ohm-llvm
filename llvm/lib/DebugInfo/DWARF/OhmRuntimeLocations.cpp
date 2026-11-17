@@ -13,6 +13,7 @@
 #include "llvm/ADT/StringMap.h"
 #include "llvm/BinaryFormat/ELF.h"
 #include "llvm/Object/ELFObjectFile.h"
+#include "llvm/Support/Alignment.h"
 #include "llvm/Support/Endian.h"
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/MemoryBuffer.h"
@@ -408,6 +409,16 @@ extern "C" int ohm_debug_rebase_locations_v1(const void *M, size_t MS,
     return Miss(Map.takeError());
   MemoryBufferRef Old(StringRef(static_cast<const char *>(O), OS),
                       "cached runtime locations");
+  // A cached ELF can start at an odd offset in a packed record. The ELF
+  // reader requires two-byte alignment for its typed views.
+  std::unique_ptr<MemoryBuffer> Aligned;
+  if (!isAddrAligned(Align(2), O)) {
+    Aligned = MemoryBuffer::getMemBufferCopy(Old.getBuffer(),
+                                             Old.getBufferIdentifier());
+    if (!Aligned)
+      return Miss(reject("unable to copy the packed ELF object"));
+    Old = Aligned->getMemBufferRef();
+  }
   auto Result = ohm::rebaseDwarf4(Old, *Map);
   if (!Result)
     return Miss(Result.takeError());
