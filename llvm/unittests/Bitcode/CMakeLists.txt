@@ -8,6 +8,7 @@ set(LLVM_LINK_COMPONENTS
 
 add_llvm_unittest(BitcodeTests
   BitReaderTest.cpp
+  CallerLineCertificateTest.cpp
   DataLayoutUpgradeTest.cpp
   OhmDebugObjectSignatureTest.cpp
   DwarfLineCertificateTest.cpp
