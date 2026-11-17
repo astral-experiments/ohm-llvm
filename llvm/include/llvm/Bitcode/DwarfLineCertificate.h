@@ -27,6 +27,19 @@ class raw_ostream;
 /// Returns false without writing anything for unsupported debug information. The
 /// format is private to a single compiler version and its codegen configuration.
 LLVM_ABI bool writeClosedDwarfLineCertificateV1(const Module &M, raw_ostream &Out);
+
+#define LLVM_OHM_X86_REGISTER_COMMENT_CERTIFICATE_V1 1
+
+/// Recognize x86-64 assembly containing only an integer register inside a
+/// block comment. Callers must still reject every other assembly input and
+/// must only publish objects that produced no backend diagnostics.
+LLVM_ABI bool hasOnlyX86RegisterCommentAsmV1(const Module &M);
+
+/// Additionally normalize the private, nonzero source cookie for one such
+/// comment. The original instruction and the live diagnostic handler retain
+/// the actual cookie. A cookie used anywhere else in the module is rejected.
+LLVM_ABI bool writeX86RegisterCommentDwarfCertificateV1(const Module &M,
+                                                        raw_ostream &Out);
 } // namespace llvm
 
 #endif

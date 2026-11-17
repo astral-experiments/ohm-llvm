@@ -2979,7 +2979,9 @@ void ModuleBitcodeWriter::writeConstants(unsigned FirstVal, unsigned LastVal,
       Code = bitc::CST_CODE_UNDEF;
     } else if (const ConstantInt *IV = dyn_cast<ConstantInt>(C)) {
       if (IV->getBitWidth() <= 64) {
-        uint64_t V = IV->getSExtValue();
+        uint64_t V = LineCertificate && LineCertificate->masks(IV)
+                         ? 1
+                         : IV->getSExtValue();
         emitSignedInt64(Record, V);
         Code = bitc::CST_CODE_INTEGER;
         AbbrevToUse = CONSTANTS_INTEGER_ABBREV;
@@ -5809,11 +5811,25 @@ bool llvm::getClosedModuleHashV1(const Module &M,
 }
 
 bool llvm::writeClosedDwarfLineCertificateV1(const Module &M, raw_ostream &Out) {
+  return BitcodeWriter::writeDwarfCertificate(M, Out, false);
+}
+
+bool llvm::hasOnlyX86RegisterCommentAsmV1(const Module &M) {
+  return visitX86RegisterComments(M, [](const CallInst &) { return true; });
+}
+
+bool llvm::writeX86RegisterCommentDwarfCertificateV1(const Module &M,
+                                                     raw_ostream &Out) {
+  return BitcodeWriter::writeDwarfCertificate(M, Out, true);
+}
+
+bool BitcodeWriter::writeDwarfCertificate(const Module &M, raw_ostream &Out,
+                                          bool MaskRegisterComment) {
   if (!M.isMaterialized() || !M.getTargetTriple().isOSBinFormatELF() ||
       !preserveUseListOrder(true))
     return false;
   DwarfLineCertificate Certificate;
-  if (!Certificate.prepare(M))
+  if (!Certificate.prepare(M, MaskRegisterComment))
     return false;
   std::array<uint8_t, 32> Context;
   if (!getClosedOptimizerContextV1(M, Context))

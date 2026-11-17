@@ -13,6 +13,8 @@
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/IR/GlobalIFunc.h"
+#include "llvm/IR/InlineAsm.h"
+#include "llvm/IR/Instructions.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/OptBisect.h"
@@ -28,6 +30,37 @@ class DwarfLineCertificateTest : public testing::Test {
 protected:
   LLVMContext C;
   std::unique_ptr<Module> M;
+
+  CallInst *
+  addRegisterComment(uint64_t Cookie, StringRef Statement = "/* ${0:q} */",
+                     StringRef Constraints = "r,~{dirflag},~{fpsr},~{flags}",
+                     Module *Destination = nullptr) {
+    auto &Mod = Destination ? *Destination : *M;
+    auto &Ctx = Mod.getContext();
+    Type *I64 = Type::getInt64Ty(Ctx);
+    auto *Ty = FunctionType::get(Type::getVoidTy(Ctx), {I64}, false);
+    auto *Asm = InlineAsm::get(Ty, Statement, Constraints, true, false,
+                               InlineAsm::AD_Intel);
+    auto *Call = CallInst::Create(
+        Ty, Asm, {ConstantInt::get(I64, 37)}, "",
+        Mod.getFunction("run")->getEntryBlock().getTerminator()->getIterator());
+    Call->setMetadata("srcloc",
+                      MDNode::get(Ctx, ConstantAsMetadata::get(
+                                           ConstantInt::get(I64, Cookie))));
+    return Call;
+  }
+
+  std::optional<std::string>
+  registerCertificate(Module *Destination = nullptr) {
+    std::string Bytes;
+    raw_string_ostream OS(Bytes);
+    if (!writeX86RegisterCommentDwarfCertificateV1(
+            Destination ? *Destination : *M, OS)) {
+      EXPECT_TRUE(Bytes.empty());
+      return std::nullopt;
+    }
+    return Bytes;
+  }
 
   void SetUp() override {
     SMDiagnostic Error;
@@ -55,10 +88,10 @@ protected:
     ASSERT_TRUE(certificate());
   }
 
-  std::optional<std::string> certificate() {
+  std::optional<std::string> certificate(Module *Destination = nullptr) {
     std::string Bytes;
     raw_string_ostream Out(Bytes);
-    if (writeClosedDwarfLineCertificateV1(*M, Out))
+    if (writeClosedDwarfLineCertificateV1(Destination ? *Destination : *M, Out))
       return Bytes;
     EXPECT_TRUE(Bytes.empty());
     return std::nullopt;
@@ -216,6 +249,82 @@ TEST_F(DwarfLineCertificateTest, IncludesOnlyTheDisabledDefaultPassGate) {
   OptPassGate Other;
   C.setOptPassGate(Other);
   EXPECT_FALSE(certificate());
+}
+
+TEST_F(DwarfLineCertificateTest,
+       NormalizesOnlyTheRegisterCommentsPrivateCookie) {
+  uint64_t A = UINT64_C(51) << 32 | 49;
+  uint64_t B = UINT64_C(73) << 32 | 71;
+  std::string IR;
+  raw_string_ostream OS(IR);
+  M->print(OS, nullptr);
+  SMDiagnostic Error;
+  LLVMContext OtherContext;
+  auto OtherModule = parseAssemblyString(IR, Error, OtherContext);
+  ASSERT_TRUE(OtherModule);
+  auto *Call = addRegisterComment(A);
+  auto *OtherCall = addRegisterComment(
+      B, "/* ${0:q} */", "r,~{dirflag},~{fpsr},~{flags}", OtherModule.get());
+  ASSERT_TRUE(hasOnlyX86RegisterCommentAsmV1(*M));
+  auto Stock = certificate();
+  auto Before = registerCertificate();
+  ASSERT_TRUE(Stock && Before);
+  EXPECT_NE(Stock, Before);
+  EXPECT_EQ(
+      mdconst::extract<ConstantInt>(Call->getMetadata("srcloc")->getOperand(0))
+          ->getZExtValue(),
+      A);
+
+  EXPECT_NE(certificate(OtherModule.get()), Stock);
+  EXPECT_EQ(registerCertificate(OtherModule.get()), Before);
+  EXPECT_EQ(mdconst::extract<ConstantInt>(
+                OtherCall->getMetadata("srcloc")->getOperand(0))
+                ->getZExtValue(),
+            B);
+
+  auto *Other = ConstantInt::get(Type::getInt64Ty(OtherContext), B);
+  auto *Tag = OtherModule->getOrInsertNamedMetadata("also.reads.cookie");
+  Tag->addOperand(
+      MDNode::get(OtherContext, {ConstantAsMetadata::get(Other),
+                                 MDString::get(OtherContext, "another use")}));
+  EXPECT_TRUE(certificate(OtherModule.get()));
+  EXPECT_FALSE(registerCertificate(OtherModule.get()));
+  auto *Local = ConstantInt::get(Type::getInt64Ty(C), A);
+  new GlobalVariable(*M, Local->getType(), true, GlobalValue::InternalLinkage,
+                     Local, "number");
+  EXPECT_TRUE(certificate());
+  EXPECT_FALSE(registerCertificate());
+}
+
+TEST_F(DwarfLineCertificateTest,
+       RejectsAssemblerInputsAndNonRegisterSubstitutions) {
+  uint64_t Cookie = UINT64_C(51) << 32 | 49;
+  EXPECT_FALSE(hasOnlyX86RegisterCommentAsmV1(*M));
+  EXPECT_FALSE(registerCertificate());
+  for (StringRef Body :
+       {"/* ${0:c} */", ".incbin \"payload\"", ".warning \"example\"",
+        "/* ${0:q} */\n.include \"payload\""}) {
+    auto *Call = addRegisterComment(Cookie, Body);
+    EXPECT_FALSE(hasOnlyX86RegisterCommentAsmV1(*M));
+    EXPECT_FALSE(registerCertificate());
+    Call->eraseFromParent();
+  }
+  auto *Immediate = addRegisterComment(Cookie, "/* ${0:q} */", "i");
+  EXPECT_FALSE(hasOnlyX86RegisterCommentAsmV1(*M));
+  Immediate->eraseFromParent();
+  auto *Call = addRegisterComment(Cookie);
+  M->setModuleInlineAsm(
+      Module::GlobalAsmFragment(StringRef(".include \"payload\"")));
+  EXPECT_FALSE(hasOnlyX86RegisterCommentAsmV1(*M));
+  M->removeModuleInlineAsm();
+  M->setTargetTriple(Triple("aarch64-unknown-linux-gnu"));
+  EXPECT_FALSE(hasOnlyX86RegisterCommentAsmV1(*M));
+  M->setTargetTriple(Triple("x86_64-unknown-linux-gnu"));
+  Call->setMetadata("srcloc", MDNode::get(C, MDString::get(C, "no cookie")));
+  EXPECT_FALSE(registerCertificate());
+  addRegisterComment(Cookie);
+  EXPECT_TRUE(hasOnlyX86RegisterCommentAsmV1(*M));
+  EXPECT_FALSE(registerCertificate());
 }
 
 TEST_F(DwarfLineCertificateTest, RejectsSecondModuleInSameContext) {
