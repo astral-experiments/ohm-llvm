@@ -80,4 +80,72 @@ TEST_F(OhmLineCertificateTest, RejectsAnAmbiguousDwarfFileNumber) {
 TEST_F(OhmLineCertificateTest, RequiresACompletedNativeEmission) {
   EXPECT_EQ(ohm_line_certificate_end_v1(), nullptr);
 }
+
+TEST_F(OhmLineCertificateTest, NestedObserversOwnTheSameCompleteEmission) {
+  ASSERT_EQ(ohm_line_certificate_end_v1(), nullptr);
+  ohm_line_certificate_begin_v1();
+  ohm_line_certificate_begin_v1();
+  ohm_line_record_module_v1(&M);
+  ohm_line_record_pair_v1(Moved, 20, Other, 21, 0);
+  ohm_line_record_end_module_v1();
+
+  auto Inner = ohm_line_certificate_end_v1();
+  auto Outer = ohm_line_certificate_end_v1();
+  ASSERT_NE(Inner, nullptr);
+  ASSERT_NE(Outer, nullptr);
+  EXPECT_NE(Inner, Outer);
+  EXPECT_EQ(StringRef(LLVMGetBufferStart(Inner), LLVMGetBufferSize(Inner)),
+            StringRef(LLVMGetBufferStart(Outer), LLVMGetBufferSize(Outer)));
+  LLVMDisposeMemoryBuffer(Inner);
+  EXPECT_EQ(ohm_line_certificate_check_v1(LLVMGetBufferStart(Outer),
+                                          LLVMGetBufferSize(Outer), Map.data(),
+                                          Map.size()),
+            0);
+  LLVMDisposeMemoryBuffer(Outer);
+  EXPECT_EQ(ohm_line_certificate_end_v1(), nullptr);
+}
+
+TEST_F(OhmLineCertificateTest, RefusesAnObserverStartingWithinAModule) {
+  ohm_line_certificate_begin_v1();
+  ohm_line_record_end_module_v1();
+  EXPECT_EQ(ohm_line_certificate_end_v1(), nullptr);
+  EXPECT_EQ(ohm_line_certificate_end_v1(), nullptr);
+}
+
+TEST_F(OhmLineCertificateTest, RefusesAnObserverEndingWithinAModule) {
+  ASSERT_EQ(ohm_line_certificate_end_v1(), nullptr);
+  ohm_line_certificate_begin_v1();
+  ohm_line_certificate_begin_v1();
+  ohm_line_record_module_v1(&M);
+  EXPECT_EQ(ohm_line_certificate_end_v1(), nullptr);
+  ohm_line_record_end_module_v1();
+  EXPECT_EQ(ohm_line_certificate_end_v1(), nullptr);
+}
+
+TEST_F(OhmLineCertificateTest, OuterObserverMustCoverOnlyOneModule) {
+  ASSERT_EQ(ohm_line_certificate_end_v1(), nullptr);
+  ohm_line_certificate_begin_v1();
+  ohm_line_certificate_begin_v1();
+  ohm_line_record_module_v1(&M);
+  ohm_line_record_end_module_v1();
+  auto Inner = ohm_line_certificate_end_v1();
+  ASSERT_NE(Inner, nullptr);
+  LLVMDisposeMemoryBuffer(Inner);
+  ohm_line_record_module_v1(&M);
+  ohm_line_record_end_module_v1();
+  EXPECT_EQ(ohm_line_certificate_end_v1(), nullptr);
+}
+
+TEST_F(OhmLineCertificateTest, BothObserversRejectAmbiguousFiles) {
+  ASSERT_EQ(ohm_line_certificate_end_v1(), nullptr);
+  ohm_line_certificate_begin_v1();
+  ohm_line_certificate_begin_v1();
+  ohm_line_record_module_v1(&M);
+  ohm_line_record_file_v1(4, Moved);
+  ohm_line_record_file_v1(4, Other);
+  ohm_line_record_pair_v1(Moved, 20, nullptr, 21, 4);
+  ohm_line_record_end_module_v1();
+  EXPECT_EQ(ohm_line_certificate_end_v1(), nullptr);
+  EXPECT_EQ(ohm_line_certificate_end_v1(), nullptr);
+}
 } // namespace
