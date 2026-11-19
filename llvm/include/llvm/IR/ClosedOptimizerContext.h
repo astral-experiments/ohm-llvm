@@ -16,12 +16,20 @@
 
 namespace llvm {
 class Module;
+class Metadata;
+template <class T> class SmallPtrSetImpl;
 
 /// Fingerprint live use and context state omitted from ordered bitcode. Return
 /// false if optimization can observe a constant graph or tracking owner which
 /// cannot be described by the module. Call before constructing LLVM analyses.
 LLVM_ABI bool getClosedOptimizerContextV1(const Module &M,
                                           std::array<uint8_t, 32> &Digest);
+
+/// Also identify metadata nodes reachable only through instruction range
+/// attachments. Clear Ranges on entry and use its contents only on success.
+LLVM_ABI bool getClosedOptimizerContextV1(const Module &M,
+                                          std::array<uint8_t, 32> &Digest,
+                                          SmallPtrSetImpl<Metadata *> &Ranges);
 } // namespace llvm
 
 #endif

@@ -17,7 +17,9 @@
 //===----------------------------------------------------------------------===//
 
 #include "OhmLeafObject.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/ScopeExit.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/Bitcode/BitcodeWriter.h"
 #include "llvm/IR/ClosedOptimizerContext.h"
@@ -97,8 +99,30 @@ template <typename T> void widenAttributes(T &V) {
     V.setAttributes(Attrs);
 }
 
-void widenRanges(Module &M) {
-  auto &C = M.getContext();
+// Widen only metadata exclusively used on range attachments, and only
+// when the upper-bound wrapper belongs to this tuple alone. Retarget it
+// in place so subsequent DWARF cache checks see a closed context. Creating
+// a new tuple would strand the old upper bound and its tracking references.
+void widenRange(LLVMContext &C, MDNode *R) {
+  if (!isa<MDTuple>(R) || R->isDistinct() || R->getNumOperands() != 2)
+    return;
+  auto *Low = mdconst::dyn_extract<ConstantInt>(R->getOperand(0));
+  auto *High = mdconst::dyn_extract<ConstantInt>(R->getOperand(1));
+  if (!Low || !High || Low->getType() != High->getType())
+    return;
+  auto Bound = widerBound(Low->getValue(), High->getValue());
+  if (!Bound)
+    return;
+  auto *New = ConstantInt::get(C, *Bound);
+  if (ValueAsMetadata::getIfExists(New) ||
+      MetadataAsValue::getIfExists(C, R->getOperand(1)) ||
+      !ReplaceableMetadataImpl::hasOnlyRepresentedUsers(
+          *R->getOperand(1), DenseSet<Value *>(), {R}))
+    return;
+  ValueAsMetadata::handleRAUW(High, New);
+}
+
+void widenRanges(Module &M, SmallPtrSetImpl<Metadata *> &Ranges) {
   for (Function &F : M) {
     widenAttributes(F);
     for (BasicBlock &BB : F)
@@ -108,18 +132,8 @@ void widenRanges(Module &M) {
         if (!I.hasMetadataOtherThanDebugLoc())
           continue;
         auto *R = I.getMetadata(LLVMContext::MD_range);
-        if (!R || !isa<MDTuple>(R) || R->isDistinct() ||
-            R->getNumOperands() != 2)
-          continue;
-        const auto *Low = mdconst::dyn_extract<ConstantInt>(R->getOperand(0));
-        const auto *High = mdconst::dyn_extract<ConstantInt>(R->getOperand(1));
-        if (Low && High && Low->getType() == High->getType()) {
-          if (auto Bound = widerBound(Low->getValue(), High->getValue())) {
-            auto *New = ConstantAsMetadata::get(ConstantInt::get(C, *Bound));
-            I.setMetadata(LLVMContext::MD_range,
-                          MDTuple::get(C, {R->getOperand(0).get(), New}));
-          }
-        }
+        if (R && Ranges.erase(R))
+          widenRange(M.getContext(), R);
       }
   }
 }
@@ -365,12 +379,12 @@ std::string ohm_leaf::prepare(Module &M, StringRef Configuration) {
       L.Ret->setOperand(0, L.Value);
   });
 
-  // Check the context before replacing range metadata, while the original
-  // nodes and their metadata tracking owners are still live.
+  // Account for the original metadata owners before retargeting any bound.
   Digest Context;
-  if (!getClosedOptimizerContextV1(M, Context))
+  SmallPtrSet<Metadata *, 8> Ranges;
+  if (!getClosedOptimizerContextV1(M, Context, Ranges))
     return {};
-  widenRanges(M);
+  widenRanges(M, Ranges);
   SmallVector<char, 0> IR;
   raw_svector_ostream OS(IR);
   WriteBitcodeToFile(M, OS, /*ShouldPreserveUseListOrder=*/true);

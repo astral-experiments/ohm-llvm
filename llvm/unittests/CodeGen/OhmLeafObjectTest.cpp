@@ -7,6 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "../../lib/CodeGen/OhmLeafObject.h"
+#include "llvm/IR/ClosedOptimizerContext.h"
 #include "llvm/IR/ConstantRange.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/LegacyPassManager.h"
@@ -64,6 +65,50 @@ TEST(OhmLeafInput, RoundsRangesOnTheActualDonorAndRestoresTheLiteral) {
   EXPECT_EQ(Attr.getValueAsConstantRange().getUpper(), APInt(16, 976));
   auto *Ret = cast<ReturnInst>(&F->getEntryBlock().front());
   EXPECT_EQ(cast<ConstantInt>(Ret->getReturnValue())->getZExtValue(), 501u);
+}
+
+// Rust computes its DWARF certificate after preparing an early object.
+// Updating a !range attachment must keep the tracking owners represented.
+TEST(OhmLeafInput, WideningRetainsAClosedContextAndUnrelatedMetadata) {
+  enum Sharing { OnlyRanges, NestedTuple, SharedBound, TargetExists };
+  for (auto Mode : {OnlyRanges, NestedTuple, SharedBound, TargetExists}) {
+    LLVMContext C;
+    auto M = rules(C, 501);
+    IRBuilder<> B(C);
+    auto *Fn = Function::Create(
+        FunctionType::get(B.getInt16Ty(), {B.getPtrTy()}, false),
+        GlobalValue::ExternalLinkage, "reader", *M);
+    B.SetInsertPoint(BasicBlock::Create(C, "entry", Fn));
+    auto Val = [&](unsigned N) {
+      return ConstantAsMetadata::get(B.getInt16(N));
+    };
+    auto *Tuple = MDTuple::get(C, {Val(0), Val(974)});
+    auto Load = [&] {
+      auto *Inst = B.CreateLoad(B.getInt16Ty(), Fn->getArg(0));
+      Inst->setMetadata(LLVMContext::MD_range, Tuple);
+      return Inst;
+    };
+    auto *First = Load();
+    auto *Second = Load();
+    B.CreateRet(B.CreateAdd(First, Second));
+    if (Mode != OnlyRanges) {
+      Metadata *Other = Tuple;
+      if (Mode != NestedTuple)
+        Other = Val(Mode == TargetExists ? 976 : 974);
+      M->getOrInsertNamedMetadata("other")->addOperand(
+          MDTuple::get(C, {Other}));
+    }
+
+    ASSERT_FALSE(ohm_leaf::prepare(*M, "session").empty());
+    std::array<uint8_t, 32> Digest;
+    ASSERT_TRUE(getClosedOptimizerContextV1(*M, Digest));
+    for (auto *I : {First, Second}) {
+      auto *R = I->getMetadata(LLVMContext::MD_range);
+      ASSERT_TRUE(R);
+      auto *High = mdconst::extract<ConstantInt>(R->getOperand(1));
+      EXPECT_EQ(High->getZExtValue(), Mode == OnlyRanges ? 976u : 974u);
+    }
+  }
 }
 
 TEST(OhmLeafInput, RefusesAnUnclosedContextBeforeWidening) {
