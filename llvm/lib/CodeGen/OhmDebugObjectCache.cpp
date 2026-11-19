@@ -7,6 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "OhmDebugObjectCache.h"
+#include "OhmLeafObject.h"
 #include "llvm-c/Core.h"
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/SmallVector.h"
@@ -241,7 +242,7 @@ struct Invocation {
   bool imagesUnchanged() const {
     return Generation && Generation == ohm::getDebugObjectImageGeneration();
   }
-  Invocation() {
+  explicit Invocation(bool Leaf = false) {
     if (std::getenv("OHM_DISABLE_DEBUG_OBJECT_CACHE"))
       return;
     auto Cmd = MemoryBuffer::getFileAsStream("/proc/self/cmdline");
@@ -258,6 +259,10 @@ struct Invocation {
     bool Strip = false;
     for (size_t I = 1; I < Args.size(); ++I) {
       StringRef A = Args[I], Key, V;
+      // Cargo requests this frontend lint when compiling workspace crates.
+      // The whole command line still contributes to the object namespace.
+      if (Leaf && A == "--force-warn=unused_crate_dependencies")
+        continue;
       if (A.starts_with("--")) {
         std::tie(Key, V) = A.split('=');
         if (!contains({"--crate-name", "--crate-type", "--edition", "--emit",
@@ -407,7 +412,11 @@ struct Invocation {
     Root = std::move(Base);
   }
 };
-Invocation &invocation() {
+Invocation &invocation(bool Leaf = false) {
+  if (Leaf) {
+    static Invocation ForLeaf(/*Leaf=*/true);
+    return ForLeaf;
+  }
   static Invocation I;
   return I;
 }
@@ -597,15 +606,80 @@ std::string machineTarget(const Module &M, const TargetMachine &TM) {
          std::to_string(unsigned(TM.getCodeModel())) + "|" +
          M.getDataLayoutStr();
 }
+struct LeafOrigin {
+  const TargetMachine *Target;
+  std::string Proof;
+  std::string Object;
+};
 struct EarlyOrigin {
   Module *Input;
   std::string Key;
   std::string MachineKey;
   DiagnosticObservation Diagnostics;
+  std::optional<LeafOrigin> Leaf;
   EarlyOrigin(Module &M, std::string K)
       : Input(&M), Key(std::move(K)), Diagnostics(M.getContext()) {}
 };
 thread_local std::weak_ptr<EarlyOrigin> PendingEarly;
+
+// Try an entry for this codegen unit. The engine checks the exact sealed
+// object and the live input before adjusting any instruction operands.
+std::string loadLeafObject(StringRef Path, StringRef Proof) {
+  auto Buffer = readPrivate(Path, MaxOrigin);
+  if (!Buffer)
+    return {};
+  StringRef Record = Buffer->getBuffer();
+  if (!Record.consume_front("OHMLEAF1") || Record.size() < 8)
+    return {};
+  uint64_t N = support::endian::read64le(Record.data());
+  Record = Record.drop_front(8);
+  if (!N || N >= Record.size())
+    return {};
+  return ohm_leaf::tryReuse(Proof, Record.take_front(N), Record.drop_front(N));
+}
+
+bool tryLeafObject(Module &M, TargetMachine &TM, const Invocation &I,
+                   StringRef Output, void **Ticket) {
+  BLAKE3 H;
+  frame(H, "ohm-leaf-object-v1");
+  frame(H, I.Namespace);
+  frame(H, machineTarget(M, TM));
+  frame(H, M.getModuleIdentifier());
+  auto Key = toHex(H.final(), true);
+  auto Proof = ohm_leaf::prepare(M, Key);
+  if (Proof.empty())
+    return false;
+  auto Path = joinPath(I.Entries, "llvmcache-" + Key);
+  auto Object = loadLeafObject(Path, Proof);
+  if (!Object.empty() && I.imagesUnchanged() &&
+      writeAtomic(Output, {Object}, 0666)) {
+    event(M.getModuleIdentifier(), "leaf-hit");
+    return true;
+  }
+
+  // prepare() has rounded selected range attributes in the live module.
+  // Enroll only the bytes from its own optimizer and machine pipeline.
+  auto Origin = std::make_shared<EarlyOrigin>(M, std::move(Key));
+  Origin->Leaf = LeafOrigin{&TM, std::move(Proof), {}};
+  PendingEarly = Origin;
+  *Ticket = new std::shared_ptr<EarlyOrigin>(std::move(Origin));
+  return false;
+}
+
+void storeLeafObject(StringRef Path, const EarlyOrigin &Entry) {
+  const auto &L = *Entry.Leaf;
+  if (L.Object.empty())
+    return;
+  auto Witness = ohm_leaf::enroll(L.Proof, L.Object);
+  if (Witness.empty() || Witness.size() + L.Object.size() + 16 > MaxOrigin)
+    return;
+  char Size[8];
+  support::endian::write64le(Size, Witness.size());
+  if (writeAtomic(Path, {"OHMLEAF1", StringRef(Size, sizeof(Size)), Witness,
+                         L.Object}))
+    event(Entry.Input->getModuleIdentifier(), "leaf-committed");
+}
+
 void observedMachineObject(Module &M, StringRef Key) {
   if (auto Origin = PendingEarly.lock(); Origin && Origin->Input == &M)
     Origin->MachineKey = Key.str();
@@ -688,6 +762,14 @@ bool llvm::ohm::runDebugObjectCache(Module &M, CodeGenTargetMachineImpl &TM,
                                     raw_svector_ostream &Out,
                                     function_ref<bool()> Emit) {
 #if defined(__linux__) && defined(__x86_64__)
+  if (auto Origin = PendingEarly.lock(); Origin && Origin->Leaf &&
+      Origin->Input == &M && Origin->Leaf->Target == &TM &&
+      Out.str().empty()) {
+    bool Changed = Emit();
+    if (Out.str().size() < MaxOrigin)
+      Origin->Leaf->Object = Out.str().str();
+    return Changed;
+  }
   // This precedes all cache filesystem activity, including toolchain identity
   // reads and the creation of source or object directories.
   if (!Out.str().empty() ||
@@ -787,18 +869,24 @@ extern "C" int ohm_early_object_begin_v1(LLVMModuleRef Ref,
   auto &M = *unwrap(Ref);
   if (!Output || !Length ||
       !sys::path::is_absolute(StringRef(Output, Length)) ||
-      std::getenv("OHM_DISABLE_EARLY_OBJECT_CACHE") ||
-      !ohm::isLargeDebugObjectInput(M, true))
+      std::getenv("OHM_DISABLE_EARLY_OBJECT_CACHE"))
     return 0;
-  const auto &I = invocation();
-  if (I.Root.empty() || !I.WithoutDebug || !I.imagesUnchanged() ||
-      !ordinaryModule(M, true))
+  bool WithoutDebug = !M.getNamedMetadata("llvm.dbg.cu");
+  if (WithoutDebug ? !ohm::isLargeDebugObjectInput(M, true)
+                   : !ohm_leaf::candidate(M))
+    return 0;
+  const auto &I = invocation(/*Leaf=*/!WithoutDebug);
+  if (I.Root.empty() || I.WithoutDebug != WithoutDebug || !I.imagesUnchanged() ||
+      !ordinaryModule(M, I.WithoutDebug))
     return 0;
   auto &C = M.getContext();
   auto *Handler = C.getDiagHandlerPtr();
   if (!Handler || Handler->HasErrors || Handler->isAnyRemarkEnabled() ||
       C.getMainRemarkStreamer() || C.getLLVMRemarkStreamer())
     return 0;
+  if (!WithoutDebug)
+    return tryLeafObject(M, *reinterpret_cast<TargetMachine *>(TM), I,
+                         StringRef(Output, Length), Ticket);
   SmallVector<char, 128> State;
   if (!ohm::getOptimizerContextState(M, State)) {
     event(M.getModuleIdentifier(), "early-bypass", "unrepresented context");
@@ -848,9 +936,12 @@ extern "C" void ohm_early_object_end_v1(void *Ticket, int Completed) {
   if (!Holder || !Completed)
     return;
   const auto &Entry = **Holder;
-  const auto &I = invocation();
-  if (Entry.MachineKey.empty() || Entry.Diagnostics.hasDiagnostics() ||
-      !I.imagesUnchanged())
+  const auto &I = invocation(Entry.Leaf.has_value());
+  if (Entry.Diagnostics.hasDiagnostics() || !I.imagesUnchanged())
+    return;
+  if (Entry.Leaf)
+    return storeLeafObject(joinPath(I.Entries, "llvmcache-" + Entry.Key), Entry);
+  if (Entry.MachineKey.empty())
     return;
   auto Sum = earlyIndexChecksum(Entry.Key, Entry.MachineKey);
   if (writeAtomic(joinPath(I.Entries, "llvmcache-" + Entry.Key),
