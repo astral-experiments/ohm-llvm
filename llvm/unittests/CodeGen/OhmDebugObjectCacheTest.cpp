@@ -273,6 +273,50 @@ TEST(OhmLocalTraitComparisons, RespectsExistingSymbol) {
   }
 }
 
+TEST(OhmLocalTraitComparisons, KeepsMethodReferencedByAssemblerName) {
+  // With function sections, a reference to a section symbol can name the
+  // method even when the IR has no explicit section assignment.
+  for (const auto &Name :
+       {(Twine("\1") + Prior).str(), (Twine(".text.") + Prior).str(),
+        (Twine("\1.text.") + Stable).str()}) {
+    LLVMContext C;
+    auto M = createComparisons(C, {{Prior, 19}});
+    auto *Method = M->getFunction(Prior);
+    auto *Ty = Method->getFunctionType();
+    auto ByAsmName = M->getOrInsertFunction(Name, Ty);
+    auto *Caller =
+        Function::Create(Ty, GlobalValue::ExternalLinkage, "call", *M);
+    IRBuilder<> B(BasicBlock::Create(C, "entry", Caller));
+    B.CreateRet(
+        B.CreateCall(ByAsmName, {Caller->getArg(0), Caller->getArg(1)}));
+
+    ohm::prepareLocalTraitComparisons(*M);
+
+    EXPECT_EQ(Method, M->getFunction(Prior));
+    EXPECT_FALSE(M->getNamedValue(Stable));
+  }
+}
+
+TEST(OhmLocalTraitComparisons, AvoidsSectionAndComdatNames) {
+  for (StringRef Name : {Prior, Stable}) {
+    for (bool UseComdat : {false, true}) {
+      LLVMContext C;
+      auto M = createComparisons(C, {{Prior, 19}});
+      auto *G = M->getOrInsertGlobal("data", Type::getInt8Ty(C));
+      G->setInitializer(ConstantInt::get(Type::getInt8Ty(C), 7));
+      if (UseComdat)
+        G->setComdat(M->getOrInsertComdat(Name));
+      else
+        G->setSection(Name);
+
+      ohm::prepareLocalTraitComparisons(*M);
+
+      EXPECT_TRUE(M->getFunction(Prior));
+      EXPECT_FALSE(M->getNamedValue(Stable));
+    }
+  }
+}
+
 TEST(OhmLocalTraitComparisons, RequiresMatchingNamespaceAndLineTables) {
   LLVMContext C, D;
   auto Namespace = createComparisons(C, {{Prior, 17}});

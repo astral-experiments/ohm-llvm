@@ -24,6 +24,7 @@
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/OhmOptimizerState.h"
+#include "llvm/IR/RustSymbolChecks.h"
 #include "llvm/Support/BLAKE3.h"
 #include "llvm/Support/CachePruning.h"
 #include "llvm/Support/Endian.h"
@@ -265,11 +266,12 @@ struct Invocation {
         std::tie(Key, V) = A.split('=');
         if (Key == "--force-warn")
           ForceWarn = true;
-        else if (!contains({"--crate-name", "--crate-type", "--edition", "--emit",
-                       "--error-format", "--json", "--out-dir", "--extern",
-                       "--check-cfg", "--cfg", "--allow", "--warn", "--deny",
-                       "--forbid", "--cap-lints", "--remap-path-scope"},
-                      Key))
+        else if (!contains({"--crate-name", "--crate-type", "--edition",
+                            "--emit", "--error-format", "--json", "--out-dir",
+                            "--extern", "--check-cfg", "--cfg", "--allow",
+                            "--warn", "--deny", "--forbid", "--cap-lints",
+                            "--remap-path-scope"},
+                           Key))
           return;
         if (!A.contains('=')) {
           if (++I == Args.size())
@@ -793,10 +795,10 @@ bool llvm::ohm::runDebugObjectCache(Module &M, CodeGenTargetMachineImpl &TM,
 static std::optional<std::string> localTraitComparisonName(Function &F) {
   StringRef Name = F.getName();
   if (!Name.starts_with("_RNvXs") || Name.size() < 9 || Name[7] != '_' ||
-      !F.hasInternalLinkage() || F.hasSection() || F.hasComdat() ||
-      F.size() != 1 || F.front().size() > 8 ||
-      !F.getReturnType()->isIntegerTy(1) || F.hasOptNone() ||
-      F.hasFnAttribute(Attribute::NoInline) || F.hasAddressTaken())
+      !F.hasInternalLinkage() || F.hasSection() || F.size() != 1 ||
+      F.front().size() > 8 || !F.getReturnType()->isIntegerTy(1) ||
+      F.hasOptNone() || F.hasFnAttribute(Attribute::NoInline) ||
+      F.hasAddressTaken())
     return std::nullopt;
 
   constexpr StringLiteral Digits =
@@ -834,9 +836,7 @@ static std::optional<std::string> localTraitComparisonName(Function &F) {
 }
 
 void llvm::ohm::prepareLocalTraitComparisons(Module &M) {
-  if (M.getTargetTriple().getArch() != Triple::x86_64 ||
-      !M.getTargetTriple().isOSLinux() || !M.getModuleInlineAsm().empty() ||
-      M.getModuleFlag("ProfileSummary"))
+  if (M.getModuleFlag("ProfileSummary"))
     return;
   struct Method {
     std::string Name;
@@ -846,15 +846,8 @@ void llvm::ohm::prepareLocalTraitComparisons(Module &M) {
   for (Function &F : M)
     if (auto Name = localTraitComparisonName(F))
       Methods.push_back({std::move(*Name), &F});
-  if (Methods.empty())
+  if (Methods.empty() || !canIntroduceRustSymbols(M))
     return;
-  // Assembly can refer to local labels by their spelling.
-  for (const Function &F : M)
-    for (const BasicBlock &BB : F)
-      for (const Instruction &I : BB)
-        if (const auto *Call = dyn_cast<CallBase>(&I);
-            Call && Call->isInlineAsm())
-          return;
 
   llvm::sort(Methods,
              [](const Method &A, const Method &B) { return A.Name < B.Name; });
@@ -862,9 +855,6 @@ void llvm::ohm::prepareLocalTraitComparisons(Module &M) {
     const auto &[Name, F] = Entry;
     if ((I && Methods[I - 1].Name == Name) ||
         (I + 1 < Methods.size() && Methods[I + 1].Name == Name))
-      continue;
-    // Mangler drops the leading escape from an assembler name.
-    if (M.getNamedValue("\1" + Name))
       continue;
     if (auto *Existing = M.getNamedValue(Name); Existing && Existing != F)
       continue;
