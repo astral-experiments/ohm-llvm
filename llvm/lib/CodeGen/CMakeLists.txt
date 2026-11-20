@@ -172,6 +172,7 @@ add_llvm_component_library(LLVMCodeGen
   OhmTraitImports.cpp
   OhmDebugObjectCache.cpp
   OhmDebugObjectSources.cpp
+  OhmLeafObject.cpp
   OhmLineCertificate.cpp
   OptimizePHIs.cpp
   PeepholeOptimizer.cpp
@@ -292,6 +293,7 @@ add_llvm_component_library(LLVMCodeGen
   DebugInfoDWARF
   MC
   ObjCARC
+  Object
   ProfileData
   Scalar
   Support
