@@ -239,6 +239,7 @@ bool contains(ArrayRef<StringRef> Choices, StringRef Value) {
 struct Invocation {
   std::string Root, Entries, Blobs, Cwd, Remap, Namespace;
   bool WithoutDebug = false;
+  bool TestHarness = false;
   std::optional<ohm::DebugObjectImageGeneration> Generation;
   bool imagesUnchanged() const {
     return Generation && Generation == ohm::getDebugObjectImageGeneration();
@@ -258,10 +259,17 @@ struct Invocation {
     StringRef Incremental, Opt, LTO, Embed, Debug, Crate, Outputs, Source;
     bool Ohm = false;
     bool Strip = false;
+    bool CheckRelinkInputs = false;
+    bool EmitRelink = false;
+    StringRef TempsDir;
     for (size_t I = 1; I < Args.size(); ++I) {
       StringRef A = Args[I], Key, V;
       // Cargo requests this frontend lint when compiling workspace crates.
       // The whole command line still contributes to the object namespace.
+      if (ForLineObjects && A == "--test") {
+        TestHarness = true;
+        continue;
+      }
       if (ForLineObjects && A == "--force-warn=unused_crate_dependencies")
         continue;
       if (A.starts_with("--")) {
@@ -322,6 +330,14 @@ struct Invocation {
           } else if (O == "incremental")
             Incremental = Value;
         } else if (Key == "-Z") {
+          if (O == "emit-rlink" && Value.empty()) {
+            EmitRelink = true;
+            continue;
+          }
+          if (O == "temps-dir" && sys::path::is_absolute(Value)) {
+            TempsDir = Value;
+            continue;
+          }
           if (!contains({"ohm-shared-stages", "public-api-hash", "threads",
                          "ohm-caller-local-cgus", "ohm-stable-cgu-merging",
                          "ohm-incremental-mono-partitions", "remap-cwd-prefix",
@@ -331,6 +347,8 @@ struct Invocation {
             return;
           if (O == "remap-cwd-prefix")
             Remap = Value.str();
+          if (O == "ohm-check-relink-inputs" && Value.empty())
+            CheckRelinkInputs = true;
           if (O == "ohm-shared-stages")
             Ohm = true;
         }
@@ -340,10 +358,19 @@ struct Invocation {
         return;
     }
     WithoutDebug = Debug.empty() || Debug == "0" || Debug == "none";
-    if (!Ohm || Source.empty() || !contains({"lib", "rlib"}, Crate) ||
-        Outputs != "dep-info,metadata,link" ||
-        !sys::path::is_absolute(Incremental) || Opt != "1" || LTO != "off" ||
-        Embed != "no" ||
+    // Cargo builds the test crate as an executable, emitting its objects
+    // for a separate relink step. This mode has no rlib metadata output.
+    if (TestHarness) {
+      if (!CheckRelinkInputs || !EmitRelink || TempsDir.empty() ||
+          !Crate.empty() || Outputs != "dep-info,link" || WithoutDebug)
+        return;
+    } else if (!Ohm || EmitRelink || !TempsDir.empty() ||
+               !contains({"lib", "rlib"}, Crate) ||
+               Outputs != "dep-info,metadata,link") {
+      return;
+    }
+    if (Source.empty() || !sys::path::is_absolute(Incremental) || Opt != "1" ||
+        LTO != "off" || Embed != "no" ||
         (!WithoutDebug && (Debug != "line-tables-only" || Strip)) ||
         Remap.empty())
       return;
@@ -1049,7 +1076,7 @@ extern "C" int ohm_early_object_begin_v1(LLVMModuleRef Ref,
     auto &Machine = *reinterpret_cast<TargetMachine *>(TM);
     if (Large && tryTraitObject(M, Machine, I, StringRef(Output, Length), Ticket))
       return 1;
-    if (Leaf)
+    if (Leaf && !I.TestHarness)
       startLeafObject(M, Machine, I, Ticket);
     return 0;
   }
