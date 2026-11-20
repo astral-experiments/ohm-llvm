@@ -91,7 +91,8 @@ TEST(OhmTraitImports, KeepsLiteralAndMethodInKey) {
   Bytes Base, Names, Current, ChangedLiteral, ChangedMethod;
   ASSERT_TRUE(ohm::writeTraitImportSignature(*M, Base, Names));
   EXPECT_TRUE(M->getFunction(Name));
-  EXPECT_TRUE(StringRef(Names.data(), Names.size()).drop_back().ends_with(Name));
+  EXPECT_TRUE(
+      StringRef(Names.data(), Names.size()).drop_back().ends_with(Name));
   ASSERT_TRUE(signature(source(Longer), Current));
   EXPECT_EQ(Base, Current);
   ASSERT_TRUE(signature(source(Longer, Longer), ChangedLiteral));
@@ -100,6 +101,39 @@ TEST(OhmTraitImports, KeepsLiteralAndMethodInKey) {
   EXPECT_NE(Base, ChangedMethod);
 }
 
+constexpr StringLiteral FirstImpl("_RNvMs_NtCs1_5types3mapNtB4_4Item6method");
+constexpr StringLiteral LaterImpl("_RNvMs0_NtCs1_5types3mapNtB5_4Item6method");
+
+TEST(OhmTraitImports, KeepsInherentMethodReceiverModuleAndMethod) {
+  Bytes First, Later;
+  ASSERT_TRUE(signature(source(FirstImpl), First));
+  ASSERT_TRUE(signature(source(LaterImpl), Later));
+  EXPECT_EQ(First, Later);
+  for (StringRef Other : {"_RNvMs0_NtCs2_5types3mapNtB5_4Item6method",
+                          "_RNvMs0_NtCs1_5types3setNtB5_4Item6method",
+                          "_RNvMs0_NtCs1_5types3mapNtB5_5Other6method",
+                          "_RNvMs0_NtCs1_5types3mapNtB5_4Item6second"}) {
+    Bytes Changed;
+    ASSERT_TRUE(signature(source(Other), Changed));
+    EXPECT_NE(First, Changed);
+  }
+}
+
+TEST(OhmTraitImports, RequiresUnambiguousInherentModuleBackreference) {
+  for (StringRef Name : {"_RNvMs0_NtCs1_5types3mapNtB4_4Item6method",
+                         "_RNvMs0_NtCs1_5types3mapNtB7_4Item6method",
+                         "_RNvMs01_NtCs1_5types3mapNtB6_4Item6method",
+                         "_RNvMs_NtCs1_5types3mapNtB4_4Item6methodCs1_5types",
+                         "_RNvMNaNtCs1_5types3mapNtB4_4Item6method"}) {
+    Bytes Key;
+    EXPECT_FALSE(signature(source(Name), Key));
+  }
+  Bytes Key;
+  EXPECT_FALSE(
+      signature(source(FirstImpl) +
+                    "declare i32 @_RNvMNtCs1_5types3mapNtB2_4Item6method()\n",
+                Key));
+}
 TEST(OhmTraitImports, SkipsSerializationForUnchangedImports) {
   LLVMContext C;
   auto M = read(C, source(Name));
@@ -220,6 +254,16 @@ TEST(OhmTraitImports, MatchesFreshELFWhenProviderGrowsAndShrinks) {
   ASSERT_TRUE(rebind(Before, Name, Longer, Rebound));
   EXPECT_EQ(Rebound, After);
   ASSERT_TRUE(rebind(After, Longer, Name, Rebound));
+  EXPECT_EQ(Rebound, Before);
+}
+
+TEST(OhmTraitImports, RebindsInherentImplInBothDirections) {
+  Bytes Before, After, Rebound;
+  ASSERT_TRUE(emit(source(FirstImpl), Before));
+  ASSERT_TRUE(emit(source(LaterImpl), After));
+  ASSERT_TRUE(rebind(Before, FirstImpl, LaterImpl, Rebound));
+  EXPECT_EQ(Rebound, After);
+  ASSERT_TRUE(rebind(After, LaterImpl, FirstImpl, Rebound));
   EXPECT_EQ(Rebound, Before);
 }
 

@@ -1,4 +1,4 @@
-//===- OhmTraitImports.h - Relocatable Rust trait imports -------*- C++ -*-===//
+//===- OhmTraitImports.h - Relocatable Rust method imports ------*- C++ -*-===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -16,8 +16,8 @@
 namespace llvm {
 class Module;
 namespace ohm {
-/// Compute a closed line certificate with a provider-independent path for
-/// each direct trait import. Key selects candidate donors. Manifest retains
+/// Compute a closed line certificate with normalized paths for selected
+/// direct method imports. Key selects candidate donors. Manifest retains
 /// their complete proof and original import names for checked rebinding.
 bool writeTraitImportSignature(const Module &M, SmallVectorImpl<char> &Key,
                                SmallVectorImpl<char> &Manifest,

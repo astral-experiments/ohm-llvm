@@ -1,4 +1,4 @@
-//===- OhmTraitImports.cpp - Relocatable Rust trait imports --------------===//
+//===- OhmTraitImports.cpp - Relocatable Rust method imports -------------===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -166,6 +166,51 @@ static StringRef traitImportMethodPath(StringRef Name) {
   return consumeCrate(Rest) && Rest.empty() ? Path : StringRef();
 }
 
+// For an inherent method defined beside its nominal receiver, v0 can
+// encode Nv M s<ordinal>_ <module> Nt B<offset>_ <receiver> <method>.
+// An earlier impl can change both the ordinal and the backreference to
+// the module. Project the name as if it had no ordinal, after checking
+// the backreference resolves to precisely that module.
+static StringRef methodPath(StringRef Name, SmallVectorImpl<char> &Storage) {
+  StringRef Rest = Name;
+  if (!Rest.consume_front("_RNvMs"))
+    return traitImportMethodPath(Name);
+
+  StringRef Ordinal = Rest.take_while(isAlnum);
+  // Accept only explicit ordinals with at most ten base-62 digits.
+  if (Ordinal.size() > 10 || (Ordinal.size() > 1 && Ordinal.front() == '0'))
+    return {};
+  Rest = Rest.drop_front(Ordinal.size());
+  if (!Rest.consume_front("_"))
+    return {};
+  StringRef ModulePath = Rest;
+  size_t Offset = Name.size() - Rest.size() - 2;
+  if (!consumeTypePath(Rest))
+    return {};
+  ModulePath = ModulePath.drop_back(Rest.size());
+
+  // Offsets are relative to the end of "_R". Here Offset is 5 to 15,
+  // so (Offset - 1) fits in one digit. Without an ordinal it becomes 2.
+  constexpr StringLiteral Digits("0123456789abcdef");
+  if (!Rest.consume_front("NtB") || Rest.size() < 2 ||
+      Rest[0] != Digits[Offset - 1] || Rest[1] != '_')
+    return {};
+  Rest = Rest.drop_front(2);
+  StringRef ReceiverAndMethod = Rest;
+  if (!consumeIdentifier(Rest) || !consumeIdentifier(Rest) || !Rest.empty())
+    return {};
+
+  raw_svector_ostream(Storage)
+      << "_RNvM" << ModulePath << "NtB2_" << ReceiverAndMethod;
+  return StringRef(Storage.data(), Storage.size());
+}
+
+static bool sameMethodPath(StringRef Old, StringRef Current) {
+  SmallString<128> A, B;
+  StringRef Path = methodPath(Old, A);
+  return !Path.empty() && Path == methodPath(Current, B);
+}
+
 // All uses of this arbitrary external function must be direct callee
 // operands. Its linkage, ABI, arguments, attributes and call sites remain
 // part of the closed signature. No function bodies or debug names are masked.
@@ -188,19 +233,24 @@ bool ohm::writeTraitImportSignature(const Module &M, SmallVectorImpl<char> &Key,
       !M.alias_empty() || !M.ifunc_empty())
     return false;
 
+  SmallString<128> Canonical;
   DenseMap<const Function *, StringRef> Paths;
   StringSet<> Seen;
   for (const Function &F : M) {
-    StringRef Path = traitImportMethodPath(F.getName());
+    if (!F.isDeclaration())
+      continue;
+    Canonical.clear();
+    StringRef Path = methodPath(F.getName(), Canonical);
     if (Path.empty() || !isDirectImport(F))
       continue;
     // The LLVM assembler-name escape is stripped before ELF emission. Its
     // references would share the import's symbol index and could not be
     // distinguished from the calls we intend to rebind.
-    if (M.getNamedValue(("\1" + F.getName()).str()) || M.getNamedValue(Path) ||
-        !Seen.insert(Path).second)
+    auto [It, Unique] = Seen.insert(Path);
+    if (!Unique || M.getNamedValue(("\1" + F.getName()).str()) ||
+        M.getNamedValue(Path))
       return false;
-    Paths[&F] = Path;
+    Paths[&F] = It->getKey();
     Imports.append(F.getName().begin(), F.getName().end());
     Imports.push_back('\0');
   }
@@ -436,10 +486,8 @@ bool ohm::rebindTraitImports(StringRef Object, StringRef Old, StringRef Current,
     auto [After, NewTail] = Current.split('\0');
     if (Before.empty() || After.empty())
       return false;
-    if (Before != After &&
-        (traitImportMethodPath(Before).empty() ||
-         traitImportMethodPath(Before) != traitImportMethodPath(After) ||
-         !Renames.try_emplace(Before, After).second))
+    if (Before != After && (!sameMethodPath(Before, After) ||
+                            !Renames.try_emplace(Before, After).second))
       return false;
     Old = OldTail;
     Current = NewTail;

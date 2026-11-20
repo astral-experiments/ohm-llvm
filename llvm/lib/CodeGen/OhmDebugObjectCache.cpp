@@ -661,9 +661,9 @@ bool splitTraitRecord(StringRef Payload, StringRef &Object,
   return true;
 }
 
-// An imported Rust default method can move when its original provider stops
-// using it. Look for the same closed optimizer input with that provider and
-// source lines projected out, then check the exact changes before replay.
+// Look for the same closed optimizer input with source lines and the
+// spelling of selected Rust method imports projected out. Verify the
+// method paths and restore their current bindings before replay.
 bool tryTraitObject(Module &M, TargetMachine &TM, const Invocation &I,
                     StringRef Output, void **Ticket) {
   if (TM.getOptLevel() != CodeGenOptLevel::Less)
