@@ -11,6 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/IR/LegacyPassManager.h"
+#include "llvm/IR/LegacyModuleSuffix.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/IR/DiagnosticInfo.h"
@@ -471,6 +472,7 @@ struct ModulePipelineCapture {
   ModulePipelineCapture *Previous;
   PassManagerImpl *Impl = nullptr;
   bool Eligible = true;
+  PassManagerBase::ModuleExecutor Suffix = nullptr;
 
   static thread_local ModulePipelineCapture *Current;
   static ModulePipelineCapture *find(PassManagerBase *Owner) {
@@ -496,10 +498,27 @@ public:
   SmallVector<const void *, 4> InitialAnalyses;
   bool PrefixIntact = true;
   PassManagerBase::ModuleExecutor Armed;
+  PassManagerBase::ModuleExecutor ArmedSuffix;
+  bool HasSuffix = false;
+
+  void startSuffix() {
+    // End the active function pipeline and its enclosing module manager.
+    // The suffix shares the same immutable passes, but initializes and
+    // finalizes its own passes only when the executor calls Run.
+    while (!activeStack.empty())
+      activeStack.pop();
+    auto *Suffix = new MPPassManager();
+    Suffix->setTopLevelManager(this);
+    addPassManager(Suffix);
+    activeStack.push(Suffix);
+    HasSuffix = true;
+  }
 
   void add(Pass *P, PassManagerBase *Owner) {
-    if (Armed)
+    if (Armed) {
       Armed = nullptr;
+      ArmedSuffix = nullptr;
+    }
     if (PrefixIntact) {
       if (auto *C = ModulePipelineCapture::find(Owner)) {
         C->Impl = this;
@@ -525,7 +544,7 @@ public:
 
   /// run - Execute all of the passes scheduled for execution.  Keep track of
   /// whether any of the passes modifies the module, and if so, return true.
-  bool run(Module &M);
+  bool run(Module &M, PassManagerBase::ModuleExecutor Suffix = nullptr);
 
   using llvm::Pass::doInitialization;
   using llvm::Pass::doFinalization;
@@ -558,7 +577,7 @@ char PassManagerImpl::ID = 0;
 //
 /// run - Execute all of the passes scheduled for execution.  Keep track of
 /// whether any of the passes modifies the module, and if so, return true.
-bool PassManagerImpl::run(Module &M) {
+bool PassManagerImpl::run(Module &M, PassManagerBase::ModuleExecutor Suffix) {
   bool Changed = false;
 
   dumpArguments();
@@ -569,7 +588,11 @@ bool PassManagerImpl::run(Module &M) {
 
   initializeAllAnalysisInfo();
   for (unsigned Index = 0; Index < getNumContainedManagers(); ++Index) {
-    Changed |= getContainedManager(Index)->runOnModule(M);
+    auto Run = [&] { return getContainedManager(Index)->runOnModule(M); };
+    if (Index == 1 && Suffix)
+      Changed |= Suffix(M, Run);
+    else
+      Changed |= Run();
     M.getContext().yield();
   }
 
@@ -1735,7 +1758,8 @@ void PassManager::add(Pass *P) {
 bool PassManager::run(Module &M) {
   if (PM->Armed) {
     auto Execute = std::move(PM->Armed);
-    return Execute(M, [&] { return PM->run(M); });
+    auto Suffix = std::move(PM->ArmedSuffix);
+    return Execute(M, [&] { return PM->run(M, std::move(Suffix)); });
   }
   return PM->run(M);
 }
@@ -1833,6 +1857,23 @@ void FunctionPass::assignPassManager(PMStack &PMS,
 
 legacy::PassManagerBase::~PassManagerBase() = default;
 
+void legacy::requestWrappedModuleSuffix(PassManagerBase &PM,
+                                        PassManagerBase::ModuleExecutor Suffix) {
+  if (auto *C = ModulePipelineCapture::find(&PM))
+    C->Suffix = std::move(Suffix);
+}
+
+void legacy::startWrappedModuleSuffix(PassManagerBase &PM) {
+  auto *C = ModulePipelineCapture::find(&PM);
+  if (!C || !C->Suffix || !C->Eligible)
+    return;
+  if (!C->Impl || C->Impl->HasSuffix) {
+    C->Eligible = false;
+    return;
+  }
+  C->Impl->startSuffix();
+}
+
 bool legacy::PassManagerBase::addWrappedModulePipeline(
     ArrayRef<const void *> AllowedPrefix, function_ref<bool()> Build,
     ModuleExecutor Execute) {
@@ -1854,7 +1895,10 @@ bool legacy::PassManagerBase::addWrappedModulePipelineWithPrefixCheck(
                                         legacy::ModulePipelineCapture::Current};
   SaveAndRestore Guard(legacy::ModulePipelineCapture::Current, &Capture);
   bool Failed = Build();
-  if (!Failed && Capture.Eligible && Capture.Impl)
+  if (!Failed && Capture.Eligible && Capture.Impl) {
     Capture.Impl->Armed = std::move(Execute);
+    if (Capture.Impl->HasSuffix)
+      Capture.Impl->ArmedSuffix = std::move(Capture.Suffix);
+  }
   return Failed;
 }

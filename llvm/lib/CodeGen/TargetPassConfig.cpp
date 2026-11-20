@@ -28,6 +28,7 @@
 #include "llvm/CodeGen/Passes.h"
 #include "llvm/CodeGen/RegAllocRegistry.h"
 #include "llvm/IR/IRPrintingPasses.h"
+#include "llvm/IR/LegacyModuleSuffix.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/PassInstrumentation.h"
 #include "llvm/IR/Verifier.h"
@@ -976,6 +977,8 @@ void TargetPassConfig::addISelPrepare() {
     addPass(new DummyCGSCCPass);
 
   addPass(createInlineAsmPreparePass());
+
+  legacy::startWrappedModuleSuffix(*PM);
 
   // Add both the safe stack and the stack protection passes: each of them will
   // only protect functions that have corresponding attributes.

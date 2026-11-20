@@ -64,6 +64,12 @@ inline bool allowsDebugObjectCacheLoader(StringRef InitialEnvironment) {
   return true;
 }
 bool canUseDebugObjectCache();
+/// Whether the current thread holds an ordinary rustc ticket for this target.
+bool hasPendingLeaf(CodeGenTargetMachineImpl &TM);
+/// Probe an input after IR preparation and before SelectionDAG. Emit must
+/// run the complete remaining pipeline, including assembly finalization.
+bool runLeafObjectCache(Module &M, CodeGenTargetMachineImpl &TM,
+                        raw_svector_ostream &Out, function_ref<bool()> Emit);
 bool runDebugObjectCache(Module &, CodeGenTargetMachineImpl &,
                          raw_svector_ostream &, function_ref<bool()> Emit);
 } // namespace ohm

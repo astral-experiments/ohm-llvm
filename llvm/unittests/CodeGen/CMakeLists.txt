@@ -33,6 +33,7 @@ add_llvm_unittest(CodeGenTests
   OhmTraitImportsTest.cpp
   OhmDebugObjectCacheTest.cpp
   OhmDebugObjectSourcesTest.cpp
+  OhmLeafObjectTest.cpp
   OhmLineCertificateTest.cpp
   LowLevelTypeTest.cpp
   LexicalScopesTest.cpp
