@@ -729,8 +729,9 @@ bool tryTraitObject(Module &M, TargetMachine &TM, const Invocation &I,
   // DWARF lookup, so defer to it if neither hint suggests a donor.
   auto ShouldProbe = [&](StringRef Imports) {
     BLAKE3 Slot;
+    // Share this negative hint across rebuilds of loaded procedural macros.
+    // The object key above still binds the full compiler namespace.
     frame(Slot, "ohm-line-object-hint-v2");
-    frame(Slot, I.Namespace);
     frame(Slot, M.getModuleIdentifier());
     auto Path = joinPath(I.Entries, "llvmcache-" + toHex(Slot.final(), true));
     std::string Shape = inputShape(M, I.TestHarness);
