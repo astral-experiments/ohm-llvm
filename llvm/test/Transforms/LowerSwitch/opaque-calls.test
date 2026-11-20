@@ -1,0 +1,117 @@
+# RUN: %python %s > %t.ll
+# RUN: opt -passes=lower-switch-calls -verify-each -S %t.ll | FileCheck %s
+# RUN: opt -passes='default<O1>' -S %t.ll | FileCheck %s --check-prefix=O1
+# REQUIRES: x86-registered-target
+
+# Generate dense switches at the minimum size used by the transform.
+# One locally defined getter keeps its direct call. The phi selects the
+# same result before and after the other 31 arms are folded.
+#
+# CHECK: @switch.table._Rdispatch = private unnamed_addr constant [32 x ptr] [ptr @_Rget0, ptr @_Rget1,
+# CHECK-SAME: ptr @_Rget30, ptr poison]
+# CHECK: @switch.table._Rdata = private unnamed_addr constant [32 x ptr] [ptr @g0, ptr @g1,
+# CHECK: @switch.table._Rdata.{{[0-9]+}} = private unnamed_addr constant [32 x i32] [i32 0, i32 1,
+# CHECK-NOT: @switch.table.
+# CHECK-LABEL: define i32 @_Rdispatch(
+# CHECK: switch i8 %key, label %b0 [
+# CHECK-NEXT: i8 31, label %b31
+# CHECK-NEXT: ]
+# CHECK: getelementptr inbounds [32 x ptr], ptr @switch.table._Rdispatch
+# CHECK: [[TARGET:%.*]] = load ptr
+# CHECK-NEXT: %x0 = call i32 [[TARGET]]()
+# CHECK: %x31 = call i32 @_Rget31()
+# CHECK: phi i32 [ %x0, %b0 ], [ %x31, %b31 ]
+# O1: @switch.table._Rdata = private unnamed_addr constant [32 x ptr]
+# O1-LABEL: define i32 @local_use(
+# O1: call i32 @_Rget0()
+# O1: call i32 @_Rget1()
+
+# One case family calls a common getter on distinct constants, then writes
+# a distinct integer. Only these two operands require tables.
+#
+# CHECK-LABEL: define i32 @_Rdata(
+# CHECK: [[ARG:%.*]] = load ptr
+# CHECK: [[DATA:%.*]] = load i32
+# CHECK: call i32 @_Rread(ptr [[ARG]])
+# CHECK-NEXT: store i32 [[DATA]], ptr %out
+
+# Different projections in the return block, a reachable default, a
+# missing key, and a constrained input must each preserve the switch.
+#
+# CHECK-LABEL: define i32 @_Rprojection(
+# CHECK-COUNT-32: call { i32, i32 } @_Rpair
+# CHECK-LABEL: define i32 @_Rdefault(
+# CHECK-COUNT-32: call i32 @_Rget
+# CHECK-LABEL: define i32 @_Rsparse(
+# CHECK-COUNT-32: call i32 @_Rget
+# CHECK-LABEL: define i32 @_Rrange(
+# CHECK-COUNT-32: call i32 @_Rget
+
+# A local caller may select a strict subset of the cases. Putting the
+# other targets in the same table would keep their symbols reachable.
+# CHECK-LABEL: define i32 @_Rlocal(
+# CHECK-COUNT-32: call i32 @_Rget
+# CHECK-LABEL: define i32 @_Rnotail(
+# CHECK-COUNT-16: notail call i32 @_Rget
+# CHECK-LABEL: define i32 @_Rattributes(
+# CHECK-COUNT-16: call signext i32
+# CHECK-COUNT-16: call zeroext i32
+
+print('target triple = "x86_64-unknown-linux-gnu"')
+keys = range(32)
+ext = ["signext"] * 16 + ["zeroext"] * 16
+for i in keys:
+    print(f"@g{i} = private constant i32 {i}")
+    print(f"declare {{ i32, i32 }} @_Rpair{i}()")
+    print(f"declare {ext[i]} i32 @_Rext{i}()")
+    if i != 31:
+        print(f"declare i32 @_Rget{i}()")
+print("define i32 @_Rget31() { ret i32 31 }")
+print("declare i32 @_Rread(ptr)")
+
+cases = ["dispatch", "data", "projection", "default", "sparse", "range"]
+for name in cases + ["local", "notail", "attributes"]:
+    print(f"define i32 @_R{name}(ptr %tag, ptr %out) {{")
+    metadata = ", !range !1" if name == "range" else ""
+    print(f"  %key = load i8, ptr %tag{metadata}")
+    print("  switch i8 %key, label %default [")
+    for i in keys:
+        key = 40 if name == "sparse" and i == 31 else i
+        print(f"    i8 {key}, label %b{i}")
+    print("  ]")
+    print("default:", "ret i32 -1" if name == "default" else "unreachable")
+    incoming = []
+    for i in keys:
+        print(f"b{i}:")
+        if name == "data":
+            print(f"  %x{i} = call i32 @_Rread(ptr @g{i})")
+            print(f"  store i32 {i}, ptr %out")
+        elif name == "projection":
+            print(f"  %pair{i} = call {{ i32, i32 }} @_Rpair{i}()")
+            print(f"  %x{i} = extractvalue {{ i32, i32 }} %pair{i}, 0")
+            print(f"  %y{i} = extractvalue {{ i32, i32 }} %pair{i}, 1")
+        elif name == "attributes":
+            print(f"  %x{i} = call {ext[i]} i32 @_Rext{i}()")
+        else:
+            tail = "notail " if name == "notail" and i >= 16 else ""
+            print(f"  %x{i} = {tail}call i32 @_Rget{i}()")
+        print("  br label %join")
+        val = "%y9" if name == "projection" and i == 9 else f"%x{i}"
+        incoming.append(f"[ {val}, %b{i} ]")
+    print("join:")
+    print("  %result = phi i32", ", ".join(incoming))
+    print("  ret i32 %result")
+    print("}")
+
+print("""
+define i32 @local_use(i8 %key) {
+  %subset = and i8 %key, 1
+  %tag = alloca i8
+  store i8 %subset, ptr %tag
+  %v = call i32 @_Rlocal(ptr %tag, ptr null) alwaysinline
+  ret i32 %v
+}
+""")
+print("!llvm.ident = !{!0}")
+print('!0 = !{!"rustc version 1.100.0"}')
+print("!1 = !{i8 0, i8 31}")
