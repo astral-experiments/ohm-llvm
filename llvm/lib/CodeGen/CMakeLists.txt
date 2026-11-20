@@ -169,6 +169,7 @@ add_llvm_component_library(LLVMCodeGen
   MIRPrintingPass.cpp
   MacroFusion.cpp
   NonRelocatableStringpool.cpp
+  OhmTraitImports.cpp
   OhmDebugObjectCache.cpp
   OhmDebugObjectSources.cpp
   OhmLineCertificate.cpp

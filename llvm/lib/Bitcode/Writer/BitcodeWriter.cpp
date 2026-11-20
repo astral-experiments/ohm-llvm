@@ -267,7 +267,8 @@ public:
 
 protected:
   void writePerModuleGlobalValueSummary();
-  void writeGUIDList();
+  void writeGUIDList(
+      function_ref<StringRef(const Function &)> DeclarationName = nullptr);
 
 private:
   void writePerModuleFunctionSummaryRecord(
@@ -307,6 +308,7 @@ private:
 /// Class to manage the bitcode writing for a module.
 class ModuleBitcodeWriter : public ModuleBitcodeWriterBase {
   DwarfLineCertificate *LineCertificate;
+  function_ref<StringRef(const Function &)> DeclarationName;
   /// True if a module hash record should be written.
   bool GenerateHash;
 
@@ -322,19 +324,21 @@ class ModuleBitcodeWriter : public ModuleBitcodeWriterBase {
 public:
   /// Constructs a ModuleBitcodeWriter object for the given Module,
   /// writing to the provided \p Buffer.
-  ModuleBitcodeWriter(const Module &M, StringTableBuilder &StrtabBuilder,
-                      BitstreamWriter &Stream, bool ShouldPreserveUseListOrder,
-                      const ModuleSummaryIndex *Index, bool GenerateHash,
-                      ModuleHash *ModHash = nullptr,
-                      DebugObjectSourceMap *SourceMap = nullptr,
-                      MachineUseState *Uses = nullptr,
-                      DwarfLineCertificate *LineCertificate = nullptr)
-      : ModuleBitcodeWriterBase(
-            M, StrtabBuilder, Stream, ShouldPreserveUseListOrder, Index, Uses,
-            LineCertificate ? LineCertificate->enumerationHints()
-                            : ValueEnumerationHints()),
-        LineCertificate(LineCertificate), GenerateHash(GenerateHash),
-        ModHash(ModHash), BitcodeStartBit(Stream.GetCurrentBitNo()) {
+  ModuleBitcodeWriter(
+      const Module &M, StringTableBuilder &StrtabBuilder,
+      BitstreamWriter &Stream, bool ShouldPreserveUseListOrder,
+      const ModuleSummaryIndex *Index, bool GenerateHash,
+      ModuleHash *ModHash = nullptr, DebugObjectSourceMap *SourceMap = nullptr,
+      MachineUseState *Uses = nullptr,
+      DwarfLineCertificate *LineCertificate = nullptr,
+      function_ref<StringRef(const Function &)> DeclarationName = nullptr)
+      : ModuleBitcodeWriterBase(M, StrtabBuilder, Stream,
+                                ShouldPreserveUseListOrder, Index, Uses,
+                                LineCertificate ? LineCertificate->enumerationHints()
+                                                : ValueEnumerationHints()),
+        LineCertificate(LineCertificate), DeclarationName(DeclarationName),
+        GenerateHash(GenerateHash), ModHash(ModHash),
+        BitcodeStartBit(Stream.GetCurrentBitNo()) {
     assert(!(SourceMap && LineCertificate));
     VE.setSourceMap(SourceMap);
   }
@@ -1683,7 +1687,7 @@ void ModuleBitcodeWriter::writeModuleInfo() {
     Vals.clear();
   }
 
-  writeGUIDList();
+  writeGUIDList(DeclarationName);
 
   // Emit the global variable information.
   for (const GlobalVariable &GV : M.globals()) {
@@ -1743,8 +1747,10 @@ void ModuleBitcodeWriter::writeModuleInfo() {
     //             unnamed_addr, prologuedata, dllstorageclass, comdat,
     //             prefixdata, personalityfn, DSO_Local, addrspace,
     //             partition_strtab, partition_size, prefalign]
-    Vals.push_back(addToStrtab(F.getName()));
-    Vals.push_back(F.getName().size());
+    StringRef Name =
+        DeclarationName && F.isDeclaration() ? DeclarationName(F) : F.getName();
+    Vals.push_back(addToStrtab(Name));
+    Vals.push_back(Name.size());
     Vals.push_back(VE.getTypeID(F.getFunctionType()));
     Vals.push_back(F.getCallingConv());
     Vals.push_back(F.isDeclaration());
@@ -5043,7 +5049,8 @@ void ModuleBitcodeWriterBase::writePerModuleGlobalValueSummary() {
   Stream.ExitBlock();
 }
 
-void ModuleBitcodeWriterBase::writeGUIDList() {
+void ModuleBitcodeWriterBase::writeGUIDList(
+    function_ref<StringRef(const Function &)> DeclarationName) {
   const ValueEnumerator::ValueList &Vals = VE.getValues();
   const size_t Max = Vals.size();
 
@@ -5053,6 +5060,14 @@ void ModuleBitcodeWriterBase::writeGUIDList() {
     if (!MaybeGUID)
       continue;
     auto GUID = *MaybeGUID;
+    // Non-local declarations without explicit GUID metadata derive the
+    // serialized GUID from the same spelling as their module record.
+    if (DeclarationName && !GV.hasLocalLinkage())
+      if (auto *F = dyn_cast<Function>(&GV); F && F->isDeclaration()) {
+        StringRef Name = DeclarationName(*F);
+        if (Name != F->getName() && !F->hasMetadata())
+          GUID = GlobalValue::getGUIDAssumingExternalLinkage(Name);
+      }
 
     const auto ValueID = VE.getValueID(&GV);
     GUIDs[ValueID] = GUID;
@@ -5814,6 +5829,11 @@ bool llvm::getClosedModuleHashV1(const Module &M,
 }
 
 bool llvm::writeClosedDwarfLineCertificateV1(const Module &M, raw_ostream &Out) {
+  return writeProjectedDwarfLineCertificate(M, Out, {});
+}
+bool llvm::writeProjectedDwarfLineCertificate(
+    const Module &M, raw_ostream &Out,
+    function_ref<StringRef(const Function &)> GetName) {
   if (!M.isMaterialized() || !M.getTargetTriple().isOSBinFormatELF() ||
       !preserveUseListOrder(true))
     return false;
@@ -5829,13 +5849,16 @@ bool llvm::writeClosedDwarfLineCertificateV1(const Module &M, raw_ostream &Out) 
     raw_svector_ostream Buffer(Bytes);
     BitcodeWriter Writer(Buffer);
     Writer.Mods.push_back(const_cast<Module *>(&M));
-    ModuleBitcodeWriter ModuleWriter(M, Writer.StrtabBuilder, *Writer.Stream,
-                                     /*ShouldPreserveUseListOrder=*/true, nullptr,
-                                     /*GenerateHash=*/false, nullptr,
-                                     /*SourceMap=*/nullptr, /*Uses=*/nullptr,
-                                     &Certificate);
+    ModuleBitcodeWriter ModuleWriter(
+        M, Writer.StrtabBuilder, *Writer.Stream,
+        /*ShouldPreserveUseListOrder=*/true, nullptr,
+        /*GenerateHash=*/false, nullptr,
+        /*SourceMap=*/nullptr, /*Uses=*/nullptr, &Certificate, GetName);
     ModuleWriter.write();
-    Writer.writeSymtab();
+    // The optional IR symbol table derives from unprojected names. The
+    // signature already covers the complete module records.
+    if (!GetName)
+      Writer.writeSymtab();
     Writer.writeStrtab();
   }
   Bytes.append(StringRef(reinterpret_cast<const char *>(Context.data()), Context.size()));
