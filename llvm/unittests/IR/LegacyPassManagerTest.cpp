@@ -28,6 +28,7 @@
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/LegacyModuleSuffix.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/OptBisect.h"
 #include "llvm/InitializePasses.h"
@@ -292,6 +293,72 @@ TEST(PassManager, WrappedModulePipelineChecksEffectiveLibraryInfo) {
   Check({true}, false);
   Check({false, true}, true);
   Check({true, false}, false);
+}
+
+TEST(PassManager, WrappedSuffixComposesWithOuterExecutorAndIsOneShot) {
+  LLVMContext C;
+  Module M("suffix", C);
+  enum Result { OuterHit, SuffixHit, NoHit };
+  for (Result Hit : {OuterHit, SuffixHit, NoHit}) {
+    legacy::PassManager PM;
+    ModuleNDNM::run = 0;
+    ModuleNDM::run = 0;
+    int Calls = 0;
+    PM.addWrappedModulePipeline(
+        {},
+        [&] {
+          legacy::requestWrappedModuleSuffix(
+              PM, [&](Module &, function_ref<bool()> Run) {
+                EXPECT_EQ(ModuleNDNM::run, 1);
+                EXPECT_EQ(ModuleNDM::run, 0);
+                ++Calls;
+                return Hit == SuffixHit ? false : Run();
+              });
+          PM.add(new ModuleNDNM);
+          legacy::startWrappedModuleSuffix(PM);
+          PM.add(new ModuleNDM);
+          return false;
+        },
+        [&](Module &, function_ref<bool()> Run) {
+          EXPECT_EQ(ModuleNDNM::run, 0);
+          return Hit == OuterHit ? false : Run();
+        });
+    PM.run(M);
+    EXPECT_EQ(ModuleNDNM::run, Hit != OuterHit);
+    EXPECT_EQ(ModuleNDM::run, Hit == NoHit);
+    PM.run(M);
+    EXPECT_EQ(ModuleNDNM::run, 1 + (Hit != OuterHit));
+    EXPECT_EQ(ModuleNDM::run, 1 + (Hit == NoHit));
+    EXPECT_EQ(Calls, Hit != OuterHit);
+  }
+}
+
+TEST(PassManager, RequiresOneBoundaryForAWrappedSuffix) {
+  LLVMContext C;
+  Module M("invalid-suffix", C);
+  for (unsigned Boundaries : {0u, 2u}) {
+    legacy::PassManager PM;
+    ModuleNDNM::run = 0;
+    ModuleNDM::run = 0;
+    PM.addWrappedModulePipeline(
+        {},
+        [&] {
+          legacy::requestWrappedModuleSuffix(
+              PM, [](Module &, function_ref<bool()>) {
+                ADD_FAILURE() << "unexpected suffix execution";
+                return false;
+              });
+          PM.add(new ModuleNDNM);
+          for (unsigned I = 0; I < Boundaries; ++I)
+            legacy::startWrappedModuleSuffix(PM);
+          PM.add(new ModuleNDM);
+          return false;
+        },
+        [](Module &, function_ref<bool()> Run) { return Run(); });
+    PM.run(M);
+    EXPECT_EQ(ModuleNDNM::run, 1);
+    EXPECT_EQ(ModuleNDM::run, 1);
+  }
 }
 
 TEST(PassManager, WrappedModulePipelineIsOneShot) {

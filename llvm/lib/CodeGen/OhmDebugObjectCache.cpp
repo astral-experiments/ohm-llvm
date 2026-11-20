@@ -622,44 +622,33 @@ struct EarlyOrigin {
 };
 thread_local std::weak_ptr<EarlyOrigin> PendingEarly;
 
-std::pair<StringRef, StringRef> splitLeafRecord(StringRef Record) {
+// Check the binding to this exact object before adjusting any leaf.
+std::string loadLeafObject(StringRef Path, StringRef Proof) {
+  auto Buffer = readPrivate(Path, MaxOrigin);
+  if (!Buffer)
+    return {};
+  StringRef Record = Buffer->getBuffer();
   if (!Record.consume_front("OHMLEAF1") || Record.size() < 8)
     return {};
   uint64_t N = support::endian::read64le(Record.data());
   Record = Record.drop_front(8);
   if (!N || N >= Record.size())
     return {};
-  return {Record.take_front(N), Record.drop_front(N)};
+  return ohm_leaf::tryReuse(Proof, Record.take_front(N), Record.drop_front(N));
 }
 
-bool tryLeafObject(Module &M, TargetMachine &TM, const Invocation &I,
-                   StringRef Output, void **Ticket) {
+void startLeafObject(Module &M, TargetMachine &TM, const Invocation &I,
+                     void **Ticket) {
   BLAKE3 H;
-  frame(H, "ohm-leaf-object-v1");
+  frame(H, "ohm-leaf-object-v2");
   frame(H, I.Namespace);
   frame(H, machineTarget(M, TM));
   frame(H, M.getModuleIdentifier());
   auto Key = toHex(H.final(), true);
-  auto Path = joinPath(I.Entries, "llvmcache-" + Key);
-  auto Buffer = readPrivate(Path, MaxOrigin);
-  auto [Witness, Prior] =
-      splitLeafRecord(Buffer ? Buffer->getBuffer() : StringRef());
-  auto Proof = ohm_leaf::prepare(M, Key, Witness);
-  if (Proof.empty())
-    return false;
-  auto Object = ohm_leaf::tryReuse(Proof, Witness, Prior);
-  if (!Object.empty() && I.imagesUnchanged() &&
-      writeAtomic(Output, {Object}, 0666)) {
-    event(M.getModuleIdentifier(), "leaf-hit");
-    return true;
-  }
-
-  // Enroll only the bytes from this exact compilation.
   auto Origin = std::make_shared<EarlyOrigin>(M, std::move(Key));
-  Origin->Leaf = LeafOrigin{&TM, std::move(Proof), {}};
+  Origin->Leaf = LeafOrigin{&TM, {}, {}};
   PendingEarly = Origin;
   *Ticket = new std::shared_ptr<EarlyOrigin>(std::move(Origin));
-  return false;
 }
 
 void storeLeafObject(StringRef Path, const EarlyOrigin &Entry) {
@@ -754,18 +743,50 @@ bool llvm::ohm::canUseDebugObjectCache() {
 #endif
 }
 
+bool llvm::ohm::hasPendingLeaf(CodeGenTargetMachineImpl &TM) {
+#if defined(__linux__) && defined(__x86_64__)
+  if (auto Origin = PendingEarly.lock())
+    return Origin->Leaf && Origin->Leaf->Target == &TM;
+#endif
+  return false;
+}
+
+bool llvm::ohm::runLeafObjectCache(Module &M, CodeGenTargetMachineImpl &TM,
+                                   raw_svector_ostream &Out,
+                                   function_ref<bool()> Emit) {
+#if defined(__linux__) && defined(__x86_64__)
+  auto Origin = PendingEarly.lock();
+  if (!Origin || !Origin->Leaf || Origin->Input != &M ||
+      Origin->Leaf->Target != &TM || !Out.str().empty() ||
+      TM.Options.EnableFastISel || TM.Options.EnableGlobalISel ||
+      Origin->Diagnostics.hasDiagnostics() || !ordinaryModule(M, false))
+    return Emit();
+  PendingEarly.reset();
+  auto &Leaf = *Origin->Leaf;
+  Leaf.Proof = ohm_leaf::prepare(M, Origin->Key);
+  if (Leaf.Proof.empty())
+    return Emit();
+  const auto &I = invocation(/*Leaf=*/true);
+  auto Path = joinPath(I.Entries, "llvmcache-" + Origin->Key);
+  auto Object = loadLeafObject(Path, Leaf.Proof);
+  if (!Object.empty() && I.imagesUnchanged()) {
+    Out << Object;
+    event(M.getModuleIdentifier(), "leaf-hit");
+    return false;
+  }
+  bool Changed = Emit();
+  if (Out.str().size() < MaxOrigin)
+    Leaf.Object = Out.str().str();
+  return Changed;
+#else
+  return Emit();
+#endif
+}
+
 bool llvm::ohm::runDebugObjectCache(Module &M, CodeGenTargetMachineImpl &TM,
                                     raw_svector_ostream &Out,
                                     function_ref<bool()> Emit) {
 #if defined(__linux__) && defined(__x86_64__)
-  if (auto Origin = PendingEarly.lock(); Origin && Origin->Leaf &&
-      Origin->Input == &M && Origin->Leaf->Target == &TM &&
-      Out.str().empty()) {
-    bool Changed = Emit();
-    if (Out.str().size() < MaxOrigin)
-      Origin->Leaf->Object = Out.str().str();
-    return Changed;
-  }
   // This precedes all cache filesystem activity, including toolchain identity
   // reads and the creation of source or object directories.
   if (!Out.str().empty() ||
@@ -775,6 +796,12 @@ bool llvm::ohm::runDebugObjectCache(Module &M, CodeGenTargetMachineImpl &TM,
   if (I.Root.empty() || !I.imagesUnchanged() ||
       !ordinaryModule(M, I.WithoutDebug))
     return Emit();
+  // Recording the outer line certificate requires observing instruction
+  // selection and emission. Give this cache precedence over a leaf ticket.
+  if (auto Origin = PendingEarly.lock(); Origin && Origin->Input == &M &&
+                                         Origin->Leaf &&
+                                         Origin->Leaf->Target == &TM)
+    PendingEarly.reset();
   std::string Target = machineTarget(M, TM);
   if (I.WithoutDebug)
     return runExactObjectCache(M, I, Target, Out, Emit);
@@ -880,9 +907,12 @@ extern "C" int ohm_early_object_begin_v1(LLVMModuleRef Ref,
   if (!Handler || Handler->HasErrors || Handler->isAnyRemarkEnabled() ||
       C.getMainRemarkStreamer() || C.getLLVMRemarkStreamer())
     return 0;
-  if (!WithoutDebug)
-    return tryLeafObject(M, *reinterpret_cast<TargetMachine *>(TM), I,
-                         StringRef(Output, Length), Ticket);
+  if (!WithoutDebug) {
+    if (!ohm::canUseDebugObjectCache())
+      return 0;
+    startLeafObject(M, *reinterpret_cast<TargetMachine *>(TM), I, Ticket);
+    return 0;
+  }
   SmallVector<char, 128> State;
   if (!ohm::getOptimizerContextState(M, State)) {
     event(M.getModuleIdentifier(), "early-bypass", "unrepresented context");

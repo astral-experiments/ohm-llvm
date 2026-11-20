@@ -6,24 +6,29 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// Reassigning enum variants can renumber functions returning a discriminant.
-// Compare the complete optimizer input with just the returned literals masked.
-// Each changed return must occupy its own mov/ret section, with no aliases
-// or incoming code/data relocations.
+// Adding an enum variant can renumber functions that return discriminants.
+// After the IR transforms, project only ranges whose precise upper bound
+// is irrelevant to the remaining machine operations. Compare every other
+// operand, attribute, metadata and live use order in the machine input.
+// Require each changed return to occupy its own mov/ret section, with no
+// aliases or incoming code/data relocations.
 //
 //===----------------------------------------------------------------------===//
 
 #include "OhmLeafObject.h"
 #include "llvm/ADT/ScopeExit.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringMap.h"
-#include "llvm/Bitcode/ClosedModuleHash.h"
+#include "llvm/Bitcode/OhmDebugObjectSignature.h"
 #include "llvm/IR/ConstantRange.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/MDBuilder.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Object/ELF.h"
 #include "llvm/Support/BLAKE3.h"
 #include "llvm/Support/Endian.h"
+#include "llvm/Support/MathExtras.h"
 
 using namespace llvm;
 
@@ -47,6 +52,8 @@ Digest binding(StringRef Proof, StringRef Object) {
   return Hash.final();
 }
 
+// Keep narrow ranges and signed/wrapping ranges intact. Rounding from
+// [0, 974) to [0, 976) lets consecutive enum additions share a bound.
 bool isLargeTag(const APInt &Lower, const APInt &Upper) {
   return Upper.getBitWidth() == 16 && Lower.isZero() && Upper.ugt(256) &&
          Upper.isNonNegative();
@@ -91,6 +98,158 @@ std::optional<Leaf> isolatedLeaf(Function &F, const ConstantRange &Range) {
     return std::nullopt;
   return Leaf{Ret, V};
 }
+
+// The IR pipeline has finished. Allow a declaration's return range to
+// change only on a direct transfer to another opaque Rust call with the
+// same parameter range. In particular a comparison, switch, memory
+// address or returned parameter cannot observe the precise upper bound.
+bool isOpaqueCall(const CallBase &Call) {
+  auto *F = Call.getCalledFunction();
+  return F && F->isDeclaration() && F->getName().starts_with("_R") &&
+         !F->isVarArg() && !Call.hasOperandBundles() &&
+         !Call.getReturnedArgOperand() && !Call.onlyReadsMemory() &&
+         !Call.hasFnAttr(Attribute::AllocSize) &&
+         !Call.hasFnAttr(Attribute::AllocKind);
+}
+
+bool hasOnlyTagAttributes(AttributeSet Attrs) {
+  for (Attribute A : Attrs)
+    if (!A.hasAttribute(Attribute::NoUndef) &&
+        !A.hasAttribute(Attribute::Range))
+      return false;
+  return true;
+}
+
+bool transfersTag(const CallBase &Source, Attribute Tag) {
+  if (!isOpaqueCall(Source) || !Source.hasOneUse() ||
+      Source.isUsedByMetadata() || Source.getMetadata(LLVMContext::MD_range))
+    return false;
+  const Use &U = *Source.use_begin();
+  auto *Sink = dyn_cast<CallBase>(U.getUser());
+  if (!Sink || !isOpaqueCall(*Sink) || !Sink->isArgOperand(&U))
+    return false;
+  unsigned Arg = Sink->getArgOperandNo(&U);
+  auto Result = Source.getCalledFunction()->getAttributes().getRetAttrs();
+  auto Param = Sink->getCalledFunction()->getAttributes().getParamAttrs(Arg);
+  auto CallResult = Source.getAttributes().getRetAttrs();
+  auto CallArg = Sink->getAttributes().getParamAttrs(Arg);
+  return Result.getAttribute(Attribute::Range) == Tag &&
+         Param.getAttribute(Attribute::Range) == Tag &&
+         !CallResult.hasAttribute(Attribute::Range) &&
+         !CallArg.hasAttribute(Attribute::Range) &&
+         hasOnlyTagAttributes(Result) && hasOnlyTagAttributes(Param) &&
+         hasOnlyTagAttributes(CallResult) && hasOnlyTagAttributes(CallArg);
+}
+
+bool canProjectReturn(Function &F, Attribute Tag) {
+  if (!F.isDeclaration())
+    return isolatedLeaf(F, Tag.getValueAsConstantRange()).has_value();
+  if (F.isUsedByMetadata())
+    return false;
+  for (const Use &U : F.uses()) {
+    auto *Call = dyn_cast<CallBase>(U.getUser());
+    if (!Call || !Call->isCallee(&U) || !transfersTag(*Call, Tag))
+      return false;
+  }
+  return true;
+}
+
+bool canProjectArgument(Argument &A, Attribute Tag) {
+  Function &F = *A.getParent();
+  if (!F.isDeclaration() || F.isUsedByMetadata())
+    return false;
+  for (const Use &U : F.uses()) {
+    auto *Sink = dyn_cast<CallBase>(U.getUser());
+    if (!Sink || !Sink->isCallee(&U) || Sink->getCalledFunction() != &F)
+      return false;
+    auto *Source = dyn_cast<CallBase>(Sink->getArgOperand(A.getArgNo()));
+    if (!Source || !transfersTag(*Source, Tag))
+      return false;
+  }
+  return true;
+}
+
+// MemSDNode::refineRanges drops differing metadata when merging loads.
+// Preserve pointer equality relationships with other ranges, including
+// ranges DAGCombiner can synthesize when narrowing a wider load to i16.
+bool canProjectLoadsIn(const Function &F, uint16_t Upper, uint16_t Rounded) {
+  bool Found = false;
+  for (const auto &BB : F)
+    for (const auto &I : BB) {
+      const MDNode *MD = I.getMetadata(LLVMContext::MD_range);
+      if (!MD)
+        continue;
+      auto R = getConstantRangeFromMetadata(*MD);
+      if (R.getBitWidth() < 16)
+        continue;
+      if (R.getBitWidth() > 16)
+        R = R.truncate(16);
+      if (R.getLower().isZero() &&
+          (R.getUpper() == Upper || R.getUpper() == Rounded)) {
+        if (Found || !isa<MDTuple>(MD) || MD->isDistinct())
+          return false;
+        Found = true;
+      }
+    }
+  return Found;
+}
+
+// SelectionDAG uses an i16 load's range to compute known bits and sign
+// bits. Keep its active width. Also constrain every IR use, since alias
+// analysis can still query a GEP index during machine scheduling.
+// A low-bit mask must already admit every masked value, and a logical
+// right shift must produce the same interval. BasicAA stops its linear
+// decomposition at both operations.
+bool canProjectLoad(Instruction &I, uint16_t Upper, uint16_t Rounded) {
+  auto *L = dyn_cast<LoadInst>(&I);
+  if (!L || !L->isSimple() || !L->getType()->isIntegerTy(16) || Upper <= 256 ||
+      Rounded < Upper || Rounded > 32768 ||
+      Log2_32(Upper - 1) != Log2_32(Rounded - 1))
+    return false;
+  SmallVector<Value *, 4> Pending{L};
+  while (!Pending.empty()) {
+    auto *V = Pending.pop_back_val();
+    if (V->isUsedByMetadata())
+      return false;
+    for (User *U : V->users()) {
+      if (auto *Ext = dyn_cast<ZExtInst>(U)) {
+        Pending.push_back(Ext);
+        continue;
+      }
+      auto *Op = dyn_cast<BinaryOperator>(U);
+      if (!Op)
+        return false;
+      auto *RHS = dyn_cast<ConstantInt>(Op->getOperand(1));
+      if (!RHS)
+        return false;
+      const APInt &K = RHS->getValue();
+      if (Op->getOpcode() == Instruction::And && K.isMask() && K.ult(Upper))
+        continue;
+      if (Op->getOpcode() != Instruction::LShr || Op->isExact() || K.uge(16))
+        return false;
+      unsigned Shift = K.getZExtValue();
+      if (((Upper - 1) >> Shift) != ((Rounded - 1) >> Shift))
+        return false;
+    }
+  }
+  return canProjectLoadsIn(*I.getFunction(), Upper, Rounded);
+}
+
+bool hasTagRange(const MDNode *MD, uint16_t Upper) {
+  if (!MD || !isa<MDTuple>(MD) || MD->isDistinct() || MD->getNumOperands() != 2)
+    return false;
+  auto *Low = mdconst::dyn_extract<ConstantInt>(MD->getOperand(0));
+  auto *High = mdconst::dyn_extract<ConstantInt>(MD->getOperand(1));
+  return Low && High && Low->getType() == High->getType() &&
+         Low->getBitWidth() == 16 && Low->isZero() &&
+         High->getZExtValue() == Upper;
+}
+
+struct ProjectedFunction {
+  Function *F;
+  AttributeList Original;
+  AttributeList Rounded;
+};
 
 struct Change {
   uint16_t Before;
@@ -271,57 +430,123 @@ bool patchLiterals(std::string &Bytes, StringMap<Change> &Delta) {
 }
 } // namespace
 
+static bool needsStackProtection(const Function &F) {
+  return F.hasFnAttribute(Attribute::SafeStack) ||
+         F.hasFnAttribute(Attribute::StackProtect) ||
+         F.hasFnAttribute(Attribute::StackProtectReq) ||
+         F.hasFnAttribute(Attribute::StackProtectStrong);
+}
+
 bool ohm_leaf::candidate(const Module &M) {
   const Triple &T = M.getTargetTriple();
   return T.getArch() == Triple::x86_64 && T.isOSBinFormatELF() &&
          M.isMaterialized() && M.getModuleInlineAsm().empty() &&
          M.ifunc_empty() &&
-         any_of(M, [](const Function &F) { return tagRange(F).isValid(); });
+         any_of(M, [](const Function &F) { return tagRange(F).isValid(); }) &&
+         none_of(M, needsStackProtection);
 }
 
-std::string ohm_leaf::prepare(Module &M, StringRef Configuration,
-                              StringRef Previous) {
+std::string ohm_leaf::prepare(Module &M, StringRef Configuration) {
   if (Configuration.empty() || !candidate(M))
     return {};
+  Attribute Tag;
   SmallVector<Leaf> Leaves;
-  std::string Literals;
   for (auto &F : M) {
     auto Range = tagRange(F);
     if (!Range.isValid())
       continue;
-    auto Slot = isolatedLeaf(F, Range.getValueAsConstantRange());
-    if (!Slot)
-      continue;
-    Leaves.push_back(*Slot);
-    Literals += F.getName();
-    Literals.push_back(0);
-    char Value[2];
-    support::endian::write16le(Value, Slot->Value->getZExtValue());
-    Literals.append(Value, 2);
+    if (Tag.isValid() && Tag != Range)
+      return {};
+    Tag = Range;
+    if (auto Slot = isolatedLeaf(F, Tag.getValueAsConstantRange()))
+      Leaves.push_back(*Slot);
   }
-  // The previous witness starts with the object binding and input digest.
-  // This is a performance hint only. Reuse checks the complete witness.
-  if (Leaves.empty() ||
-      (Previous.size() >= 64 && Previous.drop_front(64) == Literals))
-    return {};
 
-  // Integer constants have no use list. Restoring a literal cannot change
-  // the use order of another value in the module.
+  const auto &Range = Tag.getValueAsConstantRange();
+  uint16_t Upper = Range.getUpper().getZExtValue();
+  APInt Rounded(16, alignTo(Upper, 16));
+
+  // Check the uses of the original declarations before adjusting them.
+  // One declaration can supply the argument to another in the same group.
+  auto &C = M.getContext();
+  SmallVector<ProjectedFunction> Functions;
+  SmallVector<std::pair<Instruction *, MDNode *>> Loads;
+  if (Rounded != Range.getUpper()) {
+    auto To = Attribute::get(C, Attribute::Range,
+                             ConstantRange(Range.getLower(), Rounded));
+    for (auto &F : M) {
+      AttributeList Attrs = F.getAttributes();
+      if (Attrs.getRetAttr(Attribute::Range) == Tag) {
+        if (!canProjectReturn(F, Tag))
+          return {};
+        Attrs = Attrs.removeRetAttribute(C, Attribute::Range)
+                    .addRetAttribute(C, To);
+      }
+      for (auto &Arg : F.args()) {
+        unsigned N = Arg.getArgNo();
+        if (Attrs.getParamAttr(N, Attribute::Range) != Tag)
+          continue;
+        if (!canProjectArgument(Arg, Tag))
+          return {};
+        Attrs = Attrs.removeParamAttribute(C, N, Attribute::Range)
+                    .addParamAttribute(C, N, To);
+      }
+      if (Attrs != F.getAttributes())
+        Functions.push_back({&F, F.getAttributes(), Attrs});
+      for (auto &BB : F)
+        for (auto &I : BB) {
+          if (!I.hasMetadataOtherThanDebugLoc())
+            continue;
+          auto *MD = I.getMetadata(LLVMContext::MD_range);
+          if (!hasTagRange(MD, Upper))
+            continue;
+          if (!canProjectLoad(I, Upper, Rounded.getZExtValue()))
+            return {};
+          Loads.emplace_back(&I, MD);
+        }
+    }
+  }
+
+  // The actual machine pipeline sees the same range bounds as the proof.
+  // Integer literals have no use list, so restoring them preserves use order.
+  for (const auto &Function : Functions)
+    Function.F->setAttributes(Function.Rounded);
+  if (!Loads.empty()) {
+    MDNode *MD = MDBuilder(C).createRange(Range.getLower(), Rounded);
+    for (const auto &Load : Loads)
+      Load.first->setMetadata(LLVMContext::MD_range, MD);
+  }
   for (auto &L : Leaves)
     L.Ret->setOperand(0, ConstantInt::get(L.Value->getType(), 0));
   auto Restore = scope_exit([&] {
     for (auto &L : Leaves)
       L.Ret->setOperand(0, L.Value);
   });
-
-  Digest Input;
-  if (!getClosedModuleHashV1(M, Input))
+  char *IR = nullptr;
+  size_t Size = 0;
+  if (!ohm_bc_save_v1(reinterpret_cast<LLVMModuleRef>(&M), &IR, &Size)) {
+    for (const auto &Load : Loads)
+      Load.first->setMetadata(LLVMContext::MD_range, Load.second);
+    for (const auto &Function : Functions)
+      Function.F->setAttributes(Function.Original);
     return {};
+  }
   BLAKE3 Hash;
-  Hash.update("ohm-literal-input-v1");
+  Hash.update("ohm-enum-isel-v1");
   Hash.update(digest(Configuration));
-  Hash.update(Input);
-  return bytes(Hash.final()).str() + Literals;
+  Hash.update(digest(M.getModuleIdentifier()));
+  Hash.update(StringRef(IR, Size));
+  ohm_bc_free_v1(IR);
+  std::string Proof = bytes(Hash.final()).str();
+  for (auto &L : Leaves) {
+    StringRef Name = L.Ret->getFunction()->getName();
+    Proof.append(Name.data(), Name.size());
+    Proof.push_back(0);
+    char Value[2];
+    support::endian::write16le(Value, L.Value->getZExtValue());
+    Proof.append(Value, 2);
+  }
+  return Proof;
 }
 
 std::string ohm_leaf::enroll(StringRef Proof, StringRef Object) {

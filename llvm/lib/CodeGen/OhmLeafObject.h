@@ -21,14 +21,12 @@ namespace ohm_leaf {
 /// Cheap preflight for modules returning large 16-bit discriminants.
 LLVM_ABI_FOR_TEST bool candidate(const Module &M);
 
-/// For an admitted ordinary, non-LTO x86-64 ELF compilation, identify the
-/// ordered IR and record the literal returned by each isolated leaf. The
-/// configuration must identify the compiler, target and codegen options.
-///
-/// Skip the input digest when Previous already has these literals. The
-/// ordinary object caches can handle edits that leave them alone.
-LLVM_ABI_FOR_TEST std::string prepare(Module &M, StringRef Configuration,
-                                      StringRef Previous = {});
+/// Fingerprint the IR immediately before ordinary x86-64 SelectionDAG
+/// codegen. Round the bounds on selected 16-bit tags in the live module.
+/// The returned proof is valid for emission with those bounds. Record the
+/// literal returned by each isolated leaf separately. Configuration binds
+/// the compiler, target and options.
+LLVM_ABI_FOR_TEST std::string prepare(Module &M, StringRef Configuration);
 
 /// Bind the proof to the actual object from that compilation. The caller
 /// must ensure compilation succeeded with no diagnostics and store the two

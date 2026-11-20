@@ -20,6 +20,7 @@
 #include "llvm/CodeGen/MachineModuleInfo.h"
 #include "llvm/CodeGen/Passes.h"
 #include "llvm/CodeGen/TargetPassConfig.h"
+#include "llvm/IR/LegacyModuleSuffix.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/MC/MCAsmBackend.h"
 #include "llvm/MC/MCAsmInfo.h"
@@ -245,6 +246,13 @@ bool CodeGenTargetMachineImpl::addPassesToEmitFile(
       Out.tell() == 0 && TargetPassConfig::willCompleteCodeGenPipeline() &&
       ohm::canUseDebugObjectCache();
   auto Build = [&] {
+    if (CanReuse && ohm::hasPendingLeaf(*this))
+      legacy::requestWrappedModuleSuffix(
+          PM, [this, &Out](Module &M, function_ref<bool()> Emit) {
+            return ohm::runLeafObjectCache(
+                M, *this, static_cast<raw_svector_ostream &>(Out), Emit);
+          });
+
     // Add common CodeGen passes.
     if (!MMIWP)
       MMIWP = new MachineModuleInfoWrapperPass(this);

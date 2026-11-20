@@ -54,28 +54,137 @@ std::unique_ptr<Module> rules(LLVMContext &C, unsigned Literal,
   return M;
 }
 
-TEST(OhmLeafInput, KeepsPreciseRangesAndRestoresTheLiteral) {
+TEST(OhmLeafInput, RoundsRangesOnTheActualDonorAndRestoresTheLiteral) {
   LLVMContext C;
   auto M = rules(C, 501);
   EXPECT_TRUE(ohm_leaf::candidate(*M));
   EXPECT_FALSE(ohm_leaf::prepare(*M, "session").empty());
   auto *F = M->getFunction(Name);
   auto Attr = F->getAttributes().getRetAttrs().getAttribute(Attribute::Range);
-  EXPECT_EQ(Attr.getValueAsConstantRange().getUpper(), APInt(16, 974));
+  EXPECT_EQ(Attr.getValueAsConstantRange().getUpper(), APInt(16, 976));
   auto *Ret = cast<ReturnInst>(&F->getEntryBlock().front());
   EXPECT_EQ(cast<ConstantInt>(Ret->getReturnValue())->getZExtValue(), 501u);
 }
 
-TEST(OhmLeafInput, RefusesAnUnclosedContext) {
+TEST(OhmLeafInput, PreservesOtherRangesAndDeclinesAmbiguousTagSizes) {
+  for (bool RustSymbol : {false, true}) {
+    LLVMContext C;
+    auto M = rules(C, 501);
+    auto *Other = M->getFunction(Sibling);
+    if (!RustSymbol)
+      Other->setName("other");
+    auto Range = Attribute::get(C, Attribute::Range,
+                                ConstantRange(APInt(16, 0), APInt(16, 701)));
+    Other->removeRetAttr(Attribute::Range);
+    Other->addRetAttr(Range);
+    EXPECT_EQ(ohm_leaf::prepare(*M, "session").empty(), RustSymbol);
+    EXPECT_EQ(
+        Other->getAttributes().getRetAttrs().getAttribute(Attribute::Range),
+        Range);
+  }
+}
+
+TEST(OhmLeafInput, RejectsStackProtection) {
+  for (auto Attr :
+       {Attribute::SafeStack, Attribute::StackProtect,
+        Attribute::StackProtectStrong, Attribute::StackProtectReq}) {
+    LLVMContext C;
+    auto M = rules(C, 501);
+    M->getFunction(Sibling)->addFnAttr(Attr);
+    EXPECT_TRUE(ohm_leaf::prepare(*M, "session").empty());
+  }
+}
+
+enum class Transfer { Direct, Compared, Returned, CallSiteRange };
+
+std::string transferKey(unsigned Upper, Transfer Kind) {
   LLVMContext C;
-  auto M = rules(C, 501);
-  Module Unrelated("another", C);
-  EXPECT_TRUE(ohm_leaf::prepare(*M, "session").empty());
-  auto *F = M->getFunction(Name);
-  auto Attr = F->getAttributes().getRetAttrs().getAttribute(Attribute::Range);
-  EXPECT_EQ(Attr.getValueAsConstantRange().getUpper(), APInt(16, 974));
-  auto *Ret = cast<ReturnInst>(&F->getEntryBlock().front());
-  EXPECT_EQ(cast<ConstantInt>(Ret->getReturnValue())->getZExtValue(), 501u);
+  auto M = rules(C, 501, Upper);
+  IRBuilder<> B(C);
+  auto *Ty = B.getInt16Ty();
+  auto *Source = Function::Create(FunctionType::get(Ty, false),
+                                  GlobalValue::ExternalLinkage, "_Rsource", *M);
+  auto *Sink = Function::Create(FunctionType::get(Ty, {Ty}, false),
+                                GlobalValue::ExternalLinkage, "_Rsink", *M);
+  Attribute Tag =
+      M->getFunction(Name)->getAttributes().getRetAttr(Attribute::Range);
+  Source->addRetAttr(Tag);
+  Sink->addParamAttr(0, Tag);
+  if (Kind == Transfer::Returned)
+    Sink->addParamAttr(0, Attribute::Returned);
+  auto *Caller = Function::Create(FunctionType::get(B.getInt1Ty(), false),
+                                  GlobalValue::ExternalLinkage, "caller", *M);
+  B.SetInsertPoint(BasicBlock::Create(C, "entry", Caller));
+  auto *Value = B.CreateCall(Source);
+  if (Kind == Transfer::CallSiteRange)
+    Value->addRetAttr(Attribute::get(
+        C, Attribute::Range, ConstantRange(APInt(16, 0), APInt(16, 974))));
+  auto *Result = B.CreateCall(Sink, {Value});
+  B.CreateRet(B.CreateICmpUGE(Kind == Transfer::Compared ? Value : Result,
+                              B.getInt16(974)));
+  return ohm_leaf::prepare(*M, "session");
+}
+
+TEST(OhmLeafInput, ProjectsOnlyOpaqueTagTransfers) {
+  std::string Key = transferKey(974, Transfer::Direct);
+  ASSERT_FALSE(Key.empty());
+  EXPECT_EQ(Key, transferKey(975, Transfer::Direct));
+  for (auto Kind :
+       {Transfer::Compared, Transfer::Returned, Transfer::CallSiteRange})
+    EXPECT_TRUE(transferKey(974, Kind).empty());
+}
+
+enum class LoadUse {
+  MaskAndShift,
+  Compared,
+  WiderMask,
+  SmallerShift,
+  Collision
+};
+
+std::string loadKey(unsigned Upper, LoadUse Kind) {
+  LLVMContext C;
+  auto M = rules(C, 501, Upper);
+  IRBuilder<> B(C);
+  auto *F =
+      Function::Create(FunctionType::get(B.getInt64Ty(), {B.getPtrTy()}, false),
+                       GlobalValue::ExternalLinkage, "reader", *M);
+  B.SetInsertPoint(BasicBlock::Create(C, "entry", F));
+  auto Load = [&](IntegerType *Ty, unsigned Bound) {
+    auto *V = B.CreateLoad(Ty, F->getArg(0));
+    auto *Range =
+        MDTuple::get(C, {ConstantAsMetadata::get(ConstantInt::get(Ty, 0)),
+                         ConstantAsMetadata::get(ConstantInt::get(Ty, Bound))});
+    V->setMetadata(LLVMContext::MD_range, Range);
+    return V;
+  };
+  Value *V = B.CreateZExt(Load(B.getInt16Ty(), Upper), B.getInt64Ty());
+  Value *Word = B.CreateLShr(V, Kind == LoadUse::SmallerShift ? 1 : 6);
+  Value *Bit = B.CreateAnd(V, Kind == LoadUse::WiderMask ? 1023 : 63);
+  Value *Result = B.CreateOr(Word, Bit);
+  if (Kind == LoadUse::Compared)
+    Result = B.CreateSelect(B.CreateICmpUGE(V, B.getInt64(974)), B.getInt64(0),
+                            Result);
+  if (Kind == LoadUse::Collision)
+    Result = B.CreateOr(
+        Result, B.CreateZExt(Load(B.getInt32Ty(), 976), B.getInt64Ty()));
+  B.CreateRet(Result);
+  return ohm_leaf::prepare(*M, "session");
+}
+
+TEST(OhmLeafInput, ProjectsOnlyLoadsWithEquivalentMasksAndShifts) {
+  std::string Key = loadKey(974, LoadUse::MaskAndShift);
+  ASSERT_FALSE(Key.empty());
+  EXPECT_EQ(Key, loadKey(975, LoadUse::MaskAndShift));
+  for (auto Kind :
+       {LoadUse::Compared, LoadUse::WiderMask, LoadUse::SmallerShift})
+    EXPECT_TRUE(loadKey(974, Kind).empty());
+}
+
+TEST(OhmLeafInput, KeepsRangesDistinguishableWhenNarrowingLoads) {
+  // SelectionDAG can truncate [0, 976) on the i32 load to i16. Preserve
+  // the distinct range of the first load when memory nodes are merged.
+  EXPECT_TRUE(loadKey(974, LoadUse::Collision).empty());
 }
 
 TEST(OhmLeafInput, RefusesOtherTargetsAndSmallTags) {
@@ -129,7 +238,7 @@ TEST_F(OhmLeafObject, MatchesAFreshObjectAfterOneOfTwoEqualReturnsChanges) {
   auto Witness = ohm_leaf::enroll(First, Donor);
   ASSERT_FALSE(Witness.empty());
 
-  auto M = rules(Current, 502);
+  auto M = rules(Current, 502, 975);
   auto Proof = ohm_leaf::prepare(*M, "session");
   auto Actual = ohm_leaf::tryReuse(Proof, Witness, Donor);
   ASSERT_FALSE(Actual.empty());
@@ -143,12 +252,12 @@ TEST_F(OhmLeafObject, RejectsMergedFunctions) {
   // immediate would affect both functions.
   LLVMContext Old, Current;
   auto Before = rules(Old, 501);
-  auto After = rules(Current, 502);
+  auto After = rules(Current, 502, 975);
   auto First = ohm_leaf::prepare(*Before, "session");
   auto Proof = ohm_leaf::prepare(*After, "session");
   for (auto Kind : {Other::Forward, Other::Alias}) {
     LLVMContext Folded;
-    auto Equivalent = rules(Folded, 501, 974, Kind);
+    auto Equivalent = rules(Folded, 501, 976, Kind);
     auto Donor = emit(*Equivalent);
     auto Witness = ohm_leaf::enroll(First, Donor);
     ASSERT_FALSE(Witness.empty());
@@ -163,16 +272,14 @@ TEST_F(OhmLeafObject, RejectsOtherInputsAndCorruptObjects) {
   auto Donor = emit(*Before);
   auto Witness = ohm_leaf::enroll(First, Donor);
   ASSERT_FALSE(Witness.empty());
-  auto M = rules(Current, 502);
+  auto M = rules(Current, 502, 975);
   auto OtherSession = ohm_leaf::prepare(*M, "other");
   EXPECT_TRUE(ohm_leaf::tryReuse(OtherSession, Witness, Donor).empty());
 
-  EXPECT_TRUE(ohm_leaf::prepare(*Before, "session", Witness).empty());
-
   LLVMContext Wider;
-  auto Wide = rules(Wider, 502, 975);
-  auto DifferentBound = ohm_leaf::prepare(*Wide, "session");
-  EXPECT_TRUE(ohm_leaf::tryReuse(DifferentBound, Witness, Donor).empty());
+  auto Wide = rules(Wider, 502, 977);
+  auto OtherBucket = ohm_leaf::prepare(*Wide, "session");
+  EXPECT_TRUE(ohm_leaf::tryReuse(OtherBucket, Witness, Donor).empty());
 
   auto Proof = ohm_leaf::prepare(*M, "session");
   ASSERT_FALSE(ohm_leaf::tryReuse(Proof, Witness, Donor).empty());
