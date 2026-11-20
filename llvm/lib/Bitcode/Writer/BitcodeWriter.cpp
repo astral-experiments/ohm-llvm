@@ -266,7 +266,8 @@ public:
 
 protected:
   void writePerModuleGlobalValueSummary();
-  void writeGUIDList();
+  void writeGUIDList(
+      function_ref<StringRef(const Function &)> DeclarationName = nullptr);
 
 private:
   void writePerModuleFunctionSummaryRecord(
@@ -306,6 +307,7 @@ private:
 /// Class to manage the bitcode writing for a module.
 class ModuleBitcodeWriter : public ModuleBitcodeWriterBase {
   DwarfLineCertificate *LineCertificate;
+  function_ref<StringRef(const Function &)> DeclarationName;
   /// True if a module hash record should be written.
   bool GenerateHash;
 
@@ -321,16 +323,18 @@ class ModuleBitcodeWriter : public ModuleBitcodeWriterBase {
 public:
   /// Constructs a ModuleBitcodeWriter object for the given Module,
   /// writing to the provided \p Buffer.
-  ModuleBitcodeWriter(const Module &M, StringTableBuilder &StrtabBuilder,
-                      BitstreamWriter &Stream, bool ShouldPreserveUseListOrder,
-                      const ModuleSummaryIndex *Index, bool GenerateHash,
-                      ModuleHash *ModHash = nullptr,
-                      DebugObjectSourceMap *SourceMap = nullptr,
-                      MachineUseState *Uses = nullptr,
-                      DwarfLineCertificate *LineCertificate = nullptr)
+  ModuleBitcodeWriter(
+      const Module &M, StringTableBuilder &StrtabBuilder,
+      BitstreamWriter &Stream, bool ShouldPreserveUseListOrder,
+      const ModuleSummaryIndex *Index, bool GenerateHash,
+      ModuleHash *ModHash = nullptr, DebugObjectSourceMap *SourceMap = nullptr,
+      MachineUseState *Uses = nullptr,
+      DwarfLineCertificate *LineCertificate = nullptr,
+      function_ref<StringRef(const Function &)> DeclarationName = nullptr)
       : ModuleBitcodeWriterBase(M, StrtabBuilder, Stream,
                                 ShouldPreserveUseListOrder, Index, Uses),
-        LineCertificate(LineCertificate), GenerateHash(GenerateHash), ModHash(ModHash),
+        LineCertificate(LineCertificate), DeclarationName(DeclarationName),
+        GenerateHash(GenerateHash), ModHash(ModHash),
         BitcodeStartBit(Stream.GetCurrentBitNo()) {
     assert(!(SourceMap && LineCertificate));
     VE.setSourceMap(SourceMap);
@@ -1680,7 +1684,7 @@ void ModuleBitcodeWriter::writeModuleInfo() {
     Vals.clear();
   }
 
-  writeGUIDList();
+  writeGUIDList(DeclarationName);
 
   // Emit the global variable information.
   for (const GlobalVariable &GV : M.globals()) {
@@ -1740,8 +1744,10 @@ void ModuleBitcodeWriter::writeModuleInfo() {
     //             unnamed_addr, prologuedata, dllstorageclass, comdat,
     //             prefixdata, personalityfn, DSO_Local, addrspace,
     //             partition_strtab, partition_size, prefalign]
-    Vals.push_back(addToStrtab(F.getName()));
-    Vals.push_back(F.getName().size());
+    StringRef Name =
+        DeclarationName && F.isDeclaration() ? DeclarationName(F) : F.getName();
+    Vals.push_back(addToStrtab(Name));
+    Vals.push_back(Name.size());
     Vals.push_back(VE.getTypeID(F.getFunctionType()));
     Vals.push_back(F.getCallingConv());
     Vals.push_back(F.isDeclaration());
@@ -5038,7 +5044,8 @@ void ModuleBitcodeWriterBase::writePerModuleGlobalValueSummary() {
   Stream.ExitBlock();
 }
 
-void ModuleBitcodeWriterBase::writeGUIDList() {
+void ModuleBitcodeWriterBase::writeGUIDList(
+    function_ref<StringRef(const Function &)> DeclarationName) {
   const ValueEnumerator::ValueList &Vals = VE.getValues();
   const size_t Max = Vals.size();
 
@@ -5048,6 +5055,14 @@ void ModuleBitcodeWriterBase::writeGUIDList() {
     if (!MaybeGUID)
       continue;
     auto GUID = *MaybeGUID;
+    // Non-local declarations without explicit GUID metadata derive the
+    // serialized GUID from the same spelling as their module record.
+    if (DeclarationName && !GV.hasLocalLinkage())
+      if (auto *F = dyn_cast<Function>(&GV); F && F->isDeclaration()) {
+        StringRef Name = DeclarationName(*F);
+        if (Name != F->getName() && !F->hasMetadata())
+          GUID = GlobalValue::getGUIDAssumingExternalLinkage(Name);
+      }
 
     const auto ValueID = VE.getValueID(&GV);
     GUIDs[ValueID] = GUID;
@@ -5726,12 +5741,11 @@ void BitcodeWriter::writeModule(const Module &M,
                   nullptr);
 }
 
-void BitcodeWriter::writeModuleImpl(const Module &M,
-                                    bool ShouldPreserveUseListOrder,
-                                    const ModuleSummaryIndex *Index,
-                                    bool GenerateHash, ModuleHash *ModHash,
-                                    DebugObjectSourceMap *SourceMap,
-                                    MachineUseState *Uses) {
+void BitcodeWriter::writeModuleImpl(
+    const Module &M, bool ShouldPreserveUseListOrder,
+    const ModuleSummaryIndex *Index, bool GenerateHash, ModuleHash *ModHash,
+    DebugObjectSourceMap *SourceMap, MachineUseState *Uses,
+    function_ref<StringRef(const Function &)> DeclarationName) {
   assert(!WroteStrtab);
 
   // The Mods vector is used by irsymtab::build, which requires non-const
@@ -5741,17 +5755,18 @@ void BitcodeWriter::writeModuleImpl(const Module &M,
   assert(M.isMaterialized());
   Mods.push_back(const_cast<Module *>(&M));
 
-  ModuleBitcodeWriter ModuleWriter(M, StrtabBuilder, *Stream,
-                                   ShouldPreserveUseListOrder, Index,
-                                   GenerateHash, ModHash, SourceMap, Uses);
+  ModuleBitcodeWriter ModuleWriter(
+      M, StrtabBuilder, *Stream, ShouldPreserveUseListOrder, Index,
+      GenerateHash, ModHash, SourceMap, Uses, nullptr, DeclarationName);
   if (!Uses || Uses->Complete)
     ModuleWriter.write();
 }
 
-bool llvm::writeDebugObjectBitcode(const Module &M,
-                                   SmallVectorImpl<char> &Buffer,
-                                   DebugObjectSourceMap *Map,
-                                   bool AllowMachineOnlyUses) {
+namespace llvm {
+bool writeDebugObjectBitcode(
+    const Module &M, SmallVectorImpl<char> &Buffer, DebugObjectSourceMap *Map,
+    bool AllowMachineOnlyUses,
+    function_ref<StringRef(const Function &)> DeclarationName) {
   // Use-list ordering can affect machine-code generation. If the process
   // explicitly forbids writing it, this compilation cannot supply a key.
   if (!M.isMaterialized() || !M.getTargetTriple().isOSBinFormatELF() ||
@@ -5762,8 +5777,12 @@ bool llvm::writeDebugObjectBitcode(const Module &M,
   BitcodeWriter Writer(Buffer);
   MachineUseState Uses;
   Uses.OptimizerInput = !AllowMachineOnlyUses;
-  Writer.writeModuleImpl(M, true, nullptr, false, nullptr, Map, &Uses);
-  Writer.writeSymtab();
+  Writer.writeModuleImpl(M, true, nullptr, false, nullptr, Map, &Uses,
+                         DeclarationName);
+  // The derived IR symbol index contains original names. All information
+  // used to build it is already in the module records.
+  if (!DeclarationName)
+    Writer.writeSymtab();
   Writer.writeStrtab();
   if (!Uses.Complete || (Map && !Map->Valid))
     return false;
@@ -5781,6 +5800,21 @@ bool llvm::writeDebugObjectBitcode(const Module &M,
     Writer.Stream->ExitBlock();
   }
   return true;
+}
+
+} // namespace llvm
+
+bool llvm::writeDebugObjectBitcode(const Module &M,
+                                   SmallVectorImpl<char> &Buffer,
+                                   DebugObjectSourceMap *Map,
+                                   bool AllowMachineOnlyUses) {
+  return writeDebugObjectBitcode(M, Buffer, Map, AllowMachineOnlyUses, {});
+}
+
+bool llvm::writeClosedOptimizerInput(
+    const Module &M, SmallVectorImpl<char> &Buffer,
+    function_ref<StringRef(const Function &)> DeclarationName) {
+  return writeDebugObjectBitcode(M, Buffer, nullptr, false, DeclarationName);
 }
 
 bool llvm::writeClosedOptimizerInput(const Module &M,

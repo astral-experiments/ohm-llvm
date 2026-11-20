@@ -32,11 +32,13 @@ struct DebugObjectSourceMap;
 struct MachineUseState;
 
 class BitcodeWriter {
-  friend bool writeDebugObjectBitcode(const Module &, SmallVectorImpl<char> &,
-                                      DebugObjectSourceMap *, bool);
-  void writeModuleImpl(const Module &, bool, const ModuleSummaryIndex *, bool,
-                       ModuleHash *, DebugObjectSourceMap *,
-                       MachineUseState *Uses = nullptr);
+  friend bool writeDebugObjectBitcode(
+      const Module &, SmallVectorImpl<char> &, DebugObjectSourceMap *, bool,
+      function_ref<StringRef(const Function &)> DeclarationName);
+  void writeModuleImpl(
+      const Module &, bool, const ModuleSummaryIndex *, bool, ModuleHash *,
+      DebugObjectSourceMap *, MachineUseState *Uses = nullptr,
+      function_ref<StringRef(const Function &)> DeclarationName = nullptr);
 
   friend bool writeClosedDwarfLineCertificateV1(const Module &, raw_ostream &);
 
@@ -151,6 +153,12 @@ LLVM_ABI void WriteBitcodeToFile(const Module &M, raw_ostream &Out,
 /// users outside ordinary bitcode require normal optimization.
 LLVM_ABI bool writeClosedOptimizerInput(const Module &M,
                                         SmallVectorImpl<char> &Buffer);
+
+/// Produce a private signature with a projected name for function declarations.
+/// Definitions, uses, metadata and ordinary bitcode remain fully spelled.
+LLVM_ABI bool writeClosedOptimizerInput(
+    const Module &M, SmallVectorImpl<char> &Buffer,
+    function_ref<StringRef(const Function &)> DeclarationName);
 
 /// Write the specified thin link bitcode file (i.e., the minimized bitcode
 /// file) to the given raw output stream, where it will be written in a new

@@ -7,6 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "OhmDebugObjectCache.h"
+#include "OhmTraitImports.h"
 #include "llvm-c/Core.h"
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/SmallVector.h"
@@ -18,6 +19,7 @@
 #include "llvm/CodeGen/OhmEarlyObjectCache.h"
 #include "llvm/CodeGen/OhmLineCertificate.h"
 #include "llvm/DebugInfo/DWARF/OhmRuntimeLocations.h"
+#include "llvm/IR/ClosedOptimizerContext.h"
 #include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/IR/DiagnosticObservation.h"
 #include "llvm/IR/Instructions.h"
@@ -241,7 +243,7 @@ struct Invocation {
   bool imagesUnchanged() const {
     return Generation && Generation == ohm::getDebugObjectImageGeneration();
   }
-  Invocation() {
+  explicit Invocation(bool ForTraitImports = false) {
     if (std::getenv("OHM_DISABLE_DEBUG_OBJECT_CACHE"))
       return;
     auto Cmd = MemoryBuffer::getFileAsStream("/proc/self/cmdline");
@@ -258,6 +260,10 @@ struct Invocation {
     bool Strip = false;
     for (size_t I = 1; I < Args.size(); ++I) {
       StringRef A = Args[I], Key, V;
+      // Cargo requests this rustc lint for workspace libraries. It runs
+      // before LLVM, and the complete argument still binds the donor.
+      if (ForTraitImports && A == "--force-warn=unused_crate_dependencies")
+        continue;
       if (A.starts_with("--")) {
         std::tie(Key, V) = A.split('=');
         if (!contains({"--crate-name", "--crate-type", "--edition", "--emit",
@@ -407,7 +413,11 @@ struct Invocation {
     Root = std::move(Base);
   }
 };
-Invocation &invocation() {
+Invocation &invocation(bool ForTraitImports = false) {
+  if (ForTraitImports) {
+    static Invocation Trait(/*ForTraitImports=*/true);
+    return Trait;
+  }
   static Invocation I;
   return I;
 }
@@ -576,8 +586,23 @@ std::string exactObjectKey(Module &M, const Invocation &I, StringRef Target) {
   return toHex(H.final(), true);
 }
 
-StringRef exactObjectPayload(StringRef Record, StringRef Key) {
-  if (!Record.consume_front("OHMOBJ01") || Record.size() < 64)
+constexpr StringLiteral ExactMagic("OHMOBJ01");
+
+bool saveCheckedObject(StringRef Path, StringRef Key, StringRef Object,
+                       StringRef Header = ExactMagic) {
+  if (Object.size() > MaxOrigin - Header.size() - 64 ||
+      !Object.starts_with("\x7f"
+                          "ELF"))
+    return false;
+  BLAKE3 H;
+  frame(H, Key);
+  frame(H, Object);
+  auto Sum = toHex(H.final(), true);
+  return writeAtomic(Path, {Header, Sum, Object});
+}
+StringRef exactObjectPayload(StringRef Record, StringRef Key,
+                             StringRef Header = ExactMagic) {
+  if (!Record.consume_front(Header) || Record.size() < 64)
     return {};
   auto Stored = Record.take_front(64);
   auto Payload = Record.drop_front(64);
@@ -597,7 +622,13 @@ std::string machineTarget(const Module &M, const TargetMachine &TM) {
          std::to_string(unsigned(TM.getCodeModel())) + "|" +
          M.getDataLayoutStr();
 }
+struct TraitOrigin {
+  const TargetMachine *TM;
+  SmallVector<char, 0> Imports;
+  std::string Object;
+};
 struct EarlyOrigin {
+  std::unique_ptr<TraitOrigin> Trait;
   Module *Input;
   std::string Key;
   std::string MachineKey;
@@ -606,6 +637,70 @@ struct EarlyOrigin {
       : Input(&M), Key(std::move(K)), Diagnostics(M.getContext()) {}
 };
 thread_local std::weak_ptr<EarlyOrigin> PendingEarly;
+constexpr StringLiteral TraitMagic("OHMTRAI1");
+
+// The checked payload contains the original ELF, followed by the ordered
+// import spellings and their length. Only deliver the ELF after rebinding.
+bool splitTraitRecord(StringRef Payload, StringRef &Object,
+                      StringRef &Imports) {
+  if (Payload.size() < 8)
+    return false;
+  uint64_t Size = support::endian::read64le(Payload.take_back(8).data());
+  Payload = Payload.drop_back(8);
+  if (!Size || Size >= Payload.size())
+    return false;
+  Imports = Payload.take_back(Size);
+  Object = Payload.drop_back(Size);
+  return true;
+}
+
+// An imported Rust default method can move to a different crate when the
+// upstream user that first instantiated it disappears. Preserve the entire
+// checked input including debug info, substituting each eligible method path
+// for its provider-qualified spelling in the private signature only.
+bool tryTraitObject(Module &M, TargetMachine &TM, const Invocation &I,
+                    StringRef Output, void **Ticket) {
+  if (TM.getOptLevel() != CodeGenOptLevel::Less)
+    return false;
+  auto Trait = std::make_unique<TraitOrigin>();
+  Trait->TM = &TM;
+  SmallVector<char, 0> Input;
+  std::array<uint8_t, 32> Context;
+  if (!ohm::writeTraitImportSignature(M, Input, Trait->Imports) ||
+      Trait->Imports.size() >= MaxOrigin ||
+      !getClosedOptimizerContextV1(M, Context))
+    return false;
+  BLAKE3 H;
+  frame(H, TraitMagic);
+  frame(H, I.Namespace);
+  frame(H, machineTarget(M, TM));
+  frame(H, M.getModuleIdentifier());
+  frame(H, StringRef(Input.data(), Input.size()));
+  H.update(Context);
+  auto Key = toHex(H.final(), true);
+  StringRef Current(Trait->Imports.data(), Trait->Imports.size());
+  auto Saved = readPrivate(joinPath(I.Entries, "llvmcache-" + Key), MaxOrigin);
+  StringRef ObjectBytes, Manifest;
+  if (Saved &&
+      splitTraitRecord(exactObjectPayload(Saved->getBuffer(), Key, TraitMagic),
+                       ObjectBytes, Manifest)) {
+    if (Current == Manifest)
+      return false;
+    SmallVector<char, 0> Object;
+    if (ohm::rebindTraitImports(ObjectBytes, Manifest, Current, Object) &&
+        I.imagesUnchanged() &&
+        writeAtomic(Output, {StringRef(Object.data(), Object.size())}, 0666)) {
+      event(M.getModuleIdentifier(), "trait-import-hit");
+      return true;
+    }
+  }
+  auto Origin = std::make_shared<EarlyOrigin>(M, std::move(Key));
+  Origin->Trait = std::move(Trait);
+  PendingEarly = Origin;
+  *Ticket = new std::shared_ptr<EarlyOrigin>(std::move(Origin));
+  return false;
+}
+
 void observedMachineObject(Module &M, StringRef Key) {
   if (auto Origin = PendingEarly.lock(); Origin && Origin->Input == &M)
     Origin->MachineKey = Key.str();
@@ -630,13 +725,6 @@ bool runExactObjectCache(Module &M, const Invocation &I, StringRef Target,
   if (Key.empty())
     return Emit();
   std::string Path = joinPath(I.Entries, "llvmcache-" + Key);
-  constexpr StringLiteral Header("OHMOBJ01");
-  auto Checksum = [&](StringRef Object) {
-    BLAKE3 Digest;
-    frame(Digest, Key);
-    frame(Digest, Object);
-    return toHex(Digest.final(), true);
-  };
   if (auto Saved = readPrivate(Path, MaxOrigin)) {
     StringRef Object = exactObjectPayload(Saved->getBuffer(), Key);
     if (!Object.empty() && I.imagesUnchanged()) {
@@ -654,14 +742,9 @@ bool runExactObjectCache(Module &M, const Invocation &I, StringRef Target,
     event(M.getModuleIdentifier(), "bypass", "machine diagnostics");
     return Changed;
   }
-  if (Object.starts_with("\x7f"
-                         "ELF") &&
-      Object.size() <= MaxOrigin - Header.size() - 64 && I.imagesUnchanged()) {
-    std::string Sum = Checksum(Object);
-    if (writeAtomic(Path, {Header, Sum, Object})) {
-      observedMachineObject(M, Key);
-      event(M.getModuleIdentifier(), "committed", "exact machine input");
-    }
+  if (I.imagesUnchanged() && saveCheckedObject(Path, Key, Object)) {
+    observedMachineObject(M, Key);
+    event(M.getModuleIdentifier(), "committed", "exact machine input");
   }
   return Changed;
 }
@@ -688,6 +771,20 @@ bool llvm::ohm::runDebugObjectCache(Module &M, CodeGenTargetMachineImpl &TM,
                                     raw_svector_ostream &Out,
                                     function_ref<bool()> Emit) {
 #if defined(__linux__) && defined(__x86_64__)
+  // Bind the donor to the bytes produced for this live module, before the
+  // caller writes its object file. Finish the record only on rustc success.
+  auto Pending = PendingEarly.lock();
+  TraitOrigin *Trait = nullptr;
+  if (Pending && Pending->Input == &M && Pending->Trait &&
+      Pending->Trait->TM == &TM && Out.str().empty()) {
+    Trait = Pending->Trait.get();
+    PendingEarly.reset();
+  }
+  auto Capture = scope_exit([&] {
+    if (Trait && Out.str().size() <= MaxOrigin - Trait->Imports.size())
+      Trait->Object = Out.str().str();
+  });
+
   // This precedes all cache filesystem activity, including toolchain identity
   // reads and the creation of source or object directories.
   if (!Out.str().empty() ||
@@ -717,9 +814,9 @@ bool llvm::ohm::runDebugObjectCache(Module &M, CodeGenTargetMachineImpl &TM,
       Prior ? Prior->Object.data() : nullptr, Prior ? Prior->Object.size() : 0,
       &Sources.Value, &Map.Value, &Proof.Value, &Why);
   if (Prior && Status == 0 && !Map.bytes().empty() && !Proof.bytes().empty() &&
-      ohm_line_certificate_check_v1(Prior->Certificate.data(),
-                                    Prior->Certificate.size(),
-                                    Map.bytes().data(), Map.bytes().size()) == 0) {
+      ohm_line_certificate_check_v1(
+          Prior->Certificate.data(), Prior->Certificate.size(),
+          Map.bytes().data(), Map.bytes().size()) == 0) {
     Buffer Rebased;
     struct ObjectProjection {
       StringRef Map;
@@ -741,12 +838,13 @@ bool llvm::ohm::runDebugObjectCache(Module &M, CodeGenTargetMachineImpl &TM,
         Map.bytes().data(), Map.bytes().size(), Proof.bytes().data(),
         Proof.bytes().size(), CheckLocations, &Projection);
     if ((Match == 2 ||
-         (Match == 1 && ohm_debug_rebase_v1(
-                            Map.bytes().data(), Map.bytes().size(),
-                            Prior->Object.data(), Prior->Object.size(),
-                            &Rebased.Value, &Why) == 0)) &&
+         (Match == 1 &&
+          ohm_debug_rebase_v1(Map.bytes().data(), Map.bytes().size(),
+                              Prior->Object.data(), Prior->Object.size(),
+                              &Rebased.Value, &Why) == 0)) &&
         Rebased.bytes().starts_with("\x7f"
-                                    "ELF") && I.imagesUnchanged()) {
+                                    "ELF") &&
+        I.imagesUnchanged()) {
       Out << Rebased.bytes();
       event(M.getModuleIdentifier(), "hit");
       return false;
@@ -790,15 +888,19 @@ extern "C" int ohm_early_object_begin_v1(LLVMModuleRef Ref,
       std::getenv("OHM_DISABLE_EARLY_OBJECT_CACHE") ||
       !ohm::isLargeDebugObjectInput(M, true))
     return 0;
-  const auto &I = invocation();
-  if (I.Root.empty() || !I.WithoutDebug || !I.imagesUnchanged() ||
-      !ordinaryModule(M, true))
+  const bool ForTraitImports = M.getNamedMetadata("llvm.dbg.cu");
+  const auto &I = invocation(ForTraitImports);
+  if (I.Root.empty() || I.WithoutDebug == ForTraitImports ||
+      !I.imagesUnchanged() || !ordinaryModule(M, I.WithoutDebug))
     return 0;
   auto &C = M.getContext();
   auto *Handler = C.getDiagHandlerPtr();
   if (!Handler || Handler->HasErrors || Handler->isAnyRemarkEnabled() ||
       C.getMainRemarkStreamer() || C.getLLVMRemarkStreamer())
     return 0;
+  if (ForTraitImports)
+    return tryTraitObject(M, *reinterpret_cast<TargetMachine *>(TM), I,
+                          StringRef(Output, Length), Ticket);
   SmallVector<char, 128> State;
   if (!ohm::getOptimizerContextState(M, State)) {
     event(M.getModuleIdentifier(), "early-bypass", "unrepresented context");
@@ -848,9 +950,23 @@ extern "C" void ohm_early_object_end_v1(void *Ticket, int Completed) {
   if (!Holder || !Completed)
     return;
   const auto &Entry = **Holder;
-  const auto &I = invocation();
-  if (Entry.MachineKey.empty() || Entry.Diagnostics.hasDiagnostics() ||
-      !I.imagesUnchanged())
+  const auto &I = invocation(Entry.Trait != nullptr);
+  if (Entry.Diagnostics.hasDiagnostics() || !I.imagesUnchanged())
+    return;
+  if (Entry.Trait) {
+    auto &R = *Entry.Trait;
+    if (R.Object.empty())
+      return;
+    R.Object.append(R.Imports.data(), R.Imports.size());
+    char Size[8];
+    support::endian::write64le(Size, R.Imports.size());
+    R.Object.append(Size, sizeof(Size));
+    if (saveCheckedObject(joinPath(I.Entries, "llvmcache-" + Entry.Key),
+                          Entry.Key, R.Object, TraitMagic))
+      event(Entry.Input->getModuleIdentifier(), "trait-import-committed");
+    return;
+  }
+  if (Entry.MachineKey.empty())
     return;
   auto Sum = earlyIndexChecksum(Entry.Key, Entry.MachineKey);
   if (writeAtomic(joinPath(I.Entries, "llvmcache-" + Entry.Key),
