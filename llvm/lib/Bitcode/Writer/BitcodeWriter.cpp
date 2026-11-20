@@ -5741,11 +5741,12 @@ void BitcodeWriter::writeModule(const Module &M,
                   nullptr);
 }
 
-void BitcodeWriter::writeModuleImpl(
-    const Module &M, bool ShouldPreserveUseListOrder,
-    const ModuleSummaryIndex *Index, bool GenerateHash, ModuleHash *ModHash,
-    DebugObjectSourceMap *SourceMap, MachineUseState *Uses,
-    function_ref<StringRef(const Function &)> DeclarationName) {
+void BitcodeWriter::writeModuleImpl(const Module &M,
+                                    bool ShouldPreserveUseListOrder,
+                                    const ModuleSummaryIndex *Index,
+                                    bool GenerateHash, ModuleHash *ModHash,
+                                    DebugObjectSourceMap *SourceMap,
+                                    MachineUseState *Uses) {
   assert(!WroteStrtab);
 
   // The Mods vector is used by irsymtab::build, which requires non-const
@@ -5755,18 +5756,17 @@ void BitcodeWriter::writeModuleImpl(
   assert(M.isMaterialized());
   Mods.push_back(const_cast<Module *>(&M));
 
-  ModuleBitcodeWriter ModuleWriter(
-      M, StrtabBuilder, *Stream, ShouldPreserveUseListOrder, Index,
-      GenerateHash, ModHash, SourceMap, Uses, nullptr, DeclarationName);
+  ModuleBitcodeWriter ModuleWriter(M, StrtabBuilder, *Stream,
+                                   ShouldPreserveUseListOrder, Index,
+                                   GenerateHash, ModHash, SourceMap, Uses);
   if (!Uses || Uses->Complete)
     ModuleWriter.write();
 }
 
-namespace llvm {
-bool writeDebugObjectBitcode(
-    const Module &M, SmallVectorImpl<char> &Buffer, DebugObjectSourceMap *Map,
-    bool AllowMachineOnlyUses,
-    function_ref<StringRef(const Function &)> DeclarationName) {
+bool llvm::writeDebugObjectBitcode(const Module &M,
+                                   SmallVectorImpl<char> &Buffer,
+                                   DebugObjectSourceMap *Map,
+                                   bool AllowMachineOnlyUses) {
   // Use-list ordering can affect machine-code generation. If the process
   // explicitly forbids writing it, this compilation cannot supply a key.
   if (!M.isMaterialized() || !M.getTargetTriple().isOSBinFormatELF() ||
@@ -5777,12 +5777,8 @@ bool writeDebugObjectBitcode(
   BitcodeWriter Writer(Buffer);
   MachineUseState Uses;
   Uses.OptimizerInput = !AllowMachineOnlyUses;
-  Writer.writeModuleImpl(M, true, nullptr, false, nullptr, Map, &Uses,
-                         DeclarationName);
-  // The derived IR symbol index contains original names. All information
-  // used to build it is already in the module records.
-  if (!DeclarationName)
-    Writer.writeSymtab();
+  Writer.writeModuleImpl(M, true, nullptr, false, nullptr, Map, &Uses);
+  Writer.writeSymtab();
   Writer.writeStrtab();
   if (!Uses.Complete || (Map && !Map->Valid))
     return false;
@@ -5800,21 +5796,6 @@ bool writeDebugObjectBitcode(
     Writer.Stream->ExitBlock();
   }
   return true;
-}
-
-} // namespace llvm
-
-bool llvm::writeDebugObjectBitcode(const Module &M,
-                                   SmallVectorImpl<char> &Buffer,
-                                   DebugObjectSourceMap *Map,
-                                   bool AllowMachineOnlyUses) {
-  return writeDebugObjectBitcode(M, Buffer, Map, AllowMachineOnlyUses, {});
-}
-
-bool llvm::writeClosedOptimizerInput(
-    const Module &M, SmallVectorImpl<char> &Buffer,
-    function_ref<StringRef(const Function &)> DeclarationName) {
-  return writeDebugObjectBitcode(M, Buffer, nullptr, false, DeclarationName);
 }
 
 bool llvm::writeClosedOptimizerInput(const Module &M,
@@ -5843,6 +5824,11 @@ bool llvm::getClosedModuleHashV1(const Module &M,
 }
 
 bool llvm::writeClosedDwarfLineCertificateV1(const Module &M, raw_ostream &Out) {
+  return writeProjectedDwarfLineCertificate(M, Out, {});
+}
+bool llvm::writeProjectedDwarfLineCertificate(
+    const Module &M, raw_ostream &Out,
+    function_ref<StringRef(const Function &)> GetName) {
   if (!M.isMaterialized() || !M.getTargetTriple().isOSBinFormatELF() ||
       !preserveUseListOrder(true))
     return false;
@@ -5858,13 +5844,16 @@ bool llvm::writeClosedDwarfLineCertificateV1(const Module &M, raw_ostream &Out) 
     raw_svector_ostream Buffer(Bytes);
     BitcodeWriter Writer(Buffer);
     Writer.Mods.push_back(const_cast<Module *>(&M));
-    ModuleBitcodeWriter ModuleWriter(M, Writer.StrtabBuilder, *Writer.Stream,
-                                     /*ShouldPreserveUseListOrder=*/true, nullptr,
-                                     /*GenerateHash=*/false, nullptr,
-                                     /*SourceMap=*/nullptr, /*Uses=*/nullptr,
-                                     &Certificate);
+    ModuleBitcodeWriter ModuleWriter(
+        M, Writer.StrtabBuilder, *Writer.Stream,
+        /*ShouldPreserveUseListOrder=*/true, nullptr,
+        /*GenerateHash=*/false, nullptr,
+        /*SourceMap=*/nullptr, /*Uses=*/nullptr, &Certificate, GetName);
     ModuleWriter.write();
-    Writer.writeSymtab();
+    // The optional IR symbol table derives from unprojected names. The
+    // signature already covers the complete module records.
+    if (!GetName)
+      Writer.writeSymtab();
     Writer.writeStrtab();
   }
   Bytes.append(StringRef(reinterpret_cast<const char *>(Context.data()), Context.size()));

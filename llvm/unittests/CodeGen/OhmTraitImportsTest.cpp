@@ -28,22 +28,48 @@ constexpr StringLiteral
 constexpr StringLiteral
     Other("_RNvYNtCs1_5types4ItemNtCs2_6traits5Trait6secondCs4_8newcrate");
 
-static std::string source(StringRef Import, StringRef Literal = Name) {
-  // The plain symbol @old and the section "ld" can share their spelling
-  // with the provider suffix in the combined symbol/section string table.
+static std::string withLines(StringRef Provider, unsigned Line, char Checksum) {
   return ("target triple = \"x86_64-unknown-linux-gnu\"\n"
-          "@old = constant i32 1\n"
-          "@literal = constant [" +
-          Twine(Literal.size()) + " x i8] c\"" + Literal +
-          "\", section \"ld\"\n"
           "declare i32 @" +
-          Import +
+          Provider +
           "()\n"
-          "define i32 @caller() { %v = call i32 @" +
-          Import + "() ret i32 %v }\n")
+          "define i32 @caller() !dbg !4 {\n"
+          "  %v = call i32 @" +
+          Provider +
+          "(), !dbg !7\n"
+          "  ret i32 %v, !dbg !8\n}\n"
+          "!llvm.dbg.cu = !{!0}\n"
+          "!llvm.module.flags = !{!1, !2}\n"
+          "!0 = distinct !DICompileUnit(language: DW_LANG_Rust, file: !3, "
+          "producer: \"rustc\", isOptimized: true, runtimeVersion: 0, "
+          "emissionKind: LineTablesOnly)\n"
+          "!1 = !{i32 7, !\"Dwarf Version\", i32 4}\n"
+          "!2 = !{i32 2, !\"Debug Info Version\", i32 3}\n"
+          "!3 = !DIFile(filename: \"lib.rs\", directory: \"/test\", "
+          "checksumkind: CSK_MD5, checksum: \"" +
+          std::string(32, Checksum) +
+          "\")\n"
+          "!4 = distinct !DISubprogram(name: \"caller\", scope: !3, file: !3, "
+          "line: 1, type: !5, scopeLine: 1, spFlags: DISPFlagDefinition | "
+          "DISPFlagOptimized, unit: !0)\n"
+          "!5 = !DISubroutineType(types: !6)\n!6 = !{}\n"
+          "!7 = !DILocation(line: " +
+          Twine(Line) +
+          ", column: 1, scope: !4)\n"
+          "!8 = !DILocation(line: " +
+          Twine(Line + 1) + ", column: 1, scope: !4)\n")
       .str();
 }
 
+static std::string source(StringRef Import, StringRef Literal = Name) {
+  // The symbol @old and section "ld" share suffixes with the provider.
+  return (Twine(withLines(Import, 80, 'a')) +
+          "@old = constant i32 1\n"
+          "@literal = constant [" +
+          Twine(Literal.size()) + " x i8] c\"" + Literal +
+          "\", section \"ld\"\n")
+      .str();
+}
 static std::unique_ptr<Module> read(LLVMContext &C, StringRef IR) {
   SMDiagnostic Error;
   auto M = parseAssemblyString(IR, Error, C);
@@ -58,15 +84,14 @@ static bool signature(StringRef IR, Bytes &Input) {
   return M && ohm::writeTraitImportSignature(*M, Input, Names);
 }
 
-TEST(OhmTraitImports, OnlyProviderIsProjected) {
+TEST(OhmTraitImports, KeepsLiteralAndMethodInKey) {
   LLVMContext C;
   auto M = read(C, source(Name));
   ASSERT_TRUE(M);
   Bytes Base, Names, Current, ChangedLiteral, ChangedMethod;
   ASSERT_TRUE(ohm::writeTraitImportSignature(*M, Base, Names));
   EXPECT_TRUE(M->getFunction(Name));
-  EXPECT_EQ(StringRef(Names.data(), Names.size()),
-            StringRef(Name.data(), Name.size() + 1));
+  EXPECT_TRUE(StringRef(Names.data(), Names.size()).drop_back().ends_with(Name));
   ASSERT_TRUE(signature(source(Longer), Current));
   EXPECT_EQ(Base, Current);
   ASSERT_TRUE(signature(source(Longer, Longer), ChangedLiteral));
@@ -135,14 +160,43 @@ static bool emit(StringRef IR, Bytes &Object) {
   return true;
 }
 
+static bool snapshot(StringRef IR, Bytes &Key, Bytes &Manifest) {
+  LLVMContext Context;
+  auto M = read(Context, IR);
+  return M && ohm::writeTraitImportSignature(*M, Key, Manifest);
+}
+static StringRef bytes(ArrayRef<char> Data) {
+  return StringRef(Data.data(), Data.size());
+}
 static bool rebind(ArrayRef<char> Input, StringLiteral Old,
                    StringLiteral Current, Bytes &Out) {
-  return ohm::rebindTraitImports(StringRef(Input.data(), Input.size()),
-                                 StringRef(Old.data(), Old.size() + 1),
-                                 StringRef(Current.data(), Current.size() + 1),
-                                 Out);
+  Bytes Key, Manifest, NewKey, NewManifest;
+  return snapshot(source(Old), Key, Manifest) &&
+         snapshot(source(Current), NewKey, NewManifest) &&
+         ohm::rebindTraitImports(bytes(Input), bytes(Manifest),
+                                 bytes(NewManifest), Out);
 }
 
+TEST(OhmTraitImports, RebindsAfterInterveningLineEdits) {
+  Bytes Before, Fresh, Rebound, Key, NewKey, Manifest, NewManifest;
+  auto Old = withLines(Name, 80, 'a');
+  auto New = withLines(Longer, 82, 'b');
+  ASSERT_TRUE(emit(Old, Before));
+  ASSERT_TRUE(emit(New, Fresh));
+  ASSERT_TRUE(snapshot(Old, Key, Manifest));
+  ASSERT_TRUE(snapshot(New, NewKey, NewManifest));
+  ASSERT_EQ(Key, NewKey);
+  ASSERT_TRUE(ohm::rebindTraitImports(bytes(Before), bytes(Manifest),
+                                      bytes(NewManifest), Rebound));
+  EXPECT_EQ(Fresh, Rebound);
+  EXPECT_FALSE(ohm::rebindTraitImports(bytes(Before), bytes(Manifest),
+                                       bytes(NewManifest).take_front(15),
+                                       Rebound));
+  Bytes SameKey, SameChecksum;
+  ASSERT_TRUE(snapshot(withLines(Longer, 82, 'a'), SameKey, SameChecksum));
+  EXPECT_FALSE(ohm::rebindTraitImports(bytes(Before), bytes(Manifest),
+                                       bytes(SameChecksum), Rebound));
+}
 TEST(OhmTraitImports, MatchesFreshELFWhenProviderGrowsAndShrinks) {
   Bytes Before, After, Rebound;
   ASSERT_TRUE(emit(source(Name), Before));

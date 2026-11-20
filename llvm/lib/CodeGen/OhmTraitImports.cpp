@@ -17,7 +17,110 @@
 #include "llvm/MC/StringTableBuilder.h"
 #include "llvm/Object/ELFTypes.h"
 
+#include "llvm/DebugInfo/DWARF/OhmDwarfRebase.h"
+#include "llvm/Support/raw_ostream.h"
 using namespace llvm;
+namespace {
+// The closed DWARF line certificate starts with the compilation directory
+// and a digest of the ordered IR, optimizer context and relative positions.
+// The remaining fields record the exact checksums and source coordinates.
+struct CertificateReader {
+  StringRef Bytes;
+
+  bool word(uint32_t &Value) {
+    if (Bytes.size() < 4)
+      return false;
+    Value = support::endian::read32le(Bytes.data());
+    Bytes = Bytes.drop_front(4);
+    return true;
+  }
+
+  bool field(StringRef &Value) {
+    uint32_t Size;
+    if (!word(Size) || Size > Bytes.size())
+      return false;
+    Value = Bytes.take_front(Size);
+    Bytes = Bytes.drop_front(Size);
+    return true;
+  }
+
+  bool header(StringRef &Directory, StringRef &Digest) {
+    if (!field(Directory) || Bytes.size() < 32)
+      return false;
+    Digest = Bytes.take_front(32);
+    Bytes = Bytes.drop_front(32);
+    return true;
+  }
+};
+
+bool canonicalPath(StringRef Path) {
+  if (!Path.starts_with("/") || Path.ends_with("/") || Path.contains("//"))
+    return false;
+  for (StringRef Part : split(Path, '/'))
+    if (Part == "." || Part == "..")
+      return false;
+  return true;
+}
+
+// Mirror rustc's dwarf_certificate::compare. Require an unambiguous,
+// monotone line mapping for each changed file. Unchanged files must preserve
+// every coordinate. Rebase only after validating the complete certificate.
+bool compareLines(StringRef Previous, StringRef Current, ohm::SourceMap &Map) {
+  CertificateReader Old{Previous}, New{Current};
+  StringRef OldDir, NewDir, OldDigest, NewDigest;
+  if (!Old.header(OldDir, OldDigest) || !New.header(NewDir, NewDigest) ||
+      OldDir != NewDir || OldDigest != NewDigest || NewDir.contains('\0'))
+    return false;
+  uint32_t Count, NewCount;
+  if (!Old.word(Count) || !New.word(NewCount) || Count != NewCount ||
+      Count > Old.Bytes.size() / 8 || Count > New.Bytes.size() / 8)
+    return false;
+  SmallVector<std::string> Paths;
+  StringMap<std::pair<StringRef, StringRef>> Checksums;
+  for (size_t I = 0; I < Count; ++I) {
+    StringRef Path, NewPath, Before, After;
+    if (!Old.field(Path) || !New.field(NewPath) || Path != NewPath ||
+        Path.contains('\0') || !Old.field(Before) || !New.field(After))
+      return false;
+    Paths.push_back(Path.starts_with("/") ? Path.str()
+                                          : (NewDir + "/" + Path).str());
+    auto Pair = std::make_pair(Before, After);
+    if (Checksums.try_emplace(Paths.back(), Pair).first->second != Pair)
+      return false;
+    if (Before != After) {
+      if (Before.empty() || After.empty() || !canonicalPath(Paths.back()))
+        return false;
+      Map.try_emplace(Paths.back());
+    }
+  }
+  if (!Old.word(Count) || !New.word(NewCount) || Count != NewCount ||
+      Old.Bytes.size() != uint64_t(Count) * 8 ||
+      Old.Bytes.size() != New.Bytes.size())
+    return false;
+  for (size_t I = 0; I < Count; ++I) {
+    uint32_t File, NewFile, From, To;
+    if (!Old.word(File) || !New.word(NewFile) || File != NewFile ||
+        File >= Paths.size() || !Old.word(From) || !New.word(To) || !From ||
+        !To)
+      return false;
+    auto It = Map.find(Paths[File]);
+    if (It == Map.end()) {
+      if (From != To)
+        return false;
+    } else if (It->second.try_emplace(From, To).first->second != To)
+      return false;
+  }
+  for (const auto &File : Map) {
+    uint32_t Last = 0;
+    for (auto Line : File.second) {
+      if (Line.second <= Last)
+        return false;
+      Last = Line.second;
+    }
+  }
+  return true;
+}
+} // namespace
 
 static bool consumeIdentifier(StringRef &S) {
   uint64_t Size;
@@ -54,7 +157,7 @@ static bool consumeTypePath(StringRef &S) {
 // and a nominal trait: Nv Y <receiver> <trait> <method>. Accept a trailing
 // instantiating crate only after parsing both complete type paths and the
 // method. Generics, backreferences and special identifiers are out of scope.
-static StringRef methodPath(StringRef Name) {
+static StringRef traitImportMethodPath(StringRef Name) {
   StringRef Rest = Name;
   if (!Rest.consume_front("_RNvY") || !consumeTypePath(Rest) ||
       !consumeTypePath(Rest) || !consumeIdentifier(Rest))
@@ -77,17 +180,18 @@ static bool isDirectImport(const Function &F) {
   });
 }
 
-bool ohm::writeTraitImportSignature(const Module &M,
-                                    SmallVectorImpl<char> &Input,
-                                    SmallVectorImpl<char> &Imports,
+bool ohm::writeTraitImportSignature(const Module &M, SmallVectorImpl<char> &Key,
+                                    SmallVectorImpl<char> &Manifest,
                                     function_ref<bool(StringRef)> ShouldProbe) {
-  if (!M.getModuleInlineAsm().empty() || !M.alias_empty() || !M.ifunc_empty())
+  SmallVector<char, 0> Imports;
+  if (M.getDwarfVersion() != 4 || !M.getModuleInlineAsm().empty() ||
+      !M.alias_empty() || !M.ifunc_empty())
     return false;
 
   DenseMap<const Function *, StringRef> Paths;
   StringSet<> Seen;
   for (const Function &F : M) {
-    StringRef Path = methodPath(F.getName());
+    StringRef Path = traitImportMethodPath(F.getName());
     if (Path.empty() || !isDirectImport(F))
       continue;
     if (M.getNamedValue(Path) || !Seen.insert(Path).second)
@@ -106,10 +210,25 @@ bool ohm::writeTraitImportSignature(const Module &M,
       for (const Instruction &I : BB)
         if (auto *CB = dyn_cast<CallBase>(&I); CB && CB->isInlineAsm())
           return false;
-  return writeClosedOptimizerInput(M, Input, [&](const Function &F) {
+  auto GetName = [&](const Function &F) {
     auto It = Paths.find(&F);
     return It != Paths.end() ? It->second : F.getName();
-  });
+  };
+  SmallVector<char, 0> Certificate;
+  raw_svector_ostream Stream(Certificate);
+  if (!writeProjectedDwarfLineCertificate(M, Stream, GetName))
+    return false;
+  CertificateReader Reader{StringRef(Certificate.data(), Certificate.size())};
+  StringRef Directory, Digest;
+  if (!Reader.header(Directory, Digest) || Certificate.size() >= (128u << 20))
+    return false;
+  Key.append(Certificate.begin(), Certificate.end() - Reader.Bytes.size());
+  char Size[4];
+  support::endian::write32le(Size, Certificate.size());
+  Manifest.append(Size, Size + 4);
+  Manifest.append(Certificate.begin(), Certificate.end());
+  Manifest.append(Imports.begin(), Imports.end());
+  return true;
 }
 
 // The integrated assembler emits the symbol and section names into a
@@ -286,6 +405,13 @@ static bool renameObjectImports(StringRef Object,
 
 bool ohm::rebindTraitImports(StringRef Object, StringRef Old, StringRef Current,
                              SmallVectorImpl<char> &Output) {
+  StringRef BeforeLines, AfterLines;
+  CertificateReader Previous{Old}, Next{Current};
+  if (!Previous.field(BeforeLines) || !Next.field(AfterLines) ||
+      BeforeLines.empty() || AfterLines.empty())
+    return false;
+  Old = Previous.Bytes;
+  Current = Next.Bytes;
   if (Old.empty() || Current.empty() || Old.back() || Current.back())
     return false;
   StringMap<StringRef> Renames;
@@ -294,13 +420,27 @@ bool ohm::rebindTraitImports(StringRef Object, StringRef Old, StringRef Current,
     auto [After, NewTail] = Current.split('\0');
     if (Before.empty() || After.empty())
       return false;
-    if (Before != After && (methodPath(Before).empty() ||
-                            methodPath(Before) != methodPath(After) ||
-                            !Renames.try_emplace(Before, After).second))
+    if (Before != After &&
+        (traitImportMethodPath(Before).empty() ||
+         traitImportMethodPath(Before) != traitImportMethodPath(After) ||
+         !Renames.try_emplace(Before, After).second))
       return false;
     Old = OldTail;
     Current = NewTail;
   }
-  return Old.empty() && Current.empty() && !Renames.empty() &&
-         renameObjectImports(Object, Renames, Output);
+  if (!Old.empty() || !Current.empty() || Renames.empty())
+    return false;
+  if (BeforeLines == AfterLines)
+    return renameObjectImports(Object, Renames, Output);
+  SourceMap Map;
+  if (!compareLines(BeforeLines, AfterLines, Map))
+    return false;
+  auto Rebased =
+      rebaseDwarf4(MemoryBufferRef(Object, "cached trait donor"), Map);
+  if (!Rebased) {
+    consumeError(Rebased.takeError());
+    return false;
+  }
+  return renameObjectImports(
+      StringRef(Rebased->Bytes.data(), Rebased->Bytes.size()), Renames, Output);
 }
