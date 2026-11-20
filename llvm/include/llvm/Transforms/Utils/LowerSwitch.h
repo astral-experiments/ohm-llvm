@@ -21,6 +21,12 @@ namespace llvm {
 struct LowerSwitchPass : public OptionalPassInfoMixin<LowerSwitchPass> {
   LLVM_ABI PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);
 };
+
+/// Factor dense dispatches to opaque Rust getters into table lookups.
+struct LowerSwitchCallsPass
+    : public OptionalPassInfoMixin<LowerSwitchCallsPass> {
+  LLVM_ABI PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM);
+};
 } // namespace llvm
 
 #endif // LLVM_TRANSFORMS_UTILS_LOWERSWITCH_H

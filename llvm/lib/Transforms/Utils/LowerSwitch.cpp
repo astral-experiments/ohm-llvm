@@ -25,9 +25,14 @@
 #include "llvm/IR/ConstantRange.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
+#include "llvm/IR/GlobalVariable.h"
+#include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InstrTypes.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/IntrinsicInst.h"
+#include "llvm/IR/Module.h"
 #include "llvm/IR/PassManager.h"
+#include "llvm/IR/RustSymbolChecks.h"
 #include "llvm/IR/Value.h"
 #include "llvm/InitializePasses.h"
 #include "llvm/Pass.h"
@@ -606,4 +611,259 @@ PreservedAnalyses LowerSwitchPass::run(Function &F,
   AssumptionCache *AC = AM.getCachedResult<AssumptionAnalysis>(F);
   return LowerSwitch(F, LVI, AC) ? PreservedAnalyses::none()
                                  : PreservedAnalyses::all();
+}
+
+namespace {
+// Large generated matches often dispatch to a different metadata getter
+// for each discriminant. The case bodies can also store constant fields
+// alongside the result. Each varying operand becomes a lookup table.
+struct GetterCase {
+  unsigned Key;
+  BasicBlock *Block;
+  SmallVector<Use *, 4> Columns;
+};
+
+static bool canUseTable(const Use &U) {
+  if (auto *Call = dyn_cast<CallInst>(U.getUser())) {
+    if (Call->isCallee(&U))
+      return true;
+    if (Call->getReturnedArgOperand() || Call->hasFnAttr(Attribute::AllocSize))
+      return false;
+  } else if (!isa<StoreInst>(U.getUser()) || U.getOperandNo() != 0) {
+    return false;
+  }
+  if (auto *G = dyn_cast<GlobalVariable>(U.get()))
+    return G->hasLocalLinkage() && G->isConstant() && !G->isThreadLocal() &&
+           !G->getAddressSpace() && G->hasInitializer() &&
+           !G->getInitializer()->needsRelocation();
+  return isa<ConstantInt>(U.get()) && U->getType()->getIntegerBitWidth() <= 64;
+}
+
+static bool isGetterCase(BasicBlock &BB) {
+  auto *Call = dyn_cast<CallInst>(&BB.front());
+  if (!Call || Call->isNoTailCall() || Call->arg_size() > 1 ||
+      Call->hasOperandBundles() || Call->isConvergent() ||
+      Call->cannotMerge() || Call->cannotDuplicate() ||
+      Call->hasFnAttr(Attribute::NoIPA) ||
+      Call->hasFnAttr(Attribute::ReturnsTwice) ||
+      Call->getAttributes().hasFnAttr(Attribute::Builtin) ||
+      Call->getAttributes().hasFnAttr(Attribute::Speculatable))
+    return false;
+
+  // Keep definitions direct for inlining and constant propagation. Preserve
+  // the ABI and all parameter and return attributes on the indirect call.
+  auto *F = Call->getCalledFunction();
+  if (!F || !F->isDeclaration() || !F->hasExternalLinkage() || F->isVarArg() ||
+      !F->getName().starts_with("_R") || F->getAddressSpace() ||
+      F->getCallingConv() != CallingConv::C ||
+      Call->getCallingConv() != CallingConv::C ||
+      F->hasMetadata(LLVMContext::MD_type) ||
+      F->hasMetadata(LLVMContext::MD_kcfi_type) ||
+      F->getAttributes().removeFnAttributes(BB.getContext()) !=
+          Call->getAttributes().removeFnAttributes(BB.getContext()))
+    return false;
+
+  BasicBlock *Join = BB.getSingleSuccessor();
+  if (!Join || !isa<UncondBrInst>(BB.getTerminator()) ||
+      !isa<ReturnInst>(Join->getTerminator()))
+    return false;
+  for (Instruction &I : BB) {
+    if (&I != Call &&
+        !isa<ExtractValueInst, GetElementPtrInst, StoreInst, UncondBrInst>(I))
+      return false;
+    if (I.hasMetadataOtherThanDebugLoc() || I.hasDbgRecords())
+      return false;
+    if (auto *Store = dyn_cast<StoreInst>(&I); Store && !Store->isSimple())
+      return false;
+    for (auto *U : I.users()) {
+      auto *Inst = cast<Instruction>(U);
+      if (Inst->getParent() != &BB &&
+          !(isa<PHINode>(Inst) && Inst->getParent() == Join))
+        return false;
+    }
+  }
+  return true;
+}
+
+// An indirect call loses facts known only from the declaration. Admit
+// ordinary code generation attributes and control attributes that we copy
+// to the call site when loading its target.
+static bool canIndirectGetter(Function &F) {
+  return all_of(F.getAttributes().getFnAttrs(), [](Attribute A) {
+    if (A.isStringAttribute())
+      return A.getKindAsString() == "probe-stack" ||
+             A.getKindAsString() == "target-cpu";
+    switch (A.getKindAsEnum()) {
+    case Attribute::NonLazyBind:
+    case Attribute::UWTable:
+    case Attribute::NoUnwind:
+    case Attribute::NoReturn:
+    case Attribute::WillReturn:
+      return true;
+    default:
+      return false;
+    }
+  });
+}
+
+using InstructionMap = DenseMap<Value *, Value *>;
+
+// Match all operands except table entries and references to corresponding
+// instructions within the arm. Check the return block's PHIs separately.
+static bool matchGetterCase(BasicBlock &First, GetterCase &Row,
+                            InstructionMap &Map) {
+  BasicBlock &BB = *Row.Block;
+  auto *A = cast<CallInst>(First.front()).getCalledFunction();
+  auto *B = cast<CallInst>(BB.front()).getCalledFunction();
+  // Inlining a switch into a caller that selects a subset of the keys
+  // can eliminate references to other getters. A table of targets would
+  // keep those references alive. Require an externally called dispatcher.
+  if (A != B && (!BB.getParent()->use_empty() || !canIndirectGetter(*A)))
+    return false;
+  if (A->getAttributes() != B->getAttributes() || First.size() != BB.size())
+    return false;
+  for (auto [I, J] : llvm::zip(First, BB)) {
+    if (!I.isSameOperationAs(&J) ||
+        I.getRawSubclassOptionalData() != J.getRawSubclassOptionalData() ||
+        I.getDebugLoc() != J.getDebugLoc())
+      return false;
+    for (auto [U, V] : llvm::zip(I.operands(), J.operands())) {
+      if (canUseTable(U)) {
+        if (!canUseTable(V))
+          return false;
+        Row.Columns.push_back(&V);
+      } else if (U.get() != V.get() && U.get() != Map.lookup(V.get())) {
+        return false;
+      }
+    }
+    Map[&J] = &I;
+  }
+  return true;
+}
+
+static void loadGetterOperands(SwitchInst &SI, ArrayRef<GetterCase> Cases) {
+  const GetterCase &First = Cases.front();
+  IRBuilder<> Builder(&First.Block->front());
+  Value *Index =
+      Builder.CreateZExtOrTrunc(SI.getCondition(), Builder.getInt64Ty());
+  unsigned Count = SI.getNumCases();
+  for (unsigned K = 0; K < First.Columns.size(); ++K) {
+    Use *Column = First.Columns[K];
+    if (all_of(Cases, [&](auto &Row) {
+          return Row.Columns[K]->get() == Column->get();
+        }))
+      continue;
+    Type *Ty = Column->get()->getType();
+    auto *TableTy = ArrayType::get(Ty, Count);
+    // Exceptional arms skip the table. Fill their data-pointer slots
+    // with a local constant so RelLookupTableConverter can use offsets.
+    Constant *Unused = isa<GlobalVariable>(Column->get())
+                           ? cast<Constant>(Column->get())
+                           : PoisonValue::get(Ty);
+    SmallVector<Constant *> Entries(Count, Unused);
+    for (const GetterCase &Row : Cases)
+      Entries[Row.Key] = cast<Constant>(Row.Columns[K]->get());
+    auto *Table = new GlobalVariable(
+        *SI.getModule(), TableTy, true, GlobalValue::PrivateLinkage,
+        ConstantArray::get(TableTy, Entries),
+        "switch.table." + SI.getFunction()->getName());
+    Table->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+    auto *Ptr =
+        Builder.CreateInBoundsGEP(TableTy, Table, {Builder.getInt64(0), Index});
+    if (auto *Call = dyn_cast<CallBase>(Column->getUser());
+        Call && Call->isCallee(Column))
+      for (auto Kind :
+           {Attribute::NoUnwind, Attribute::NoReturn, Attribute::WillReturn})
+        if (Call->hasFnAttr(Kind))
+          Call->addFnAttr(Kind);
+    Column->set(Builder.CreateLoad(Ty, Ptr));
+  }
+}
+
+static bool lowerGetterSwitch(SwitchInst &SI) {
+  // The discriminator comes directly from an argument of an externally
+  // callable function. All keys remain possible after IPSCCP.
+  auto *Load = dyn_cast<LoadInst>(SI.getCondition());
+  unsigned N = SI.getNumCases();
+  if (N < 32 || !isa<UnreachableInst>(SI.getDefaultDest()->front()) ||
+      SI.hasMetadataOtherThanDebugLoc() || SI.getParent()->size() != 2 ||
+      !Load || !Load->isSimple() || !isa<Argument>(Load->getPointerOperand()))
+    return false;
+  if (auto *Range = Load->getMetadata(LLVMContext::MD_range))
+    if (Range->getNumOperands() != 2 ||
+        !mdconst::extract<ConstantInt>(Range->getOperand(0))->isZero() ||
+        mdconst::extract<ConstantInt>(Range->getOperand(1))
+                ->getLimitedValue() != N)
+      return false;
+
+  SmallVector<GetterCase> Cases;
+  SmallPtrSet<BasicBlock *, 32> Matched;
+  InstructionMap Map;
+  for (auto Case : SI.cases()) {
+    uint64_t Key = Case.getCaseValue()->getLimitedValue();
+    if (Key >= N)
+      return false;
+    auto *BB = Case.getCaseSuccessor();
+    if (BB->getSinglePredecessor() != SI.getParent() || BB->hasAddressTaken() ||
+        !isGetterCase(*BB))
+      continue;
+    GetterCase Row{unsigned(Key), BB, {}};
+    if (matchGetterCase(Cases.empty() ? *BB : *Cases.front().Block, Row, Map)) {
+      Matched.insert(BB);
+      Cases.push_back(std::move(Row));
+    }
+  }
+  // Keep a small number of exceptional arms in the switch.
+  if (Cases.size() < N - N / 4)
+    return false;
+
+  BasicBlock *First = Cases.front().Block;
+  BasicBlock *Join = First->getSingleSuccessor();
+  for (Instruction &I : *Join)
+    if (!isa<PHINode, InsertValueInst, ICmpInst, ReturnInst>(I) &&
+        !isa<AssumeInst>(I))
+      return false;
+  for (PHINode &Phi : Join->phis()) {
+    auto *Value = Phi.getIncomingValueForBlock(First);
+    for (auto &U : Phi.incoming_values())
+      if (Matched.contains(Phi.getIncomingBlock(U)) && U.get() != Value &&
+          Map.lookup(U.get()) != Value)
+        return false;
+  }
+
+  loadGetterOperands(SI, Cases);
+  SI.setDefaultDest(First);
+  for (auto It = SI.case_begin(); It != SI.case_end();)
+    if (Matched.contains(It->getCaseSuccessor()))
+      It = SI.removeCase(It);
+    else
+      ++It;
+
+  // Remove the dead predecessors in bulk to avoid a quadratic PHI scan.
+  Matched.erase(First);
+  for (PHINode &Phi : Join->phis())
+    Phi.removeIncomingValueIf(
+        [&](unsigned I) { return Matched.contains(Phi.getIncomingBlock(I)); });
+  for (const GetterCase &Row : llvm::drop_begin(Cases))
+    Row.Block->eraseFromParent();
+  return true;
+}
+} // namespace
+
+PreservedAnalyses LowerSwitchCallsPass::run(Module &M,
+                                            ModuleAnalysisManager &AM) {
+  if (!canIntroduceRustSymbols(M) || M.getModuleFlag("cf-protection-branch"))
+    return PreservedAnalyses::all();
+
+  bool Changed = false;
+  for (Function &F : M) {
+    if (F.isDeclaration() || !F.hasExternalLinkage() || F.hasOptNone() ||
+        !F.getName().starts_with("_R") || F.hasMetadata(LLVMContext::MD_type) ||
+        F.hasMetadata(LLVMContext::MD_kcfi_type) ||
+        F.hasFnAttribute("no-jump-tables"))
+      continue;
+    if (auto *SI = dyn_cast<SwitchInst>(F.getEntryBlock().getTerminator()))
+      Changed |= lowerGetterSwitch(*SI);
+  }
+  return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
 }
