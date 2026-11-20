@@ -666,15 +666,33 @@ bool tryTraitObject(Module &M, TargetMachine &TM, const Invocation &I,
   Trait->TM = &TM;
   SmallVector<char, 0> Input;
   std::array<uint8_t, 32> Context;
-  if (!ohm::writeTraitImportSignature(M, Input, Trait->Imports) ||
-      Trait->Imports.size() >= MaxOrigin ||
-      !getClosedOptimizerContextV1(M, Context))
-    return false;
   BLAKE3 H;
   frame(H, TraitMagic);
   frame(H, I.Namespace);
   frame(H, machineTarget(M, TM));
   frame(H, M.getModuleIdentifier());
+  // A second generation with the same imports cannot reuse the first by
+  // rebinding a name. Remember only the latest roster digest per CGU and
+  // skip serialization until its imports change again. This may forgo
+  // refreshing a donor on body edits. The marker is a negative hint only:
+  // a race or interrupted compilation can cost a hit, never grant one.
+  auto Changed = [&](StringRef Imports) {
+    BLAKE3 Slot = H;
+    frame(Slot, "import-roster");
+    auto Path = joinPath(I.Entries, "llvmcache-" + toHex(Slot.final(), true));
+    BLAKE3 Roster;
+    Roster.update(Imports);
+    auto Digest = toHex(Roster.final(), true);
+    if (auto Last = readPrivate(Path, Digest.size()))
+      if (Last->getBuffer() == Digest)
+        return false;
+    writeAtomic(Path, {Digest});
+    return true;
+  };
+  if (!ohm::writeTraitImportSignature(M, Input, Trait->Imports, Changed) ||
+      Trait->Imports.size() >= MaxOrigin ||
+      !getClosedOptimizerContextV1(M, Context))
+    return false;
   frame(H, StringRef(Input.data(), Input.size()));
   H.update(Context);
   auto Key = toHex(H.final(), true);

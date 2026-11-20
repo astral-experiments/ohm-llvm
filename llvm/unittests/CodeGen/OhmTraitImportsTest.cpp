@@ -1,5 +1,4 @@
-//===- OhmTraitImportsTest.cpp - Rust trait import cache tests
-//--------------===//
+//===- OhmTraitImportsTest.cpp - Trait import cache tests -----------------===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -74,6 +73,23 @@ TEST(OhmTraitImports, OnlyProviderIsProjected) {
   EXPECT_NE(Base, ChangedLiteral);
   ASSERT_TRUE(signature(source(Other), ChangedMethod));
   EXPECT_NE(Base, ChangedMethod);
+}
+
+TEST(OhmTraitImports, SkipsSerializationForUnchangedImports) {
+  LLVMContext C;
+  auto M = read(C, source(Name));
+  ASSERT_TRUE(M);
+  Bytes Input, Names;
+  bool Checked = false;
+  auto ShouldProbe = [&](StringRef Imports) {
+    Checked = true;
+    EXPECT_EQ(Imports.drop_back(), Name);
+    EXPECT_TRUE(Imports.ends_with(StringRef("\0", 1)));
+    return false;
+  };
+  EXPECT_FALSE(ohm::writeTraitImportSignature(*M, Input, Names, ShouldProbe));
+  EXPECT_TRUE(Checked);
+  EXPECT_TRUE(Input.empty());
 }
 
 TEST(OhmTraitImports, RequiresUnambiguousDirectImport) {

@@ -79,7 +79,8 @@ static bool isDirectImport(const Function &F) {
 
 bool ohm::writeTraitImportSignature(const Module &M,
                                     SmallVectorImpl<char> &Input,
-                                    SmallVectorImpl<char> &Imports) {
+                                    SmallVectorImpl<char> &Imports,
+                                    function_ref<bool(StringRef)> ShouldProbe) {
   if (!M.getModuleInlineAsm().empty() || !M.alias_empty() || !M.ifunc_empty())
     return false;
 
@@ -95,7 +96,8 @@ bool ohm::writeTraitImportSignature(const Module &M,
     Imports.append(F.getName().begin(), F.getName().end());
     Imports.push_back('\0');
   }
-  if (Paths.empty())
+  if (Paths.empty() ||
+      (ShouldProbe && !ShouldProbe(StringRef(Imports.data(), Imports.size()))))
     return false;
 
   // Assembly can reference spelling-dependent symbols outside IR use lists.

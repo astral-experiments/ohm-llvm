@@ -10,6 +10,7 @@
 #define LLVM_LIB_CODEGEN_OHMTRAITIMPORTS_H
 
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/ADT/StringRef.h"
 
 namespace llvm {
@@ -18,7 +19,8 @@ namespace ohm {
 /// Produce an ordered, closed optimizer signature, separating the names of
 /// directly called v0 trait methods from their instantiating crates.
 bool writeTraitImportSignature(const Module &M, SmallVectorImpl<char> &Input,
-                               SmallVectorImpl<char> &Imports);
+                               SmallVectorImpl<char> &Imports,
+                               function_ref<bool(StringRef)> ShouldProbe = {});
 
 /// Restore each changed import in an LLVM-produced ELF relocatable object.
 /// The caller must match the complete signatures before passing these lists.
