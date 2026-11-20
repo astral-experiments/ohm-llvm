@@ -241,7 +241,7 @@ bool contains(ArrayRef<StringRef> Choices, StringRef Value) {
 struct Invocation {
   std::string Root, Entries, Blobs, Cwd, Remap, Namespace;
   bool WithoutDebug = false;
-  bool PrepareComparisons = false;
+  bool PrepareLocalMethods = false;
   bool TestHarness = false;
   std::optional<ohm::DebugObjectImageGeneration> Generation;
   bool imagesUnchanged() const {
@@ -382,7 +382,7 @@ struct Invocation {
       return;
     // Preparing the IR is independent of whether we can cache the resulting
     // object. Lint selection is immaterial until we might skip diagnostics.
-    PrepareComparisons = !WithoutDebug;
+    PrepareLocalMethods = !WithoutDebug;
     if (ForceWarn)
       return;
     // An ELF extension can change target passes without changing rustc, its
@@ -1061,23 +1061,75 @@ bool llvm::ohm::runDebugObjectCache(Module &M, CodeGenTargetMachineImpl &TM,
 }
 
 #if defined(__linux__) && defined(__x86_64__)
+// A macro can put its impl inside a module-level `const _: ()`. The
+// anonymous constant has its own ordinal, which changes when an earlier
+// macro expansion adds an unrelated constant. Recognize the v0 parent
+// path Nv (Nt)* C <crate> <modules> s<digit>_1__, including identifier
+// lengths, so an ordinary identifier containing that spelling is distinct.
+static std::optional<size_t> anonymousConstantDigit(StringRef Path) {
+  if (!Path.consume_front("Nv"))
+    return std::nullopt;
+  size_t Identifiers = 1;
+  while (Path.consume_front("Nt"))
+    ++Identifiers;
+  if (!Path.consume_front("C"))
+    return std::nullopt;
+  if (Path.consume_front("s")) {
+    while (!Path.empty() && isAlnum(Path.front()))
+      Path = Path.drop_front();
+    if (!Path.consume_front("_"))
+      return std::nullopt;
+  }
+  for (size_t I = 0; I < Identifiers; ++I) {
+    size_t Length;
+    if (Path.consumeInteger(10, Length) || !Length)
+      return std::nullopt;
+    Path.consume_front("_");
+    if (Length > Path.size())
+      return std::nullopt;
+    Path = Path.drop_front(Length);
+  }
+  if (Path.size() <= 6 || Path.front() != 's' || !isAlnum(Path[1]) ||
+      !Path.drop_front(2).starts_with("_1__"))
+    return std::nullopt;
+  return Path.size() - 1;
+}
+
 // The disambiguator in a Rust v0 impl path counts earlier impls in the
 // module. Removing an unrelated impl can rename a tiny comparison in every
 // CGU that uses it. The trait and Self paths already identify the operation.
 // Give local copies a consistent disambiguator before computing the cache
 // keys. Edit one base-62 digit in place to preserve v0 backreference offsets.
-static std::optional<std::string> localTraitComparisonName(Function &F) {
+static bool isScalarComparison(Function &F) {
+  if (!F.getName().starts_with("_RNvXs") ||
+      !F.getReturnType()->isIntegerTy(1))
+    return false;
+  auto *Ret = dyn_cast<ReturnInst>(F.front().getTerminator());
+  auto *Cmp = Ret ? dyn_cast<ICmpInst>(Ret->getReturnValue()) : nullptr;
+  return Cmp && Cmp->isEquality() &&
+         all_of(F.front(), [](const Instruction &I) {
+           if (auto *Load = dyn_cast<LoadInst>(&I))
+             return Load->isSimple();
+           return isa<CastInst, ICmpInst, ReturnInst>(I);
+         });
+}
+
+static std::optional<std::string> localImplMethodName(Function &F) {
   StringRef Name = F.getName();
-  if (!Name.starts_with("_RNvXs") || Name.size() < 9 || Name[7] != '_' ||
-      !F.hasInternalLinkage() || F.hasSection() || F.size() != 1 ||
-      F.front().size() > 8 || !F.getReturnType()->isIntegerTy(1) ||
+  StringRef Path = Name;
+  if (!Path.consume_front("_R"))
+    return std::nullopt;
+  Path.consume_front("I");
+  if ((!Path.consume_front("NvXs") && !Path.consume_front("NvMs")) ||
+      Path.size() < 3 || Path[1] != '_' || !F.hasInternalLinkage() ||
+      F.hasSection() || F.size() != 1 || F.front().size() > 8 ||
       F.hasOptNone() || F.hasFnAttribute(Attribute::NoInline) ||
       F.hasAddressTaken())
     return std::nullopt;
 
   constexpr StringLiteral Digits =
       "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
-  size_t Digit = Digits.find(Name[6]);
+  size_t Digit = Digits.find(Path.front());
   if (Digit == StringRef::npos)
     return std::nullopt;
   auto *SP = F.getSubprogram();
@@ -1094,22 +1146,21 @@ static std::optional<std::string> localTraitComparisonName(Function &F) {
   if (!Scope || Scope->getName() != ("{impl#" + Twine(Digit + 2) + "}").str())
     return std::nullopt;
 
-  auto *Ret = dyn_cast<ReturnInst>(F.front().getTerminator());
-  auto *Cmp = Ret ? dyn_cast<ICmpInst>(Ret->getReturnValue()) : nullptr;
-  if (!Cmp || !Cmp->isEquality() ||
-      !all_of(F.front(), [](const Instruction &I) {
-        if (auto *Load = dyn_cast<LoadInst>(&I))
-          return Load->isSimple();
-        return isa<CastInst, ICmpInst, ReturnInst>(I);
-      }))
+  auto *Parent = dyn_cast_or_null<DINamespace>(Scope->getScope());
+  auto Ordinal = Parent && Parent->getName() == "_"
+                     ? anonymousConstantDigit(Path.drop_front(2))
+                     : std::nullopt;
+  if (!Ordinal && !isScalarComparison(F))
     return std::nullopt;
 
   std::string Result = Name.str();
-  Result[6] = '0';
+  Result[Name.size() - Path.size()] = '0';
+  if (Ordinal)
+    Result[Name.size() - *Ordinal] = '0';
   return Result;
 }
 
-void llvm::ohm::prepareLocalTraitComparisons(Module &M) {
+void llvm::ohm::prepareLocalImplMethods(Module &M) {
   if (M.getModuleFlag("ProfileSummary"))
     return;
   struct Method {
@@ -1118,7 +1169,7 @@ void llvm::ohm::prepareLocalTraitComparisons(Module &M) {
   };
   SmallVector<Method, 4> Methods;
   for (Function &F : M)
-    if (auto Name = localTraitComparisonName(F))
+    if (auto Name = localImplMethodName(F))
       Methods.push_back({std::move(*Name), &F});
   if (Methods.empty() || !canIntroduceRustSymbols(M))
     return;
@@ -1165,8 +1216,8 @@ extern "C" int ohm_early_object_begin_v1(LLVMModuleRef Ref,
     return 0;
   // Rust probes this cache before the line-table cache on regular
   // incremental units. Prepare the module before taking either key.
-  if (M.getNamedMetadata("llvm.dbg.cu") && invocation().PrepareComparisons)
-    ohm::prepareLocalTraitComparisons(M);
+  if (M.getNamedMetadata("llvm.dbg.cu") && invocation().PrepareLocalMethods)
+    ohm::prepareLocalImplMethods(M);
   const bool WithoutDebug = !M.getNamedMetadata("llvm.dbg.cu");
   const bool Large = ohm::isLargeDebugObjectInput(M, true);
   const bool Leaf = !WithoutDebug && ohm_leaf::candidate(M);
