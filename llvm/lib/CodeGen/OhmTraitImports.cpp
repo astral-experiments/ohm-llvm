@@ -194,7 +194,11 @@ bool ohm::writeTraitImportSignature(const Module &M, SmallVectorImpl<char> &Key,
     StringRef Path = traitImportMethodPath(F.getName());
     if (Path.empty() || !isDirectImport(F))
       continue;
-    if (M.getNamedValue(Path) || !Seen.insert(Path).second)
+    // The LLVM assembler-name escape is stripped before ELF emission. Its
+    // references would share the import's symbol index and could not be
+    // distinguished from the calls we intend to rebind.
+    if (M.getNamedValue(("\1" + F.getName()).str()) || M.getNamedValue(Path) ||
+        !Seen.insert(Path).second)
       return false;
     Paths[&F] = Path;
     Imports.append(F.getName().begin(), F.getName().end());

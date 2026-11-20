@@ -117,6 +117,22 @@ TEST(OhmTraitImports, SkipsSerializationForUnchangedImports) {
   EXPECT_TRUE(Input.empty());
 }
 
+TEST(OhmTraitImports, ChecksAssemblerNameAliasesInBothGenerations) {
+  auto withAlias = [](StringRef Provider, StringRef Raw) {
+    return (source(Provider) + "declare i32 @\"\\01" + Raw + "\"()\n" +
+            "define i32 @other() { %v = call i32 @\"\\01" + Raw +
+            "\"() ret i32 %v }\n")
+        .str();
+  };
+  Bytes Key;
+  // A second call has an explicit assembler name. Rebinding its shared
+  // relocation in the donor or merging it with the new provider is ambiguous.
+  EXPECT_FALSE(signature(withAlias(Name, Name), Key));
+  EXPECT_TRUE(signature(withAlias(Longer, Name), Key));
+  EXPECT_TRUE(signature(withAlias(Name, Longer), Key));
+  EXPECT_FALSE(signature(withAlias(Longer, Longer), Key));
+}
+
 TEST(OhmTraitImports, RequiresUnambiguousDirectImport) {
   Bytes B;
   EXPECT_FALSE(signature(source("ordinary_function"), B));
