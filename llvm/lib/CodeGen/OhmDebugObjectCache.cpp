@@ -723,6 +723,9 @@ std::string inputShape(const Module &M, bool TestHarness) {
   return toHex(Hash.final(), true);
 }
 
+// Look for the same closed optimizer input with source lines and the
+// spelling of selected Rust method imports projected out. Verify the
+// method paths and restore their current bindings before replay.
 bool tryTraitObject(Module &M, TargetMachine &TM, const Invocation &I,
                     StringRef Output, void **Ticket) {
   if (TM.getOptLevel() != CodeGenOptLevel::Less)
