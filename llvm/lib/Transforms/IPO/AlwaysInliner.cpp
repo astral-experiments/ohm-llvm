@@ -22,6 +22,7 @@
 #include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
 #include "llvm/IR/DiagnosticInfo.h"
+#include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Module.h"
 #include "llvm/InitializePasses.h"
 #include "llvm/Transforms/Utils/Cloning.h"
@@ -39,7 +40,19 @@ bool AlwaysInlineImpl(
     function_ref<AssumptionCache &(Function &)> GetAssumptionCache,
     function_ref<AAResults &(Function &)> GetAAR,
     function_ref<TargetTransformInfo &(Function &)> GetTTI,
-    function_ref<const TargetLibraryInfo &(Function &)> GetTLI) {
+    function_ref<const TargetLibraryInfo &(Function &)> GetTLI,
+    unsigned MaxInstructions = 0) {
+  auto IsSmall = [MaxInstructions](const Function &F) {
+    if (!MaxInstructions || F.isInterposable() ||
+        F.getInstructionCount() > MaxInstructions)
+      return false;
+    // Leave stack growth to the regular cost model. A single alloca can
+    // substantially increase the size of every recursive caller frame.
+    return none_of(F.args(),
+                   [](const Argument &A) { return A.hasByValAttr(); }) &&
+           none_of(instructions(F),
+                   [](const Instruction &I) { return isa<AllocaInst>(I); });
+  };
   SmallSetVector<CallBase *, 16> Calls;
   bool Changed = false;
   SmallVector<Function *, 16> InlinedComdatFunctions;
@@ -56,6 +69,9 @@ bool AlwaysInlineImpl(
     TargetTransformInfo &CalleeTTI = GetTTI(Callee);
     std::optional<InlineResult> CanInlineWithAttributes =
         getAttributeBasedInliningDecision(CB, &Callee, CalleeTTI, GetTLI);
+    if (!CanInlineWithAttributes && IsSmall(Callee) && Caller->size() < 256 &&
+        AttributeFuncs::areInlineCompatible(*Caller, Callee))
+      CanInlineWithAttributes = InlineResult::success();
     if (!CanInlineWithAttributes || !CanInlineWithAttributes->isSuccess()) {
       ORE.emit([&]() {
         return OptimizationRemarkMissed(DEBUG_TYPE, "NotInlined", DLoc, Block)
@@ -103,22 +119,29 @@ bool AlwaysInlineImpl(
     if (F.isDeclaration() || !isInlineViable(F).isSuccess())
       continue;
 
+    bool Small = IsSmall(F);
     Calls.clear();
 
     for (User *U : F.users())
       if (auto *CB = dyn_cast<CallBase>(U))
         if (CB->getCalledFunction() == &F &&
-            CB->hasFnAttr(Attribute::AlwaysInline) &&
+            (CB->hasFnAttr(Attribute::AlwaysInline) ||
+             (Small && !CB->isMustTailCall())) &&
             !CB->getAttributes().hasFnAttr(Attribute::NoInline))
           Calls.insert(CB);
 
     for (CallBase *CB : Calls) {
       OptimizationRemarkEmitter ORE(CB->getCaller());
-      Changed |= TryInline(*CB, F, ORE, "always inline attribute");
+      Changed |= TryInline(*CB, F, ORE,
+                           CB->hasFnAttr(Attribute::AlwaysInline)
+                               ? "always inline attribute"
+                               : "small callee");
     }
 
     F.removeDeadConstantUsers();
-    if (F.hasFnAttribute(Attribute::AlwaysInline) && F.isDefTriviallyDead()) {
+    if ((F.hasFnAttribute(Attribute::AlwaysInline) ||
+         (Small && !F.hasFnAttribute(Attribute::Flatten))) &&
+        F.isDefTriviallyDead()) {
       if (F.hasComdat()) {
         InlinedComdatFunctions.push_back(&F);
       } else {
@@ -272,6 +295,12 @@ Pass *llvm::createAlwaysInlinerLegacyPass(bool InsertLifetime) {
 
 PreservedAnalyses AlwaysInlinerPass::run(Module &M,
                                          ModuleAnalysisManager &MAM) {
+  return runWithSmallCallees(M, MAM, /*MaxInstructions=*/0);
+}
+
+PreservedAnalyses
+AlwaysInlinerPass::runWithSmallCallees(Module &M, ModuleAnalysisManager &MAM,
+                                       unsigned MaxInstructions) {
   FunctionAnalysisManager &FAM =
       MAM.getResult<FunctionAnalysisManagerModuleProxy>(M).getManager();
   auto GetAssumptionCache = [&](Function &F) -> AssumptionCache & {
@@ -288,8 +317,9 @@ PreservedAnalyses AlwaysInlinerPass::run(Module &M,
   };
   auto &PSI = MAM.getResult<ProfileSummaryAnalysis>(M);
 
-  bool Changed = AlwaysInlineImpl(M, InsertLifetime, PSI, &FAM,
-                                  GetAssumptionCache, GetAAR, GetTTI, GetTLI);
+  bool Changed =
+      AlwaysInlineImpl(M, InsertLifetime, PSI, &FAM, GetAssumptionCache, GetAAR,
+                       GetTTI, GetTLI, MaxInstructions);
   if (!Changed)
     return PreservedAnalyses::all();
 
