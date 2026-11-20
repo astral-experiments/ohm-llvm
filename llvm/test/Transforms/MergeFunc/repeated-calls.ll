@@ -1,12 +1,14 @@
 ; RUN: opt -passes=merge-repeated-calls -verify-each -S %s | FileCheck %s
 ; RUN: opt -passes='default<O1>' -verify-each -S %s | FileCheck %s --check-prefix=LINK --implicit-check-not='call void @unresolved'
 ; RUN: sed '/^!llvm.ident/d' %s | opt -passes=merge-repeated-calls -S | FileCheck %s --check-prefix=OTHER
+; RUN: sed 's/^; COLLISION: //' %s | opt -passes=merge-repeated-calls -S | FileCheck %s --check-prefix=OTHER
 ; REQUIRES: x86-registered-target
 
 target triple = "x86_64-unknown-linux-gnu"
 
 declare noundef i32 @_RopaqueA(ptr) noreturn nounwind
 declare noundef i32 @_RopaqueB(ptr) noreturn nounwind
+; COLLISION: declare void @"\01_RrunA.Tgm"()
 declare void @unresolved()
 declare i32 @rust_eh_personality(...)
 

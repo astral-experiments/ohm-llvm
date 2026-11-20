@@ -29,6 +29,7 @@
 #include "llvm/Analysis/TypeBasedAliasAnalysis.h"
 #include "llvm/CodeGen/GlobalMergeFunctions.h"
 #include "llvm/IR/PassManager.h"
+#include "llvm/IR/RustSymbolChecks.h"
 #include "llvm/IR/ValueMap.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/Pass.h"
@@ -1006,7 +1007,7 @@ PreservedAnalyses InlineSmallRustFunctionsPass::run(Module &M,
 
 PreservedAnalyses
 MergeIdenticalRustFunctionsPass::run(Module &M, ModuleAnalysisManager &AM) {
-  if (!isRustModule(M))
+  if (!isRustModule(M) || !canIntroduceRustSymbols(M))
     return PreservedAnalyses::all();
   return MergeFunctionsPass().run(M, AM);
 }

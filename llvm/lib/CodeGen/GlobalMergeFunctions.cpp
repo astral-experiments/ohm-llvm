@@ -18,6 +18,7 @@
 #include "llvm/CodeGen/Passes.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/IntrinsicInst.h"
+#include "llvm/IR/RustSymbolChecks.h"
 #include "llvm/IR/StructuralHash.h"
 #include "llvm/InitializePasses.h"
 #include "llvm/Support/CommandLine.h"
@@ -266,7 +267,7 @@ static bool isCallTarget(const Instruction *I, unsigned Index) {
 }
 
 bool GlobalMergeFunc::shareCallTargets(Module &M) {
-  if (M.getModuleFlag("cf-protection-branch"))
+  if (!canIntroduceRustSymbols(M) || M.getModuleFlag("cf-protection-branch"))
     return false;
   GlobalMergeFunc Merger(nullptr);
   Merger.MergerMode = HashFunctionMode::LocalCallTargets;
