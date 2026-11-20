@@ -187,8 +187,12 @@ public:
     return It->second;
   }
 
+  bool isChecksumOnly(const MDString *Str) const {
+    return Checksums.contains(Str) && !OtherStrings.contains(Str);
+  }
+
   bool mask(const MDString *Str) {
-    bool Mask = Checksums.contains(Str) && !OtherStrings.contains(Str);
+    bool Mask = isChecksumOnly(Str);
     MaskedStrings.push_back(Mask);
     return Mask;
   }

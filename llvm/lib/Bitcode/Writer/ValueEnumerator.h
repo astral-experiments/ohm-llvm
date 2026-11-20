@@ -60,6 +60,7 @@ class ValueEnumerator {
 
 public:
   void setSourceMap(DebugObjectSourceMap *Map) { SourceMap = Map; }
+  DebugObjectSourceMap *getSourceMap() const { return SourceMap; }
   StringRef callerTail(const ConstantDataSequential *C) const {
     if (SourceMap && !SourceMap->CallerTails.empty()) {
       auto I = SourceMap->CallerTails.find(C);
