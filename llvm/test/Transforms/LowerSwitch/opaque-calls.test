@@ -1,6 +1,8 @@
 # RUN: %python %s > %t.ll
 # RUN: opt -passes=lower-switch-calls -verify-each -S %t.ll | FileCheck %s
 # RUN: opt -relocation-model=pic -passes='default<O1>' -S %t.ll | FileCheck %s --check-prefix=O1
+# RUN: %python %s --collision | opt -passes=lower-switch-calls -S | FileCheck %s --check-prefix=CLASH --implicit-check-not="@switch.table."
+# CLASH: define i32 @_Rdata(
 # REQUIRES: x86-registered-target
 
 # Generate dense switches at the minimum size used by the transform.
@@ -58,6 +60,8 @@
 # CHECK-LABEL: define i32 @_Rattributes(
 # CHECK-COUNT-16: call signext i32
 # CHECK-COUNT-16: call zeroext i32
+
+import sys
 
 print('target triple = "x86_64-unknown-linux-gnu"')
 keys = range(32)
@@ -118,3 +122,6 @@ define i32 @local_use(i8 %key) {
 print("!llvm.ident = !{!0}")
 print('!0 = !{!"rustc version 1.100.0"}')
 print("!1 = !{i8 0, i8 31}")
+
+if "--collision" in sys.argv:
+    print(r'declare void @"\01.Lswitch.table._Rdata.rel"()')

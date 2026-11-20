@@ -32,6 +32,7 @@
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/PassManager.h"
+#include "llvm/IR/RustSymbolChecks.h"
 #include "llvm/IR/Value.h"
 #include "llvm/InitializePasses.h"
 #include "llvm/Pass.h"
@@ -851,9 +852,7 @@ static bool lowerGetterSwitch(SwitchInst &SI) {
 
 PreservedAnalyses LowerSwitchCallsPass::run(Module &M,
                                             ModuleAnalysisManager &AM) {
-  if (M.getTargetTriple().getArch() != Triple::x86_64 ||
-      !M.getTargetTriple().isOSLinux() ||
-      M.getModuleFlag("cf-protection-branch"))
+  if (!canIntroduceRustSymbols(M) || M.getModuleFlag("cf-protection-branch"))
     return PreservedAnalyses::all();
 
   bool Changed = false;
