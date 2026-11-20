@@ -1,3 +1,4 @@
+# REQUIRES: x86-registered-target
 # RUN: %python %s > %t.ll
 # RUN: opt -passes=lower-string-match -verify-each -S %t.ll | FileCheck %s
 # RUN: opt -relocation-model=pic -passes='default<O1>' -S %t.ll | FileCheck %s --check-prefix=O1
