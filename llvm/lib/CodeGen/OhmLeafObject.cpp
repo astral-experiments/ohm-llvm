@@ -6,32 +6,24 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// Adding an enum variant can change range annotations throughout a crate
-// and renumber a set of functions that just return a discriminant. Round
-// the upper bound before optimizing, so even the first object is valid
-// throughout the wider range. Compare the rest of the live inputs exactly
-// except for the immediate returned by an isolated function. Each changed
-// return must still occupy its own mov/ret section, with no aliases or
-// incoming code/data relocations.
+// Reassigning enum variants can renumber functions returning a discriminant.
+// Compare the complete optimizer input with just the returned literals masked.
+// Each changed return must occupy its own mov/ret section, with no aliases
+// or incoming code/data relocations.
 //
 //===----------------------------------------------------------------------===//
 
 #include "OhmLeafObject.h"
-#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/ScopeExit.h"
-#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/StringMap.h"
-#include "llvm/Bitcode/BitcodeWriter.h"
-#include "llvm/IR/ClosedOptimizerContext.h"
+#include "llvm/Bitcode/ClosedModuleHash.h"
 #include "llvm/IR/ConstantRange.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Object/ELF.h"
 #include "llvm/Support/BLAKE3.h"
-#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Endian.h"
-#include "llvm/Support/MathExtras.h"
 
 using namespace llvm;
 
@@ -55,87 +47,19 @@ Digest binding(StringRef Proof, StringRef Object) {
   return Hash.final();
 }
 
-// Keep narrow ranges and signed/wrapping ranges intact. Rounding from
-// [0, 974) to [0, 976) lets consecutive enum additions share a bound.
 bool isLargeTag(const APInt &Lower, const APInt &Upper) {
   return Upper.getBitWidth() == 16 && Lower.isZero() && Upper.ugt(256) &&
          Upper.isNonNegative();
 }
 
-bool returnsLargeTag(const Function &F) {
+Attribute tagRange(const Function &F) {
   if (!F.getReturnType()->isIntegerTy(16) || !F.getName().starts_with("_R"))
-    return false;
+    return {};
   auto Attr = F.getAttributes().getRetAttrs().getAttribute(Attribute::Range);
   if (!Attr.isValid())
-    return false;
+    return {};
   const ConstantRange &R = Attr.getValueAsConstantRange();
-  return isLargeTag(R.getLower(), R.getUpper());
-}
-
-std::optional<APInt> widerBound(const APInt &Low, const APInt &High) {
-  if (!isLargeTag(Low, High) || isAligned(Align(16), High.getZExtValue()))
-    return std::nullopt;
-  return APInt(16, alignTo(High.getZExtValue(), 16));
-}
-
-template <typename T> void widenAttributes(T &V) {
-  AttributeList Original = V.getAttributes();
-  AttributeList Attrs = Original;
-  auto &C = V.getContext();
-  for (unsigned Index : Original.indexes()) {
-    auto A = Original.getAttributeAtIndex(Index, Attribute::Range);
-    if (!A.isValid())
-      continue;
-    const auto &R = A.getValueAsConstantRange();
-    if (auto High = widerBound(R.getLower(), R.getUpper())) {
-      Attrs = Attrs.removeAttributeAtIndex(C, Index, Attribute::Range);
-      Attrs = Attrs.addAttributeAtIndex(
-          C, Index,
-          Attribute::get(C, Attribute::Range,
-                         ConstantRange(R.getLower(), *High)));
-    }
-  }
-  if (Attrs != Original)
-    V.setAttributes(Attrs);
-}
-
-// Widen only metadata exclusively used on range attachments, and only
-// when the upper-bound wrapper belongs to this tuple alone. Retarget it
-// in place so subsequent DWARF cache checks see a closed context. Creating
-// a new tuple would strand the old upper bound and its tracking references.
-void widenRange(LLVMContext &C, MDNode *R) {
-  if (!isa<MDTuple>(R) || R->isDistinct() || R->getNumOperands() != 2)
-    return;
-  auto *Low = mdconst::dyn_extract<ConstantInt>(R->getOperand(0));
-  auto *High = mdconst::dyn_extract<ConstantInt>(R->getOperand(1));
-  if (!Low || !High || Low->getType() != High->getType())
-    return;
-  auto Bound = widerBound(Low->getValue(), High->getValue());
-  if (!Bound)
-    return;
-  auto *New = ConstantInt::get(C, *Bound);
-  if (ValueAsMetadata::getIfExists(New) ||
-      MetadataAsValue::getIfExists(C, R->getOperand(1)) ||
-      !ReplaceableMetadataImpl::hasOnlyRepresentedUsers(
-          *R->getOperand(1), DenseSet<Value *>(), {R}))
-    return;
-  ValueAsMetadata::handleRAUW(High, New);
-}
-
-void widenRanges(Module &M, SmallPtrSetImpl<Metadata *> &Ranges) {
-  for (Function &F : M) {
-    widenAttributes(F);
-    for (BasicBlock &BB : F)
-      for (Instruction &I : BB) {
-        if (auto *Call = dyn_cast<CallBase>(&I))
-          widenAttributes(*Call);
-        if (!I.hasMetadataOtherThanDebugLoc())
-          continue;
-        auto *R = I.getMetadata(LLVMContext::MD_range);
-        if (R && Ranges.erase(R))
-          widenRange(M.getContext(), R);
-      }
-  }
+  return isLargeTag(R.getLower(), R.getUpper()) ? Attr : Attribute();
 }
 
 struct Leaf {
@@ -145,9 +69,9 @@ struct Leaf {
 
 // The literal cannot flow through a call or address in the IR. Reject
 // special entry points and metadata (e.g. type IDs for devirtualization).
-std::optional<Leaf> isolatedLeaf(Function &F) {
-  if (!returnsLargeTag(F) || F.getName().contains(char(0)) ||
-      !F.hasExternalLinkage() || !F.hasDefaultVisibility() ||
+std::optional<Leaf> isolatedLeaf(Function &F, const ConstantRange &Range) {
+  if (F.getName().contains(char(0)) || !F.hasExternalLinkage() ||
+      !F.hasDefaultVisibility() ||
       F.getDLLStorageClass() != GlobalValue::DefaultStorageClass ||
       F.getCallingConv() != CallingConv::C || !F.arg_empty() || F.isVarArg() ||
       !F.use_empty() || F.isUsedByMetadata() || F.hasComdat() ||
@@ -163,11 +87,7 @@ std::optional<Leaf> isolatedLeaf(Function &F) {
   if (!Ret || Ret->hasMetadataOtherThanDebugLoc())
     return std::nullopt;
   auto *V = dyn_cast_or_null<ConstantInt>(Ret->getReturnValue());
-  if (!V || !F.getAttributes()
-                 .getRetAttrs()
-                 .getAttribute(Attribute::Range)
-                 .getValueAsConstantRange()
-                 .contains(V->getValue()))
+  if (!V || !Range.contains(V->getValue()))
     return std::nullopt;
   return Leaf{Ret, V};
 }
@@ -355,20 +275,35 @@ bool ohm_leaf::candidate(const Module &M) {
   const Triple &T = M.getTargetTriple();
   return T.getArch() == Triple::x86_64 && T.isOSBinFormatELF() &&
          M.isMaterialized() && M.getModuleInlineAsm().empty() &&
-         M.ifunc_empty() && any_of(M, returnsLargeTag);
+         M.ifunc_empty() &&
+         any_of(M, [](const Function &F) { return tagRange(F).isValid(); });
 }
 
-std::string ohm_leaf::prepare(Module &M, StringRef Configuration) {
+std::string ohm_leaf::prepare(Module &M, StringRef Configuration,
+                              StringRef Previous) {
   if (Configuration.empty() || !candidate(M))
     return {};
-  auto *Order = cl::getRegisteredOptions().lookup("preserve-bc-uselistorder");
-  if (!Order || Order->getNumOccurrences())
-    return {};
-
   SmallVector<Leaf> Leaves;
-  for (auto &F : M)
-    if (auto Slot = isolatedLeaf(F))
-      Leaves.push_back(*Slot);
+  std::string Literals;
+  for (auto &F : M) {
+    auto Range = tagRange(F);
+    if (!Range.isValid())
+      continue;
+    auto Slot = isolatedLeaf(F, Range.getValueAsConstantRange());
+    if (!Slot)
+      continue;
+    Leaves.push_back(*Slot);
+    Literals += F.getName();
+    Literals.push_back(0);
+    char Value[2];
+    support::endian::write16le(Value, Slot->Value->getZExtValue());
+    Literals.append(Value, 2);
+  }
+  // The previous witness starts with the object binding and input digest.
+  // This is a performance hint only. Reuse checks the complete witness.
+  if (Leaves.empty() ||
+      (Previous.size() >= 64 && Previous.drop_front(64) == Literals))
+    return {};
 
   // Integer constants have no use list. Restoring a literal cannot change
   // the use order of another value in the module.
@@ -379,31 +314,14 @@ std::string ohm_leaf::prepare(Module &M, StringRef Configuration) {
       L.Ret->setOperand(0, L.Value);
   });
 
-  // Account for the original metadata owners before retargeting any bound.
-  Digest Context;
-  SmallPtrSet<Metadata *, 8> Ranges;
-  if (!getClosedOptimizerContextV1(M, Context, Ranges))
+  Digest Input;
+  if (!getClosedModuleHashV1(M, Input))
     return {};
-  widenRanges(M, Ranges);
-  SmallVector<char, 0> IR;
-  raw_svector_ostream OS(IR);
-  WriteBitcodeToFile(M, OS, /*ShouldPreserveUseListOrder=*/true);
   BLAKE3 Hash;
-  Hash.update("ohm-enum-input-v1");
+  Hash.update("ohm-literal-input-v1");
   Hash.update(digest(Configuration));
-  Hash.update(Context);
-  Hash.update(digest(M.getModuleIdentifier()));
-  Hash.update(OS.str());
-  std::string Proof = bytes(Hash.final()).str();
-  for (auto &L : Leaves) {
-    StringRef Name = L.Ret->getFunction()->getName();
-    Proof.append(Name.data(), Name.size());
-    Proof.push_back(0);
-    char Value[2];
-    support::endian::write16le(Value, L.Value->getZExtValue());
-    Proof.append(Value, 2);
-  }
-  return Proof;
+  Hash.update(Input);
+  return bytes(Hash.final()).str() + Literals;
 }
 
 std::string ohm_leaf::enroll(StringRef Proof, StringRef Object) {

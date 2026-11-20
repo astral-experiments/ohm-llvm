@@ -622,20 +622,14 @@ struct EarlyOrigin {
 };
 thread_local std::weak_ptr<EarlyOrigin> PendingEarly;
 
-// Try an entry for this codegen unit. The engine checks the exact sealed
-// object and the live input before adjusting any instruction operands.
-std::string loadLeafObject(StringRef Path, StringRef Proof) {
-  auto Buffer = readPrivate(Path, MaxOrigin);
-  if (!Buffer)
-    return {};
-  StringRef Record = Buffer->getBuffer();
+std::pair<StringRef, StringRef> splitLeafRecord(StringRef Record) {
   if (!Record.consume_front("OHMLEAF1") || Record.size() < 8)
     return {};
   uint64_t N = support::endian::read64le(Record.data());
   Record = Record.drop_front(8);
   if (!N || N >= Record.size())
     return {};
-  return ohm_leaf::tryReuse(Proof, Record.take_front(N), Record.drop_front(N));
+  return {Record.take_front(N), Record.drop_front(N)};
 }
 
 bool tryLeafObject(Module &M, TargetMachine &TM, const Invocation &I,
@@ -646,19 +640,21 @@ bool tryLeafObject(Module &M, TargetMachine &TM, const Invocation &I,
   frame(H, machineTarget(M, TM));
   frame(H, M.getModuleIdentifier());
   auto Key = toHex(H.final(), true);
-  auto Proof = ohm_leaf::prepare(M, Key);
+  auto Path = joinPath(I.Entries, "llvmcache-" + Key);
+  auto Buffer = readPrivate(Path, MaxOrigin);
+  auto [Witness, Prior] =
+      splitLeafRecord(Buffer ? Buffer->getBuffer() : StringRef());
+  auto Proof = ohm_leaf::prepare(M, Key, Witness);
   if (Proof.empty())
     return false;
-  auto Path = joinPath(I.Entries, "llvmcache-" + Key);
-  auto Object = loadLeafObject(Path, Proof);
+  auto Object = ohm_leaf::tryReuse(Proof, Witness, Prior);
   if (!Object.empty() && I.imagesUnchanged() &&
       writeAtomic(Output, {Object}, 0666)) {
     event(M.getModuleIdentifier(), "leaf-hit");
     return true;
   }
 
-  // prepare() has rounded selected range attributes in the live module.
-  // Enroll only the bytes from its own optimizer and machine pipeline.
+  // Enroll only the bytes from this exact compilation.
   auto Origin = std::make_shared<EarlyOrigin>(M, std::move(Key));
   Origin->Leaf = LeafOrigin{&TM, std::move(Proof), {}};
   PendingEarly = Origin;

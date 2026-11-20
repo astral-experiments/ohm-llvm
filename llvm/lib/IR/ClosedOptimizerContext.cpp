@@ -8,7 +8,6 @@
 
 #include "llvm/IR/ClosedOptimizerContext.h"
 #include "LLVMContextImpl.h"
-#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/IR/DiagnosticHandler.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/OptBisect.h"
@@ -97,9 +96,8 @@ static bool isTerminalSlice(User *U, Value *Address) {
          E->getOperand(0)->getType()->isIntegerTy(64);
 }
 
-static bool fingerprintContext(const Module &Input,
-                               std::array<uint8_t, 32> &Digest,
-                               SmallPtrSetImpl<Metadata *> *Ranges) {
+bool llvm::getClosedOptimizerContextV1(const Module &Input,
+                                       std::array<uint8_t, 32> &Digest) {
   // LLVM's context metadata accessors take mutable pointers. This walk does
   // not change an instruction, a constant, a use list or a metadata owner.
   auto &M = const_cast<Module &>(Input);
@@ -124,22 +122,15 @@ static bool fingerprintContext(const Module &Input,
     if (V && ValueIDs.try_emplace(V, Values.size() + 1).second)
       Values.push_back(V);
   };
-  auto AddNode = [&](Metadata *N, bool Range = false) {
-    if (!N)
-      return;
-    if (Seen.try_emplace(N, Nodes.size() + 1).second) {
+  auto AddNode = [&](Metadata *N) {
+    if (N && Seen.try_emplace(N, Nodes.size() + 1).second)
       Nodes.push_back(N);
-      if (Ranges && Range)
-        Ranges->insert(N);
-    } else if (Ranges && !Range) {
-      Ranges->erase(N);
-    }
   };
-  auto Attachments = [&](auto &V, bool Instruction = false) {
+  auto Attachments = [&](auto &V) {
     SmallVector<std::pair<unsigned, MDNode *>, 4> A;
     V.getAllMetadata(A);
     for (auto P : A)
-      AddNode(P.second, Instruction && P.first == LLVMContext::MD_range);
+      AddNode(P.second);
   };
   for (auto &N : M.named_metadata())
     for (auto *MD : N.operands())
@@ -158,7 +149,7 @@ static bool fingerprintContext(const Module &Input,
             return false;
           AddValue(&Inst);
           if (Inst.hasMetadata())
-            Attachments(Inst, true);
+            Attachments(Inst);
         }
       }
     }
@@ -305,16 +296,4 @@ static bool fingerprintContext(const Module &Input,
   Flush();
   Digest = Hash.final();
   return true;
-}
-
-bool llvm::getClosedOptimizerContextV1(const Module &M,
-                                       std::array<uint8_t, 32> &Digest) {
-  return fingerprintContext(M, Digest, nullptr);
-}
-
-bool llvm::getClosedOptimizerContextV1(const Module &M,
-                                       std::array<uint8_t, 32> &Digest,
-                                       SmallPtrSetImpl<Metadata *> &Ranges) {
-  Ranges.clear();
-  return fingerprintContext(M, Digest, &Ranges);
 }

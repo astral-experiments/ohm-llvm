@@ -7,7 +7,6 @@
 //===----------------------------------------------------------------------===//
 
 #include "../../lib/CodeGen/OhmLeafObject.h"
-#include "llvm/IR/ClosedOptimizerContext.h"
 #include "llvm/IR/ConstantRange.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/LegacyPassManager.h"
@@ -55,63 +54,19 @@ std::unique_ptr<Module> rules(LLVMContext &C, unsigned Literal,
   return M;
 }
 
-TEST(OhmLeafInput, RoundsRangesOnTheActualDonorAndRestoresTheLiteral) {
+TEST(OhmLeafInput, KeepsPreciseRangesAndRestoresTheLiteral) {
   LLVMContext C;
   auto M = rules(C, 501);
   EXPECT_TRUE(ohm_leaf::candidate(*M));
   EXPECT_FALSE(ohm_leaf::prepare(*M, "session").empty());
   auto *F = M->getFunction(Name);
   auto Attr = F->getAttributes().getRetAttrs().getAttribute(Attribute::Range);
-  EXPECT_EQ(Attr.getValueAsConstantRange().getUpper(), APInt(16, 976));
+  EXPECT_EQ(Attr.getValueAsConstantRange().getUpper(), APInt(16, 974));
   auto *Ret = cast<ReturnInst>(&F->getEntryBlock().front());
   EXPECT_EQ(cast<ConstantInt>(Ret->getReturnValue())->getZExtValue(), 501u);
 }
 
-// Rust computes its DWARF certificate after preparing an early object.
-// Updating a !range attachment must keep the tracking owners represented.
-TEST(OhmLeafInput, WideningRetainsAClosedContextAndUnrelatedMetadata) {
-  enum Sharing { OnlyRanges, NestedTuple, SharedBound, TargetExists };
-  for (auto Mode : {OnlyRanges, NestedTuple, SharedBound, TargetExists}) {
-    LLVMContext C;
-    auto M = rules(C, 501);
-    IRBuilder<> B(C);
-    auto *Fn = Function::Create(
-        FunctionType::get(B.getInt16Ty(), {B.getPtrTy()}, false),
-        GlobalValue::ExternalLinkage, "reader", *M);
-    B.SetInsertPoint(BasicBlock::Create(C, "entry", Fn));
-    auto Val = [&](unsigned N) {
-      return ConstantAsMetadata::get(B.getInt16(N));
-    };
-    auto *Tuple = MDTuple::get(C, {Val(0), Val(974)});
-    auto Load = [&] {
-      auto *Inst = B.CreateLoad(B.getInt16Ty(), Fn->getArg(0));
-      Inst->setMetadata(LLVMContext::MD_range, Tuple);
-      return Inst;
-    };
-    auto *First = Load();
-    auto *Second = Load();
-    B.CreateRet(B.CreateAdd(First, Second));
-    if (Mode != OnlyRanges) {
-      Metadata *Other = Tuple;
-      if (Mode != NestedTuple)
-        Other = Val(Mode == TargetExists ? 976 : 974);
-      M->getOrInsertNamedMetadata("other")->addOperand(
-          MDTuple::get(C, {Other}));
-    }
-
-    ASSERT_FALSE(ohm_leaf::prepare(*M, "session").empty());
-    std::array<uint8_t, 32> Digest;
-    ASSERT_TRUE(getClosedOptimizerContextV1(*M, Digest));
-    for (auto *I : {First, Second}) {
-      auto *R = I->getMetadata(LLVMContext::MD_range);
-      ASSERT_TRUE(R);
-      auto *High = mdconst::extract<ConstantInt>(R->getOperand(1));
-      EXPECT_EQ(High->getZExtValue(), Mode == OnlyRanges ? 976u : 974u);
-    }
-  }
-}
-
-TEST(OhmLeafInput, RefusesAnUnclosedContextBeforeWidening) {
+TEST(OhmLeafInput, RefusesAnUnclosedContext) {
   LLVMContext C;
   auto M = rules(C, 501);
   Module Unrelated("another", C);
@@ -174,7 +129,7 @@ TEST_F(OhmLeafObject, MatchesAFreshObjectAfterOneOfTwoEqualReturnsChanges) {
   auto Witness = ohm_leaf::enroll(First, Donor);
   ASSERT_FALSE(Witness.empty());
 
-  auto M = rules(Current, 502, 975);
+  auto M = rules(Current, 502);
   auto Proof = ohm_leaf::prepare(*M, "session");
   auto Actual = ohm_leaf::tryReuse(Proof, Witness, Donor);
   ASSERT_FALSE(Actual.empty());
@@ -188,12 +143,12 @@ TEST_F(OhmLeafObject, RejectsMergedFunctions) {
   // immediate would affect both functions.
   LLVMContext Old, Current;
   auto Before = rules(Old, 501);
-  auto After = rules(Current, 502, 975);
+  auto After = rules(Current, 502);
   auto First = ohm_leaf::prepare(*Before, "session");
   auto Proof = ohm_leaf::prepare(*After, "session");
   for (auto Kind : {Other::Forward, Other::Alias}) {
     LLVMContext Folded;
-    auto Equivalent = rules(Folded, 501, 976, Kind);
+    auto Equivalent = rules(Folded, 501, 974, Kind);
     auto Donor = emit(*Equivalent);
     auto Witness = ohm_leaf::enroll(First, Donor);
     ASSERT_FALSE(Witness.empty());
@@ -208,14 +163,16 @@ TEST_F(OhmLeafObject, RejectsOtherInputsAndCorruptObjects) {
   auto Donor = emit(*Before);
   auto Witness = ohm_leaf::enroll(First, Donor);
   ASSERT_FALSE(Witness.empty());
-  auto M = rules(Current, 502, 975);
+  auto M = rules(Current, 502);
   auto OtherSession = ohm_leaf::prepare(*M, "other");
   EXPECT_TRUE(ohm_leaf::tryReuse(OtherSession, Witness, Donor).empty());
 
+  EXPECT_TRUE(ohm_leaf::prepare(*Before, "session", Witness).empty());
+
   LLVMContext Wider;
-  auto Wide = rules(Wider, 502, 977);
-  auto OtherBucket = ohm_leaf::prepare(*Wide, "session");
-  EXPECT_TRUE(ohm_leaf::tryReuse(OtherBucket, Witness, Donor).empty());
+  auto Wide = rules(Wider, 502, 975);
+  auto DifferentBound = ohm_leaf::prepare(*Wide, "session");
+  EXPECT_TRUE(ohm_leaf::tryReuse(DifferentBound, Witness, Donor).empty());
 
   auto Proof = ohm_leaf::prepare(*M, "session");
   ASSERT_FALSE(ohm_leaf::tryReuse(Proof, Witness, Donor).empty());
