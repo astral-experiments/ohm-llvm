@@ -17,6 +17,8 @@
 #include "llvm/CGData/CodeGenDataWriter.h"
 #include "llvm/CodeGen/Passes.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/IntrinsicInst.h"
+#include "llvm/IR/RustSymbolChecks.h"
 #include "llvm/IR/StructuralHash.h"
 #include "llvm/InitializePasses.h"
 #include "llvm/Support/CommandLine.h"
@@ -146,14 +148,143 @@ static bool ignoreOp(const Instruction *I, unsigned OpIdx) {
   return true;
 }
 
+static bool canForwardThroughThunk(Function &F) {
+  // Keep functions with in-module callers intact. In particular, a thunk
+  // would hide a recursive call from tail recursion elimination.
+  if (!F.use_empty() || F.arg_size() >= 5 || !F.getName().starts_with("_R") ||
+      F.getInstructionCount() < 12 ||
+      F.getParent()->getNamedValue(
+          (F.getName() + GlobalMergeFunc::MergingInstanceSuffix).str()) ||
+      F.getCallingConv() != CallingConv::C || F.hasPrefixData() ||
+      F.hasPrologueData() || F.hasGC() || F.getAddressSpace() ||
+      F.hasFnAttribute(Attribute::NoDuplicate) ||
+      F.hasFnAttribute(Attribute::DenormalFPEnv) ||
+      F.hasFnAttribute(Attribute::Preallocated) ||
+      F.hasFnAttribute(Attribute::Speculatable) ||
+      F.hasFnAttribute(Attribute::NoIPA) ||
+      F.hasFnAttribute(Attribute::PresplitCoroutine) ||
+      F.hasFnAttribute(Attribute::Naked) ||
+      F.hasFnAttribute(Attribute::Convergent) ||
+      F.hasFnAttribute(Attribute::ReturnsTwice) ||
+      F.hasFnAttribute(Attribute::OptimizeNone))
+    return false;
+
+  SmallVector<std::pair<unsigned, MDNode *>> Metadata;
+  F.getAllMetadata(Metadata);
+  if (any_of(Metadata,
+             [](auto Entry) { return Entry.first != LLVMContext::MD_dbg; }))
+    return false;
+  for (Argument &Arg : F.args()) {
+    Type *Ty = Arg.getType();
+    if (Arg.hasByValAttr() || Arg.hasInAllocaAttr() ||
+        Arg.hasPreallocatedAttr() ||
+        !(Ty->isPointerTy() ||
+          (Ty->isIntegerTy() && Ty->getIntegerBitWidth() <= 64)))
+      return false;
+  }
+
+  for (auto &BB : F) {
+    if (BB.hasAddressTaken())
+      return false;
+    for (auto &I : BB) {
+      auto *Call = dyn_cast<CallBase>(&I);
+      if (!Call)
+        continue;
+      if (Call->isInlineAsm() || Call->hasOperandBundles() ||
+          Call->cannotDuplicate() || Call->cannotMerge() ||
+          Call->isConvergent() || Call->hasFnAttr(Attribute::ReturnsTwice))
+        return false;
+      // A new frame changes the meaning of operations such as
+      // llvm.returnaddress. Admit only ordinary memory and value intrinsics.
+      if (isa<IntrinsicInst>(Call) && !isa<MemIntrinsic, AssumeInst>(Call) &&
+          !Call->isLifetimeStartOrEnd() &&
+          Call->getIntrinsicID() !=
+              Intrinsic::experimental_noalias_scope_decl &&
+          !Call->hasFnAttr(Attribute::Speculatable))
+        return false;
+    }
+  }
+  return true;
+}
+
+// Only combine parameter and return attributes when one set already
+// contains the other. This keeps the complete ABI and avoids inventing
+// combinations of mutually exclusive attributes.
+static bool canTransferAttributes(const CallBase &Call,
+                                  const Function &Target) {
+  if (Call.getAttributes().hasFnAttr(Attribute::Speculatable) ||
+      Call.getAttributes().hasFnAttr(Attribute::Builtin))
+    return false;
+
+  auto Contains = [](AttributeSet A, AttributeSet B) {
+    return llvm::all_of(B,
+                        [&](Attribute X) { return llvm::is_contained(A, X); });
+  };
+  for (unsigned I : Target.getAttributes().indexes()) {
+    if (I == AttributeList::FunctionIndex)
+      continue;
+    auto Site = Call.getAttributes().getAttributes(I);
+    auto Callee = Target.getAttributes().getAttributes(I);
+    if (Site != Callee && !Contains(Site, Callee) && !Contains(Callee, Site))
+      return false;
+  }
+  return true;
+}
+
+// Preserve facts inherited from the declaration while the target is
+// still direct. Some function attributes (e.g. denormal_fpenv) are not
+// valid on a call site.
+static void preserveCallAttributes(CallBase &Call) {
+  Function &Target = *Call.getCalledFunction();
+  LLVMContext &Ctx = Call.getContext();
+  auto Attrs = Target.getAttributes().removeFnAttributes(Ctx);
+  for (auto Kind :
+       {Attribute::NoReturn, Attribute::NoUnwind, Attribute::WillReturn,
+        Attribute::NoFree, Attribute::NoSync, Attribute::NoCallback,
+        Attribute::MustProgress, Attribute::Memory}) {
+    auto A = Target.getFnAttribute(Kind);
+    if (A.isValid())
+      Attrs = Attrs.addFnAttribute(Ctx, A);
+  }
+  Call.setAttributes(AttributeList::get(Ctx, {Attrs, Call.getAttributes()}));
+}
+
+// Only the target can vary. Keeping calls to definitions direct preserves
+// interprocedural information, including constant results and writes.
+static bool isCallTarget(const Instruction *I, unsigned Index) {
+  auto *CB = dyn_cast<CallBase>(I);
+  auto *Target = CB ? CB->getCalledFunction() : nullptr;
+  if (!Target || Index >= CB->getNumOperands() ||
+      !CB->isCallee(&CB->getOperandUse(Index)))
+    return false;
+
+  return Target->isDeclaration() && Target->getName().starts_with("_R") &&
+         !CB->hasFnAttr(Attribute::AlwaysInline) &&
+         !CB->hasFnAttr(Attribute::NoIPA) &&
+         !Target->hasMetadata(LLVMContext::MD_type) &&
+         !Target->hasMetadata(LLVMContext::MD_kcfi_type) &&
+         canTransferAttributes(*CB, *Target);
+}
+
+bool GlobalMergeFunc::shareCallTargets(Module &M) {
+  if (!canIntroduceRustSymbols(M) || M.getModuleFlag("cf-protection-branch"))
+    return false;
+  GlobalMergeFunc Merger(nullptr);
+  Merger.MergerMode = HashFunctionMode::LocalCallTargets;
+  return Merger.run(M);
+}
+
 void GlobalMergeFunc::analyze(Module &M) {
+  bool OnlyCallTargets = MergerMode == HashFunctionMode::LocalCallTargets;
   ++NumAnalyzedModues;
   for (Function &Func : M) {
     ++NumAnalyzedFunctions;
-    if (isEligibleFunction(&Func)) {
+    if (isEligibleFunction(&Func) &&
+        (!OnlyCallTargets || canForwardThroughThunk(Func))) {
       ++NumEligibleFunctions;
 
-      auto FI = llvm::StructuralHashWithDifferences(Func, ignoreOp);
+      auto FI = llvm::StructuralHashWithDifferences(
+          Func, OnlyCallTargets ? isCallTarget : ignoreOp);
 
       // Convert the operand map to a vector for a serialization-friendly
       // format.
@@ -185,7 +316,8 @@ struct FuncMergeInfo {
 // parameters.
 static Function *createMergedFunction(FuncMergeInfo &FI,
                                       ArrayRef<Type *> ConstParamTypes,
-                                      const ParamLocsVecTy &ParamLocsVec) {
+                                      const ParamLocsVecTy &ParamLocsVec,
+                                      bool OnlyCallTargets) {
   // Synthesize a new merged function name by appending ".Tgm" to the root
   // function's name.
   auto *MergedFunc = FI.F;
@@ -216,6 +348,10 @@ static Function *createMergedFunction(FuncMergeInfo &FI,
 
   NewFunction->setLinkage(GlobalValue::InternalLinkage);
   NewFunction->addFnAttr(Attribute::NoInline);
+  if (OnlyCallTargets) {
+    NewFunction->removeFnAttr(Attribute::NoRecurse);
+    NewFunction->setComdat(nullptr);
+  }
 
   // Add the new function before the root function.
   M->getFunctionList().insert(MergedFunc->getIterator(), NewFunction);
@@ -237,6 +373,8 @@ static Function *createMergedFunction(FuncMergeInfo &FI,
     for (auto [InstIndex, OpndIndex] : ParamLocsVec[ParamIdx]) {
       auto *Inst = FI.IndexInstruction->lookup(InstIndex);
       auto *OrigC = Inst->getOperand(OpndIndex);
+      if (OnlyCallTargets)
+        preserveCallAttributes(*cast<CallBase>(Inst));
       if (OrigC->getType() != NewArg->getType()) {
         IRBuilder<> Builder(Inst->getParent(), Inst->getIterator());
         Inst->setOperand(OpndIndex,
@@ -402,15 +540,18 @@ computeParamInfo(const StableFunctionMap::StableFunctionEntries &SFS) {
 }
 
 bool GlobalMergeFunc::merge(Module &M, const StableFunctionMap *FunctionMap) {
+  bool OnlyCallTargets = MergerMode == HashFunctionMode::LocalCallTargets;
   bool Changed = false;
 
   // Collect stable functions related to the current module.
   DenseMap<stable_hash, SmallVector<std::pair<Function *, FunctionHashInfo>>>
       HashToFuncs;
   for (auto &F : M) {
-    if (!isEligibleFunction(&F))
+    if (!isEligibleFunction(&F) ||
+        (OnlyCallTargets && !canForwardThroughThunk(F)))
       continue;
-    auto FI = llvm::StructuralHashWithDifferences(F, ignoreOp);
+    auto FI = llvm::StructuralHashWithDifferences(
+        F, OnlyCallTargets ? isCallTarget : ignoreOp);
     if (FunctionMap->contains(FI.FunctionHash))
       HashToFuncs[FI.FunctionHash].emplace_back(&F, std::move(FI));
   }
@@ -422,8 +563,18 @@ bool GlobalMergeFunc::merge(Module &M, const StableFunctionMap *FunctionMap) {
     assert(!SFS.empty());
     auto &RFS = SFS[0];
 
+    // Keep the forwarding call within the six SysV integer argument
+    // registers, reserving one for a possible indirect result pointer.
+    if (OnlyCallTargets) {
+      ParamLocsVec = computeParamInfo(SFS);
+      if (ParamLocsVec->empty() || ParamLocsVec->size() > 5)
+        continue;
+    }
+
     // Iterate functions with the same hash.
     for (auto &[F, FI] : Funcs) {
+      if (OnlyCallTargets && F->arg_size() + ParamLocsVec->size() > 5)
+        continue;
       // Check if the function is compatible with any stable function
       // in terms of the number of instructions and ignored operands.
       if (RFS->InstCount != FI.IndexInstruction->size())
@@ -435,7 +586,7 @@ bool GlobalMergeFunc::merge(Module &M, const StableFunctionMap *FunctionMap) {
           auto [InstIndex, OpndIndex] = Index;
           assert(InstIndex < FHI.IndexInstruction->size());
           auto *Inst = FHI.IndexInstruction->lookup(InstIndex);
-          if (!ignoreOp(Inst, OpndIndex))
+          if (!(OnlyCallTargets ? isCallTarget : ignoreOp)(Inst, OpndIndex))
             return false;
         }
         return true;
@@ -491,7 +642,7 @@ bool GlobalMergeFunc::merge(Module &M, const StableFunctionMap *FunctionMap) {
 
       // Create a merged function derived from the current function.
       Function *MergedFunc =
-          createMergedFunction(FMI, ParamTypes, *ParamLocsVec);
+          createMergedFunction(FMI, ParamTypes, *ParamLocsVec, OnlyCallTargets);
 
       LLVM_DEBUG({
         dbgs() << "[GlobalMergeFunc] Merged function (hash:" << FMI.SF->Hash
@@ -519,7 +670,8 @@ void GlobalMergeFunc::initializeMergerMode(const Module &M) {
   LocalFunctionMap = std::make_unique<StableFunctionMap>();
 
   // Disable codegen data for merging. The local merge is still enabled.
-  if (DisableCGDataForMerging)
+  if (MergerMode == HashFunctionMode::LocalCallTargets ||
+      DisableCGDataForMerging)
     return;
 
   // (Full)LTO module does not have functions added to the index.
