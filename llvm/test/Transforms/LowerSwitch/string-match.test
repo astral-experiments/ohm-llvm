@@ -1,3 +1,4 @@
+# REQUIRES: x86-registered-target
 # RUN: %python %s > %t.ll
 # RUN: opt -passes=lower-string-match -verify-each -S %t.ll | FileCheck %s
 # RUN: opt -relocation-model=pic -passes='default<O1>' -S %t.ll | FileCheck %s --check-prefix=O1
@@ -5,7 +6,7 @@
 
 # CHECK: @match.table._Rshort = private unnamed_addr constant [64 x i64]
 # CHECK: @match.table._Rlong = private unnamed_addr constant [64 x i64]
-# CHECK: @match.table._Rlong.{{[0-9]+}} = private unnamed_addr constant [32 x ptr] [ptr @long0
+# CHECK: @match.table._Rlong.{{[0-9]+}} = private unnamed_addr constant [75 x i8] c"abcdaxcdabcd
 # CHECK-LABEL: define i8 @_Rshort(
 # CHECK: lshr i64 14
 # CHECK: icmp ult i64 %n, 64
@@ -16,8 +17,7 @@
 # CHECK: getelementptr inbounds i64, ptr @match.table._Rshort
 # CHECK-NOT: call i1 @equal
 # CHECK-LABEL: define i8 @_Rlong(
-# CHECK: getelementptr inbounds ptr, ptr @match.table._Rlong
-# CHECK: [[KEY:%.*]] = load ptr
+# CHECK: [[KEY:%.*]] = getelementptr inbounds i8, ptr @match.table._Rlong
 # CHECK: icmp ult i64 %n, 4
 # CHECK: call i64 @llvm.usub.sat.i64
 # CHECK: load <4 x i8>, ptr {{.*}}, align 1

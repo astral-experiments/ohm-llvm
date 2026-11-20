@@ -13,6 +13,7 @@
 // Build a static hash table while the calls still expose the pattern.
 
 #include "llvm/ADT/DepthFirstIterator.h"
+#include "llvm/ADT/SmallString.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/IRBuilder.h"
@@ -79,7 +80,11 @@ static bool isSliceEquality(Function &F, const TargetLibraryInfo &TLI) {
 // On paths through a caller, reject references to declarations that might
 // otherwise have disappeared after specialization of the original match.
 static bool hasClosedCallers(Function &F) {
-  if (!F.use_empty() && !F.hasOneUse())
+  if (!F.hasOneUse())
+    return F.use_empty();
+  Use &U = *F.use_begin();
+  auto *Call = dyn_cast<CallInst>(U.getUser());
+  if (!Call || !Call->isCallee(&U) || !Call->getFunction()->use_empty())
     return false;
   SmallVector<Constant *> Work;
   SmallPtrSet<Constant *, 32> Seen;
@@ -90,21 +95,15 @@ static bool hasClosedCallers(Function &F) {
         if (!isa<ConstantData>(C) && Seen.insert(C).second)
           Work.push_back(C);
   };
-  SmallPtrSet<BasicBlock *, 32> Blocks;
-  for (Use &U : F.uses()) {
-    auto *Call = dyn_cast<CallInst>(U.getUser());
-    if (!Call || !Call->isCallee(&U) || !Call->getFunction()->use_empty())
-      return false;
-    BasicBlock *BB = Call->getParent();
-    for (auto *Next : depth_first(BB))
-      Blocks.insert(Next);
-    for (auto *Prev : inverse_depth_first(BB))
-      Blocks.insert(Prev);
-    AddOperands(*Call->getFunction());
-  }
-  for (auto *BB : Blocks)
+  auto AddBlock = [&](BasicBlock *BB) {
     for (Instruction &I : *BB)
       AddOperands(I);
+  };
+  AddOperands(*Call->getFunction());
+  for (auto *BB : depth_first(Call->getParent()))
+    AddBlock(BB);
+  for (auto *BB : inverse_depth_first(Call->getParent()))
+    AddBlock(BB);
   while (!Work.empty()) {
     Constant *C = Work.pop_back_val();
     if (auto *GV = dyn_cast<GlobalValue>(C); GV && GV->isDeclarationForLinker())
@@ -120,7 +119,7 @@ static bool hasClosedCallers(Function &F) {
 // Collect an ordered chain of slice comparisons returning 0..N-1 or -1.
 // The last comparison selects between the final ordinal and the miss value.
 static bool collectKeys(Function &F, CallInst &First,
-                        SmallVectorImpl<Constant *> &Keys) {
+                        SmallVectorImpl<StringRef> &Keys) {
   BasicBlock *BB = &F.getEntryBlock();
   auto *Br = dyn_cast<CondBrInst>(BB->getTerminator());
   if (!Br)
@@ -157,7 +156,7 @@ static bool collectKeys(Function &F, CallInst &First,
     if (!V)
       return false;
     unsigned Index = Keys.size();
-    Keys.push_back(Key);
+    Keys.push_back(Data->getAsString());
     if (auto *Br = dyn_cast<CondBrInst>(BB->getTerminator())) {
       if (BB->size() != 2 || Br->getCondition() != Test ||
           Br->getSuccessor(0) != End || !match(V, m_SpecificInt(Index)))
@@ -174,18 +173,16 @@ static bool collectKeys(Function &F, CallInst &First,
   return false;
 }
 
-static bool buildLookup(Function &F, CallInst &Call,
-                        ArrayRef<Constant *> Keys) {
+static bool buildLookup(Function &F, CallInst &Call, ArrayRef<StringRef> Keys) {
   // Use the length and three bytes to reject most candidates before
   // comparing all their bytes. Zero marks an empty bucket.
   unsigned Shift = 32 - Log2_64_Ceil(2 * Keys.size());
   uint32_t Mask = ~0u >> Shift;
   constexpr uint32_t Multiplier = 2654435761u;
   SmallVector<uint64_t> Buckets(Mask + 1, 0);
+  SmallString<0> Bytes;
   uint64_t Lengths = 0;
-  for (auto [Index, Key] : enumerate(Keys)) {
-    auto *G = cast<GlobalVariable>(Key);
-    StringRef S = cast<ConstantDataArray>(G->getInitializer())->getAsString();
+  for (auto [Index, S] : enumerate(Keys)) {
     Lengths |= 1ull << S.size();
     uint32_t Tag =
         (uint32_t(S.size()) << 24) | (uint32_t(uint8_t(S.front())) << 16) |
@@ -198,7 +195,16 @@ static bool buildLookup(Function &F, CallInst &Call,
         return false;
       Slot = (Slot + 1) & Mask;
     }
-    Buckets[Slot] = (uint64_t(Index) << 32) | Tag;
+    // Pack the long-key offset beside its ordinal. An integer table
+    // keeps the parser free of dynamic pointer relocations.
+    uint64_t Offset = 0;
+    if (S.size() > 3) {
+      Offset = Bytes.size();
+      if (Offset + S.size() > 65536)
+        return false;
+      Bytes.append(S);
+    }
+    Buckets[Slot] = (Offset << 48) | (uint64_t(Index) << 32) | Tag;
   }
 
   LLVMContext &Ctx = F.getContext();
@@ -256,19 +262,18 @@ static bool buildLookup(Function &F, CallInst &Call,
 
   // At lengths up to three the tag includes every byte of the input.
   B.SetInsertPoint(Test);
-  BasicBlock *Compare = (Lengths >> 4) ? Block("compare") : Found;
+  BasicBlock *Compare = Bytes.empty() ? Found : Block("compare");
   Value *Index = B.CreateLShr(Record, 32);
   Value *Stored = B.CreateTrunc(Record, B.getInt32Ty());
   B.CreateCondBr(B.CreateICmpEQ(Stored, Tag), Compare, Next);
   if (Compare != Found) {
-    auto *Pointers = Table(
-        ConstantArray::get(ArrayType::get(B.getPtrTy(), Keys.size()), Keys));
+    auto *Strings = Table(ConstantDataArray::getString(Ctx, Bytes, false));
     B.SetInsertPoint(Compare);
     // Keep the comparison inline. A dynamic-length bcmp could create a
     // library dependency when all original fixed sizes expanded to loads.
     // Walk backwards in four-byte words, overlapping at the start.
-    Value *Ptr = B.CreateInBoundsGEP(B.getPtrTy(), Pointers, Index);
-    Value *Key = B.CreateLoad(B.getPtrTy(), Ptr);
+    Value *Key =
+        B.CreateInBoundsGEP(B.getInt8Ty(), Strings, B.CreateLShr(Record, 48));
     auto *Check = Block("word");
     auto *Continue = Block("continue");
     B.CreateCondBr(B.CreateICmpULT(Length, B.getInt64(4)), Found, Check);
@@ -314,7 +319,7 @@ PreservedAnalyses LowerStringMatchPass::run(Module &M,
         !F.hasParamAttribute(0, Attribute::NoUndef) ||
         !F.hasParamAttribute(1, Attribute::NoUndef) ||
         !F.getReturnType()->isIntegerTy() ||
-        F.getReturnType()->getIntegerBitWidth() > 32 || F.size() <= 32 ||
+        F.getReturnType()->getIntegerBitWidth() > 16 || F.size() <= 32 ||
         F.size() > 65536)
       continue;
     auto *Call = dyn_cast<CallInst>(&F.getEntryBlock().front());
@@ -325,7 +330,7 @@ PreservedAnalyses LowerStringMatchPass::run(Module &M,
         !isSliceEquality(*Helper,
                          FAM.getResult<TargetLibraryAnalysis>(*Helper)))
       continue;
-    SmallVector<Constant *> Keys;
+    SmallVector<StringRef> Keys;
     if (!collectKeys(F, *Call, Keys) || !hasClosedCallers(F))
       continue;
     if (!Changed && !canIntroduceRustSymbols(M))
