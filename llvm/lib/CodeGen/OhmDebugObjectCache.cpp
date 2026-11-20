@@ -691,13 +691,17 @@ bool splitTraitRecord(StringRef Payload, StringRef &Object,
 // A quick way to recognize a unit from the common ancestor when switching
 // branches. This only decides when to serialize the full LLVM input. A
 // collision can cost a probe, but cannot authorize a hit.
-std::string inputShape(const Module &M) {
+std::string inputShape(const Module &M, bool TestHarness) {
   BLAKE3 Hash;
   for (const Function &F : M) {
     frame(Hash, F.getName());
     char Blocks[8];
     support::endian::write64le(Blocks, F.size());
     Hash.update(StringRef(Blocks, sizeof(Blocks)));
+    // rustc checks for line movement on successive library builds. Test
+    // executables need that probe here, even if the source checksum changed.
+    if (TestHarness)
+      continue;
     auto *SP = F.getSubprogram();
     auto *File = SP ? SP->getFile() : nullptr;
     if (File && File->getChecksum())
@@ -729,7 +733,7 @@ bool tryTraitObject(Module &M, TargetMachine &TM, const Invocation &I,
     frame(Slot, I.Namespace);
     frame(Slot, M.getModuleIdentifier());
     auto Path = joinPath(I.Entries, "llvmcache-" + toHex(Slot.final(), true));
-    std::string Shape = inputShape(M);
+    std::string Shape = inputShape(M, I.TestHarness);
     std::string Roster = hexDigest(Imports);
     StringRef First = Shape;
     size_t Size = Shape.size() + Roster.size();
@@ -763,7 +767,8 @@ bool tryTraitObject(Module &M, TargetMachine &TM, const Invocation &I,
       return Install(ObjectBytes, "exact-line-hit");
     SmallVector<char, 0> Object;
     if (ohm::rebindTraitImports(ObjectBytes, Manifest, Current, Object))
-      return Install(StringRef(Object.data(), Object.size()), "trait-import-hit");
+      return Install(StringRef(Object.data(), Object.size()),
+                     I.TestHarness ? "test-line-hit" : "trait-import-hit");
   }
   Trait->Key = std::move(Key);
   auto Origin = std::make_shared<EarlyOrigin>(M, std::string());
