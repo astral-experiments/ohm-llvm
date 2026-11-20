@@ -1,0 +1,106 @@
+# RUN: %python %s > %t.ll
+# RUN: opt -passes=lower-string-match -verify-each -S %t.ll | FileCheck %s
+# RUN: opt -relocation-model=pic -passes='default<O1>' -S %t.ll | FileCheck %s --check-prefix=O1
+# RUN: %python %s --assembly | opt -passes=lower-string-match -S | FileCheck %s --check-prefix=ASM
+
+# CHECK: @match.table._Rshort = private unnamed_addr constant [64 x i64]
+# CHECK: @match.table._Rlong = private unnamed_addr constant [64 x i64]
+# CHECK: @match.table._Rlong.{{[0-9]+}} = private unnamed_addr constant [32 x ptr] [ptr @long0
+# CHECK-LABEL: define i8 @_Rshort(
+# CHECK: lshr i64 14
+# CHECK: icmp ult i64 %n, 64
+# CHECK: br i1 {{.*}}, label %hash, label %missing
+# CHECK: hash:
+# CHECK: load i8
+# CHECK: probe:
+# CHECK: getelementptr inbounds i64, ptr @match.table._Rshort
+# CHECK-NOT: call i1 @equal
+# CHECK-LABEL: define i8 @_Rlong(
+# CHECK: getelementptr inbounds ptr, ptr @match.table._Rlong
+# CHECK: [[KEY:%.*]] = load ptr
+# CHECK: icmp ult i64 %n, 4
+# CHECK: call i64 @llvm.usub.sat.i64
+# CHECK: load <4 x i8>, ptr {{.*}}, align 1
+# CHECK: getelementptr i8, ptr [[KEY]]
+# CHECK-NOT: call i1 @equal
+# CHECK-LABEL: define i8 @_Rordinal(
+# CHECK: call i1 @equal
+# CHECK-LABEL: define i8 @_Rlength(
+# CHECK: call i1 @equal
+# CHECK-LABEL: define i8 @_Rpredicate(
+# CHECK: call i1 @other
+# CHECK-LABEL: define i8 @_Rcalled(
+# CHECK: call i1 @equal
+# O1: @match.table._Rlong
+# ASM-NOT: @match.table.
+
+import sys
+
+print('target triple = "x86_64-unknown-linux-gnu"')
+if "--assembly" in sys.argv:
+    print('module asm ".Lmatch.table._Rshort:"')
+
+print("declare i32 @memcmp(ptr, ptr, i64)")
+print("declare i32 @custom(ptr, ptr, i64)")
+for helper, compare in [("equal", "memcmp"), ("other", "custom")]:
+    print(f"""
+define internal i1 @{helper}(ptr %a, i64 %na, ptr %b, i64 %nb) {{
+entry:
+  %test = icmp eq i64 %na, %nb
+  br i1 %test, label %body, label %done
+body:
+  %v = call i32 @{compare}(ptr %a, ptr %b, i64 %na)
+  %same = icmp eq i32 %v, 0
+  br label %done
+done:
+  %r = phi i1 [ %same, %body ], [ false, %entry ]
+  ret i1 %r
+}}
+""")
+
+# The first two long keys have identical tags. The third repeats the first.
+short = ["a", "ab", "abc", "bc", "A", "x", "y", "z"]
+long = ["abcd", "axcd", "abcd", "a", "xy", "xyz", "q", "q" * 63]
+for mode in ["short", "long", "ordinal", "length", "predicate", "called"]:
+    keys = (short if mode == "short" else long) + [f"{i:02x}" for i in range(24)]
+    helper = "other" if mode == "predicate" else "equal"
+    for i, key in enumerate(keys):
+        print(f'@{mode}{i} = private constant [{len(key)} x i8] c"{key}"')
+    print(f"define i8 @_R{mode}(ptr noundef %s, i64 noundef %n) {{")
+    values = []
+    for i, key in enumerate(keys):
+        length = len(key) - (mode == "length" and i == 3)
+        print(f"t{i}:")
+        print(f"  %eq{i} = call i1 @{helper}(ptr %s, i64 %n, ptr @{mode}{i}, i64 {length})")
+        if i + 1 == len(keys):
+            values.append(f"[ %last, %t{i} ]")
+            print(f"  %last = select i1 %eq{i}, i8 {i}, i8 -1")
+            print("  br label %end")
+        else:
+            value = 6 if mode == "ordinal" and i == 4 else i
+            values.append(f"[ {value}, %t{i} ]")
+            print(f"  br i1 %eq{i}, label %end, label %t{i+1}")
+    print("end:")
+    print("  %r = phi i8 " + ", ".join(reversed(values)))
+    print("  ret i8 %r")
+    print("}")
+
+# A caller that only forwards a result can use the lookup. Preserve the
+# chain if its inlining might eliminate a reference to an undefined symbol.
+print("""
+define i8 @_Rforward(ptr %s, i64 %n) {
+  %r = call i8 @_Rshort(ptr %s, i64 %n)
+  ret i8 %r
+}
+declare void @missing()
+define void @_Rroot() {
+  %r = call i8 @_Rcalled(ptr @called0, i64 4)
+  %ok = icmp eq i8 %r, 0
+  br i1 %ok, label %done, label %fail
+fail:
+  call void @missing()
+  br label %done
+done:
+  ret void
+}
+""")
