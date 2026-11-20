@@ -8,8 +8,11 @@
 
 #include "../../lib/CodeGen/OhmDebugObjectCache.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/Bitcode/DwarfLineCertificate.h"
 #include "llvm/Bitcode/OhmDebugObjectSignature.h"
+#include "llvm/IR/DIBuilder.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/OhmOptimizerState.h"
 #include "llvm/IR/ValueHandle.h"
 #include "gtest/gtest.h"
@@ -189,3 +192,141 @@ TEST(OhmEarlyObject, ExternalContextStateDeclines) {
   StructType::create(T, "unreferenced");
   EXPECT_FALSE(ohm::getOptimizerContextState(Other, Bits));
 }
+
+#if defined(__linux__) && defined(__x86_64__)
+namespace {
+constexpr StringLiteral Prior = "_RNvXsh_C4demoNtB5_5TokenNtB5_2Eq2eq";
+constexpr StringLiteral Edited = "_RNvXsf_C4demoNtB5_5TokenNtB5_2Eq2eq";
+constexpr StringLiteral Stable = "_RNvXs0_C4demoNtB5_5TokenNtB5_2Eq2eq";
+constexpr StringLiteral Other = "_RNvXs3_C4demoNtB5_5OtherNtB5_2Eq2eq";
+
+std::unique_ptr<Module> createComparisons(
+    LLVMContext &C, ArrayRef<std::pair<StringRef, unsigned>> Methods,
+    DICompileUnit::DebugEmissionKind Kind = DICompileUnit::LineTablesOnly) {
+  auto M = std::make_unique<Module>("demo", C);
+  M->setTargetTriple(Triple("x86_64-unknown-linux-gnu"));
+  DIBuilder Debug(*M);
+  auto *File = Debug.createFile("token.rs", "/src");
+  Debug.createCompileUnit(dwarf::DW_LANG_Rust, File, "test", true, "", 0, "",
+                          Kind);
+  auto *Crate = Debug.createNameSpace(nullptr, "demo", false);
+  auto *Sig = Debug.createSubroutineType(Debug.getOrCreateTypeArray({}));
+  Type *Ptr = PointerType::getUnqual(C);
+  auto *Ty = FunctionType::get(Type::getInt1Ty(C), {Ptr, Ptr}, false);
+  for (auto [Name, Ordinal] : Methods) {
+    auto *F = Function::Create(Ty, GlobalValue::InternalLinkage, Name, *M);
+    auto *Scope = Debug.createNameSpace(
+        Crate, ("{impl#" + Twine(Ordinal) + "}").str(), false);
+    auto *SP =
+        Debug.createFunction(Scope, "eq", Name, File, 10, Sig, 10,
+                             DINode::FlagZero, DISubprogram::SPFlagDefinition);
+    F->setSubprogram(SP);
+    IRBuilder<> B(BasicBlock::Create(C, "entry", F));
+    B.SetCurrentDebugLocation(DILocation::get(C, 10, 1, SP));
+    auto *L = B.CreateLoad(B.getInt8Ty(), F->getArg(0));
+    auto *R = B.CreateLoad(B.getInt8Ty(), F->getArg(1));
+    B.CreateRet(B.CreateICmpEQ(L, R));
+  }
+  Debug.finalize();
+  return M;
+}
+
+} // namespace
+
+TEST(OhmLocalTraitComparisons, GivesRenumberedMethodsTheSameLineCertificate) {
+  LLVMContext C, D;
+  auto A = createComparisons(C, {{Prior, 19}, {Other, 5}});
+  auto B = createComparisons(D, {{Other, 5}, {Edited, 17}});
+  for (auto *M : {A.get(), B.get()}) {
+    ohm::prepareLocalTraitComparisons(*M);
+    auto *F = M->getFunction(Stable);
+    ASSERT_TRUE(F);
+    EXPECT_EQ(Stable, F->getSubprogram()->getLinkageName());
+    auto *NS = cast<DINamespace>(F->getSubprogram()->getScope());
+    EXPECT_EQ("{impl#2}", NS->getName());
+    EXPECT_EQ("demo", NS->getScope()->getName());
+  }
+  SmallString<0> Old, New;
+  raw_svector_ostream Before(Old), After(New);
+  ASSERT_TRUE(writeClosedDwarfLineCertificateV1(*A, Before));
+  ASSERT_TRUE(writeClosedDwarfLineCertificateV1(*B, After));
+  EXPECT_EQ(Old, New);
+}
+
+TEST(OhmLocalTraitComparisons, KeepsBothCollidingMethods) {
+  LLVMContext C;
+  auto M = createComparisons(C, {{Prior, 19}, {Edited, 17}});
+  ohm::prepareLocalTraitComparisons(*M);
+  EXPECT_TRUE(M->getFunction(Prior));
+  EXPECT_TRUE(M->getFunction(Edited));
+  EXPECT_FALSE(M->getNamedValue(Stable));
+}
+
+TEST(OhmLocalTraitComparisons, RespectsExistingSymbol) {
+  for (const auto &Name : {Stable.str(), (Twine("\1") + Stable).str()}) {
+    LLVMContext C;
+    auto M = createComparisons(C, {{Prior, 19}});
+    auto *G = M->getOrInsertGlobal(Name, Type::getInt8Ty(C));
+    ohm::prepareLocalTraitComparisons(*M);
+    EXPECT_TRUE(M->getFunction(Prior));
+    EXPECT_EQ(G, M->getNamedGlobal(Name));
+  }
+}
+
+TEST(OhmLocalTraitComparisons, RequiresMatchingNamespaceAndLineTables) {
+  LLVMContext C, D;
+  auto Namespace = createComparisons(C, {{Prior, 17}});
+  auto Full = createComparisons(D, {{Prior, 19}}, DICompileUnit::FullDebug);
+  for (auto *M : {Namespace.get(), Full.get()}) {
+    ohm::prepareLocalTraitComparisons(*M);
+    EXPECT_TRUE(M->getFunction(Prior));
+  }
+}
+
+TEST(OhmLocalTraitComparisons, PreservesPrivateAssemblyPrefix) {
+  LLVMContext C;
+  auto M = createComparisons(C, {{Prior, 19}});
+  M->getFunction(Prior)->setLinkage(GlobalValue::PrivateLinkage);
+  ohm::prepareLocalTraitComparisons(*M);
+  EXPECT_TRUE(M->getFunction(Prior));
+}
+
+TEST(OhmLocalTraitComparisons, PreservesPublicAndAddressTakenMethods) {
+  LLVMContext C;
+  auto M = createComparisons(C, {{Prior, 19}, {Other, 5}});
+  M->getFunction(Prior)->setLinkage(GlobalValue::ExternalLinkage);
+  auto *F = M->getFunction(Other);
+  new GlobalVariable(*M, F->getType(), true, GlobalValue::ExternalLinkage, F);
+  ohm::prepareLocalTraitComparisons(*M);
+  EXPECT_TRUE(M->getFunction(Prior));
+  EXPECT_TRUE(M->getFunction(Other));
+}
+
+TEST(OhmLocalTraitComparisons, RequiresSimpleLoadsAndEquality) {
+  LLVMContext C;
+  auto M = createComparisons(C, {{Prior, 19}, {Other, 5}});
+  cast<LoadInst>(M->getFunction(Prior)->front().front()).setVolatile(true);
+  auto *I = M->getFunction(Other)->front().getTerminator()->getPrevNode();
+  cast<ICmpInst>(I)->setPredicate(CmpInst::ICMP_ULT);
+  ohm::prepareLocalTraitComparisons(*M);
+  EXPECT_TRUE(M->getFunction(Prior));
+  EXPECT_TRUE(M->getFunction(Other));
+}
+
+TEST(OhmLocalTraitComparisons, PreservesSymbolsVisibleToAssembly) {
+  LLVMContext C, D;
+  auto Global = createComparisons(C, {{Prior, 19}});
+  auto Local = createComparisons(D, {{Prior, 19}});
+  std::string Assembly = (".quad " + Twine(Prior)).str();
+  Global->setModuleInlineAsm(Assembly);
+  auto *Ty = FunctionType::get(Type::getVoidTy(D), false);
+  auto *F = Function::Create(Ty, GlobalValue::ExternalLinkage, "other", *Local);
+  IRBuilder<> B(BasicBlock::Create(D, "entry", F));
+  B.CreateCall(InlineAsm::get(Ty, Assembly, "", true));
+  B.CreateRetVoid();
+  for (auto *M : {Global.get(), Local.get()}) {
+    ohm::prepareLocalTraitComparisons(*M);
+    EXPECT_TRUE(M->getFunction(Prior));
+  }
+}
+#endif
