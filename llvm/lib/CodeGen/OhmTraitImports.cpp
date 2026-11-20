@@ -320,16 +320,24 @@ static bool renameObjectImports(StringRef Object,
     if (!Destinations.insert(Pair.second).second)
       return false;
   StringTableBuilder Builder(StringTableBuilder::ELF);
-  for (const Section &S : Sections)
-    if (S.sh_name)
-      Builder.add(Table.data() + S.sh_name);
+  for (const Section &S : Sections) {
+    if (!S.sh_name)
+      continue;
+    // A named section can supply its own implicit symbol at assembly time.
+    StringRef Name(Table.data() + S.sh_name);
+    if (Renames.contains(Name) || Destinations.contains(Name))
+      return false;
+    Builder.add(Name);
+  }
   SmallVector<StringRef> Names;
   SmallDenseSet<size_t> Changed;
   for (auto &S : Symbols) {
     if (S.st_name >= Table.size())
       return false;
     StringRef Name(Table.data() + S.st_name);
-    if (Destinations.contains(Name))
+    // Keep any use of ELF version syntax for either name out of replay.
+    StringRef Base = Name.split('@').first;
+    if (Destinations.contains(Base) || (Base != Name && Renames.contains(Base)))
       return false;
     if (auto It = Renames.find(Name); It != Renames.end()) {
       if (S.st_shndx != ELF::SHN_UNDEF || S.st_value || S.st_size ||
@@ -351,6 +359,10 @@ static bool renameObjectImports(StringRef Object,
   // particular refuse imports that occur as addresses in data or DWARF.
   SmallDenseSet<size_t> Referenced;
   for (const Section &Rel : Sections) {
+    // A COMDAT signature can share the imported function's symbol index.
+    // Rebinding it would also change how the linker selects the group.
+    if (Rel.sh_type == ELF::SHT_GROUP && Changed.contains(Rel.sh_info))
+      return false;
     if (Rel.sh_type != ELF::SHT_RELA)
       continue;
     if (Rel.sh_link != size_t(SymSec - Sections.data()) || !Rel.sh_info ||

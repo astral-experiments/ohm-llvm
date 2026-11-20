@@ -223,6 +223,28 @@ TEST(OhmTraitImports, MatchesFreshELFWhenProviderGrowsAndShrinks) {
   EXPECT_EQ(Rebound, Before);
 }
 
+TEST(OhmTraitImports, RejectsELFNameCollisions) {
+  for (const auto &Extra :
+       {("$" + Name +
+         " = comdat any\n"
+         "define linkonce_odr i32 @other() comdat($" +
+         Name + ") { ret i32 0 }\n")
+            .str(),
+        ("@\"" + Name + "@V1\" = global i32 0\n").str(),
+        ("@\"" + Longer + "@@V2\" = global i32 0\n").str(),
+        ("@other = global i32 0, section \"" + Longer + "\"\n").str()}) {
+    auto Before = source(Name) + Extra;
+    auto After = source(Longer) + Extra;
+    Bytes Donor, Key, Manifest, NextKey, NextManifest, Rebound;
+    ASSERT_TRUE(emit(Before, Donor));
+    ASSERT_TRUE(snapshot(Before, Key, Manifest));
+    ASSERT_TRUE(snapshot(After, NextKey, NextManifest));
+    ASSERT_EQ(Key, NextKey);
+    EXPECT_FALSE(ohm::rebindTraitImports(bytes(Donor), bytes(Manifest),
+                                         bytes(NextManifest), Rebound));
+  }
+}
+
 TEST(OhmTraitImports, RejectsMismatchedObjectOrMethod) {
   Bytes Before, Out, Data, Collision, Defined;
   ASSERT_TRUE(emit(source(Name), Before));
