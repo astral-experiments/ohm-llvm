@@ -27,12 +27,6 @@ struct LowerSwitchCallsPass
     : public OptionalPassInfoMixin<LowerSwitchCallsPass> {
   LLVM_ABI PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM);
 };
-
-/// Turn long chains of string-to-ordinal comparisons into hash lookups.
-struct LowerStringMatchPass
-    : public OptionalPassInfoMixin<LowerStringMatchPass> {
-  LLVM_ABI PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM);
-};
 } // namespace llvm
 
 #endif // LLVM_TRANSFORMS_UTILS_LOWERSWITCH_H

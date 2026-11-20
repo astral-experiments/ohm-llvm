@@ -60,7 +60,6 @@ add_llvm_component_library(LLVMTransformUtils
   LowerIFunc.cpp
   LowerInvoke.cpp
   LowerMemIntrinsics.cpp
-  LowerStringMatch.cpp
   LowerSwitch.cpp
   LowerVectorIntrinsics.cpp
   MatrixUtils.cpp
