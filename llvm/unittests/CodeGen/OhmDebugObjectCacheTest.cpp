@@ -202,7 +202,8 @@ constexpr StringLiteral Other = "_RNvXs3_C4demoNtB5_5OtherNtB5_2Eq2eq";
 
 std::unique_ptr<Module> createComparisons(
     LLVMContext &C, ArrayRef<std::pair<StringRef, unsigned>> Methods,
-    DICompileUnit::DebugEmissionKind Kind = DICompileUnit::LineTablesOnly) {
+    DICompileUnit::DebugEmissionKind Kind = DICompileUnit::LineTablesOnly,
+    bool Anonymous = false) {
   auto M = std::make_unique<Module>("demo", C);
   M->setTargetTriple(Triple("x86_64-unknown-linux-gnu"));
   DIBuilder Debug(*M);
@@ -210,13 +211,14 @@ std::unique_ptr<Module> createComparisons(
   Debug.createCompileUnit(dwarf::DW_LANG_Rust, File, "test", true, "", 0, "",
                           Kind);
   auto *Crate = Debug.createNameSpace(nullptr, "demo", false);
+  auto *Parent = Anonymous ? Debug.createNameSpace(Crate, "_", false) : Crate;
   auto *Sig = Debug.createSubroutineType(Debug.getOrCreateTypeArray({}));
   Type *Ptr = PointerType::getUnqual(C);
   auto *Ty = FunctionType::get(Type::getInt1Ty(C), {Ptr, Ptr}, false);
   for (auto [Name, Ordinal] : Methods) {
     auto *F = Function::Create(Ty, GlobalValue::InternalLinkage, Name, *M);
     auto *Scope = Debug.createNameSpace(
-        Crate, ("{impl#" + Twine(Ordinal) + "}").str(), false);
+        Parent, ("{impl#" + Twine(Ordinal) + "}").str(), false);
     auto *SP =
         Debug.createFunction(Scope, "eq", Name, File, 10, Sig, 10,
                              DINode::FlagZero, DISubprogram::SPFlagDefinition);
@@ -238,7 +240,7 @@ TEST(OhmLocalTraitComparisons, GivesRenumberedMethodsTheSameLineCertificate) {
   auto A = createComparisons(C, {{Prior, 19}, {Other, 5}});
   auto B = createComparisons(D, {{Other, 5}, {Edited, 17}});
   for (auto *M : {A.get(), B.get()}) {
-    ohm::prepareLocalTraitComparisons(*M);
+    ohm::prepareLocalImplMethods(*M);
     auto *F = M->getFunction(Stable);
     ASSERT_TRUE(F);
     EXPECT_EQ(Stable, F->getSubprogram()->getLinkageName());
@@ -256,10 +258,83 @@ TEST(OhmLocalTraitComparisons, GivesRenumberedMethodsTheSameLineCertificate) {
 TEST(OhmLocalTraitComparisons, KeepsBothCollidingMethods) {
   LLVMContext C;
   auto M = createComparisons(C, {{Prior, 19}, {Edited, 17}});
-  ohm::prepareLocalTraitComparisons(*M);
+  ohm::prepareLocalImplMethods(*M);
   EXPECT_TRUE(M->getFunction(Prior));
   EXPECT_TRUE(M->getFunction(Edited));
   EXPECT_FALSE(M->getNamedValue(Stable));
+}
+
+TEST(OhmAnonymousImplMethods, MethodInRenumberedConstantHasSameCertificate) {
+  constexpr StringLiteral Before =
+      "_RNvXs2_NvNtCs2t_4demo5typessh_1__NtB5_5TokenNtB5_2Eq2eq";
+  constexpr StringLiteral After =
+      "_RNvXs2_NvNtCs2t_4demo5typessi_1__NtB5_5TokenNtB5_2Eq2eq";
+  constexpr StringLiteral Canonical =
+      "_RNvXs0_NvNtCs2t_4demo5typess0_1__NtB5_5TokenNtB5_2Eq2eq";
+  auto prepare = [](LLVMContext &C, StringRef Name) {
+    auto M = createComparisons(C, {{Name, 4}}, DICompileUnit::LineTablesOnly,
+                               /*Anonymous=*/true);
+    ohm::prepareLocalImplMethods(*M);
+    return M;
+  };
+  LLVMContext C, D;
+  auto A = prepare(C, Before);
+  auto B = prepare(D, After);
+  for (auto *M : {A.get(), B.get()}) {
+    auto *F = M->getFunction(Canonical);
+    ASSERT_TRUE(F);
+    EXPECT_EQ(Canonical, F->getSubprogram()->getLinkageName());
+    auto *Scope = cast<DINamespace>(F->getSubprogram()->getScope());
+    EXPECT_EQ("{impl#2}", Scope->getName());
+    EXPECT_EQ("_", Scope->getScope()->getName());
+  }
+  SmallString<0> Old, New;
+  raw_svector_ostream OldStream(Old), NewStream(New);
+  ASSERT_TRUE(writeClosedDwarfLineCertificateV1(*A, OldStream));
+  ASSERT_TRUE(writeClosedDwarfLineCertificateV1(*B, NewStream));
+  EXPECT_EQ(Old, New);
+}
+
+TEST(OhmAnonymousImplMethods, HandlesGenericMethodInNestedModule) {
+  constexpr StringLiteral Before =
+      "_RINvMs2_NvNtNtC4demo6_nested5typessZ_1__NtB6_5Token4bitslE";
+  constexpr StringLiteral After =
+      "_RINvMs0_NvNtNtC4demo6_nested5typess0_1__NtB6_5Token4bitslE";
+  LLVMContext C;
+  auto M = createComparisons(C, {{Before, 4}}, DICompileUnit::LineTablesOnly,
+                             /*Anonymous=*/true);
+  ohm::prepareLocalImplMethods(*M);
+  EXPECT_TRUE(M->getFunction(After));
+}
+
+TEST(OhmAnonymousImplMethods, ChecksConstantPathAndScope) {
+  for (StringRef Name :
+       {"_RNvMs2_NvC10demosh_1__NtB5_5Token4bits", // Inside identifier.
+        "_RNvMs2_NvC4demosjh_1__NtB5_5Token4bits", // Two digits.
+        "_RNvMs2_NvC4demosj_1_xNtB5_5Token4bits",  // Named.
+        "_RNvMs2_NvC900demosj_1__NtB5_5Token4bits"}) {
+    LLVMContext C;
+    auto M = createComparisons(C, {{Name, 4}}, DICompileUnit::LineTablesOnly,
+                               /*Anonymous=*/true);
+    ohm::prepareLocalImplMethods(*M);
+    EXPECT_TRUE(M->getFunction(Name));
+  }
+  constexpr StringLiteral Name = "_RNvMs2_NvC4demosj_1__NtB5_5Token4bits";
+  LLVMContext C;
+  auto M = createComparisons(C, {{Name, 4}});
+  ohm::prepareLocalImplMethods(*M);
+  EXPECT_TRUE(M->getFunction(Name));
+}
+
+TEST(OhmAnonymousImplMethods, KeepsBothMethodsWhenNamesWouldCollide) {
+  constexpr StringLiteral A = "_RNvMs2_NvC4demosj_1__NtB5_5Token4bits";
+  constexpr StringLiteral B = "_RNvMs2_NvC4demosk_1__NtB5_5Token4bits";
+  LLVMContext C;
+  auto M = createComparisons(C, {{A, 4}, {B, 4}}, DICompileUnit::LineTablesOnly,
+                             /*Anonymous=*/true);
+  ohm::prepareLocalImplMethods(*M);
+  EXPECT_TRUE(M->getFunction(A));
+  EXPECT_TRUE(M->getFunction(B));
 }
 
 TEST(OhmLocalTraitComparisons, RespectsExistingSymbol) {
@@ -267,7 +342,7 @@ TEST(OhmLocalTraitComparisons, RespectsExistingSymbol) {
     LLVMContext C;
     auto M = createComparisons(C, {{Prior, 19}});
     auto *G = M->getOrInsertGlobal(Name, Type::getInt8Ty(C));
-    ohm::prepareLocalTraitComparisons(*M);
+    ohm::prepareLocalImplMethods(*M);
     EXPECT_TRUE(M->getFunction(Prior));
     EXPECT_EQ(G, M->getNamedGlobal(Name));
   }
@@ -290,7 +365,7 @@ TEST(OhmLocalTraitComparisons, KeepsMethodReferencedByAssemblerName) {
     B.CreateRet(
         B.CreateCall(ByAsmName, {Caller->getArg(0), Caller->getArg(1)}));
 
-    ohm::prepareLocalTraitComparisons(*M);
+    ohm::prepareLocalImplMethods(*M);
 
     EXPECT_EQ(Method, M->getFunction(Prior));
     EXPECT_FALSE(M->getNamedValue(Stable));
@@ -309,7 +384,7 @@ TEST(OhmLocalTraitComparisons, AvoidsSectionAndComdatNames) {
       else
         G->setSection(Name);
 
-      ohm::prepareLocalTraitComparisons(*M);
+      ohm::prepareLocalImplMethods(*M);
 
       EXPECT_TRUE(M->getFunction(Prior));
       EXPECT_FALSE(M->getNamedValue(Stable));
@@ -322,7 +397,7 @@ TEST(OhmLocalTraitComparisons, RequiresMatchingNamespaceAndLineTables) {
   auto Namespace = createComparisons(C, {{Prior, 17}});
   auto Full = createComparisons(D, {{Prior, 19}}, DICompileUnit::FullDebug);
   for (auto *M : {Namespace.get(), Full.get()}) {
-    ohm::prepareLocalTraitComparisons(*M);
+    ohm::prepareLocalImplMethods(*M);
     EXPECT_TRUE(M->getFunction(Prior));
   }
 }
@@ -331,7 +406,7 @@ TEST(OhmLocalTraitComparisons, PreservesPrivateAssemblyPrefix) {
   LLVMContext C;
   auto M = createComparisons(C, {{Prior, 19}});
   M->getFunction(Prior)->setLinkage(GlobalValue::PrivateLinkage);
-  ohm::prepareLocalTraitComparisons(*M);
+  ohm::prepareLocalImplMethods(*M);
   EXPECT_TRUE(M->getFunction(Prior));
 }
 
@@ -341,7 +416,7 @@ TEST(OhmLocalTraitComparisons, PreservesPublicAndAddressTakenMethods) {
   M->getFunction(Prior)->setLinkage(GlobalValue::ExternalLinkage);
   auto *F = M->getFunction(Other);
   new GlobalVariable(*M, F->getType(), true, GlobalValue::ExternalLinkage, F);
-  ohm::prepareLocalTraitComparisons(*M);
+  ohm::prepareLocalImplMethods(*M);
   EXPECT_TRUE(M->getFunction(Prior));
   EXPECT_TRUE(M->getFunction(Other));
 }
@@ -352,7 +427,7 @@ TEST(OhmLocalTraitComparisons, RequiresSimpleLoadsAndEquality) {
   cast<LoadInst>(M->getFunction(Prior)->front().front()).setVolatile(true);
   auto *I = M->getFunction(Other)->front().getTerminator()->getPrevNode();
   cast<ICmpInst>(I)->setPredicate(CmpInst::ICMP_ULT);
-  ohm::prepareLocalTraitComparisons(*M);
+  ohm::prepareLocalImplMethods(*M);
   EXPECT_TRUE(M->getFunction(Prior));
   EXPECT_TRUE(M->getFunction(Other));
 }
@@ -369,7 +444,7 @@ TEST(OhmLocalTraitComparisons, PreservesSymbolsVisibleToAssembly) {
   B.CreateCall(InlineAsm::get(Ty, Assembly, "", true));
   B.CreateRetVoid();
   for (auto *M : {Global.get(), Local.get()}) {
-    ohm::prepareLocalTraitComparisons(*M);
+    ohm::prepareLocalImplMethods(*M);
     EXPECT_TRUE(M->getFunction(Prior));
   }
 }
