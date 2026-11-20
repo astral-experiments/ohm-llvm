@@ -754,7 +754,12 @@ static void loadGetterOperands(SwitchInst &SI, ArrayRef<GetterCase> Cases) {
       continue;
     Type *Ty = Column->get()->getType();
     auto *TableTy = ArrayType::get(Ty, Count);
-    SmallVector<Constant *> Entries(Count, PoisonValue::get(Ty));
+    // Exceptional arms skip the table. Fill their data-pointer slots
+    // with a local constant so RelLookupTableConverter can use offsets.
+    Constant *Unused = isa<GlobalVariable>(Column->get())
+                           ? cast<Constant>(Column->get())
+                           : PoisonValue::get(Ty);
+    SmallVector<Constant *> Entries(Count, Unused);
     for (const GetterCase &Row : Cases)
       Entries[Row.Key] = cast<Constant>(Row.Columns[K]->get());
     auto *Table = new GlobalVariable(

@@ -1,6 +1,6 @@
 # RUN: %python %s > %t.ll
 # RUN: opt -passes=lower-switch-calls -verify-each -S %t.ll | FileCheck %s
-# RUN: opt -passes='default<O1>' -S %t.ll | FileCheck %s --check-prefix=O1
+# RUN: opt -relocation-model=pic -passes='default<O1>' -S %t.ll | FileCheck %s --check-prefix=O1
 # REQUIRES: x86-registered-target
 
 # Generate dense switches at the minimum size used by the transform.
@@ -10,6 +10,7 @@
 # CHECK: @switch.table._Rdispatch = private unnamed_addr constant [32 x ptr] [ptr @_Rget0, ptr @_Rget1,
 # CHECK-SAME: ptr @_Rget30, ptr poison]
 # CHECK: @switch.table._Rdata = private unnamed_addr constant [32 x ptr] [ptr @g0, ptr @g1,
+# CHECK-SAME: ptr @g30, ptr @g0]
 # CHECK: @switch.table._Rdata.{{[0-9]+}} = private unnamed_addr constant [32 x i32] [i32 0, i32 1,
 # CHECK-NOT: @switch.table.
 # CHECK-LABEL: define i32 @_Rdispatch(
@@ -21,18 +22,19 @@
 # CHECK-NEXT: %x0 = call i32 [[TARGET]]()
 # CHECK: %x31 = call i32 @_Rget31()
 # CHECK: phi i32 [ %x0, %b0 ], [ %x31, %b31 ]
-# O1: @switch.table._Rdata = private unnamed_addr constant [32 x ptr]
+# O1: @switch.table._Rdata.rel = private unnamed_addr constant [32 x i32]
 # O1-LABEL: define i32 @local_use(
 # O1: call i32 @_Rget0()
 # O1: call i32 @_Rget1()
 
 # One case family calls a common getter on distinct constants, then writes
-# a distinct integer. Only these two operands require tables.
+# a distinct integer. A local constant fills the unused pointer slot
+# so the PIC pipeline can turn that column into relative offsets.
 #
 # CHECK-LABEL: define i32 @_Rdata(
 # CHECK: [[ARG:%.*]] = load ptr
 # CHECK: [[DATA:%.*]] = load i32
-# CHECK: call i32 @_Rread(ptr [[ARG]])
+# CHECK: call i32 @_Rread(ptr nonnull [[ARG]])
 # CHECK-NEXT: store i32 [[DATA]], ptr %out
 
 # Different projections in the return block, a reachable default, a
@@ -67,7 +69,7 @@ for i in keys:
     if i != 31:
         print(f"declare i32 @_Rget{i}()")
 print("define i32 @_Rget31() { ret i32 31 }")
-print("declare i32 @_Rread(ptr)")
+print("declare i32 @_Rread(ptr nonnull)")
 
 cases = ["dispatch", "data", "projection", "default", "sparse", "range"]
 for name in cases + ["local", "notail", "attributes"]:
@@ -84,7 +86,8 @@ for name in cases + ["local", "notail", "attributes"]:
     for i in keys:
         print(f"b{i}:")
         if name == "data":
-            print(f"  %x{i} = call i32 @_Rread(ptr @g{i})")
+            call = "@_Rget31()" if i == 31 else f"@_Rread(ptr nonnull @g{i})"
+            print(f"  %x{i} = call i32 {call}")
             print(f"  store i32 {i}, ptr %out")
         elif name == "projection":
             print(f"  %pair{i} = call {{ i32, i32 }} @_Rpair{i}()")
