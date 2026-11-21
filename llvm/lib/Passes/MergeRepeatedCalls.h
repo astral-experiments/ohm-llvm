@@ -26,6 +26,11 @@ struct MergeRepeatedCallsPass : OptionalPassInfoMixin<MergeRepeatedCallsPass> {
   PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM);
 };
 
+struct EliminateDeadSharedArgumentsPass
+    : OptionalPassInfoMixin<EliminateDeadSharedArgumentsPass> {
+  PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM);
+};
+
 struct RustJumpThreadingPass : OptionalPassInfoMixin<RustJumpThreadingPass> {
   PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);
 };
