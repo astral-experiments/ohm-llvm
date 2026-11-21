@@ -47,12 +47,14 @@ bool AlwaysInlineImpl(
     if (!MaxInstructions || F.isInterposable() ||
         F.getInstructionCount() > MaxInstructions)
       return false;
-    // Leave stack growth to the regular cost model. A single alloca can
-    // substantially increase the size of every recursive caller frame.
+    // Leave stack growth and calls that require a single site to the regular
+    // inliner, which considers each caller and whether the callee will die.
     return none_of(F.args(),
                    [](const Argument &A) { return A.hasByValAttr(); }) &&
-           none_of(instructions(F),
-                   [](const Instruction &I) { return isa<AllocaInst>(I); });
+           none_of(instructions(F), [](const Instruction &I) {
+             const auto *CB = dyn_cast<CallBase>(&I);
+             return isa<AllocaInst>(I) || (CB && CB->cannotDuplicate());
+           });
   };
   DenseMap<Function *, unsigned> ExtraCalls;
   SmallSetVector<CallBase *, 16> Calls;
