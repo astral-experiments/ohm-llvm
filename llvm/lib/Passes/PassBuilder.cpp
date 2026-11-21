@@ -15,6 +15,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/Passes/PassBuilder.h"
+#include "MergeRepeatedCalls.h"
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/ADT/StringTable.h"
 #include "llvm/Analysis/AliasAnalysisEvaluator.h"
