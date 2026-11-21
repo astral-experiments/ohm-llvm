@@ -1378,13 +1378,18 @@ PassBuilder::buildModuleSimplificationPipeline(OptimizationLevel Level,
     // libraries and other oracles.
     MPM.addPass(InferFunctionAttrsPass());
     MPM.addPass(CoroEarlyPass());
-    // Expose the operations behind small wrappers before simplification.
-    if (deferLocalSimplification(Level, Phase) && supportsCallSharing(TM) &&
-        PTO.InlinerThreshold == -1 && !hasInlineThresholdOverride())
-      MPM.addPass(InlineSmallRustFunctionsPass());
-
     FunctionPassManager EarlyFPM;
-    EarlyFPM.addPass(EntryExitInstrumenterPass(/*PostInlining=*/false));
+    EntryExitInstrumenterPass Instrument(/*PostInlining=*/false);
+    // Expose small wrappers after inserting their instrumentation and before
+    // simplification.
+    if (deferLocalSimplification(Level, Phase) && supportsCallSharing(TM) &&
+        PTO.InlinerThreshold == -1 && !hasInlineThresholdOverride()) {
+      MPM.addPass(createModuleToFunctionPassAdaptor(std::move(Instrument)));
+      MPM.addPass(InlineSmallRustFunctionsPass());
+    } else {
+      EarlyFPM.addPass(std::move(Instrument));
+    }
+
     // Lower llvm.expect to metadata before attempting transforms.
     // Compare/branch metadata may alter the behavior of passes like
     // SimplifyCFG.
