@@ -594,11 +594,31 @@ static bool isIntOrIntVectorValue(const std::pair<const Value*, unsigned> &V) {
   return V.first->getType()->isIntOrIntVectorTy();
 }
 
+void ValueEnumerator::getNonDebugAttachments(
+    const Instruction &I,
+    SmallVectorImpl<std::pair<unsigned, MDNode *>> &MDs) const {
+  I.getAllMetadataOtherThanDebugLoc(MDs);
+  if (!OmittedAsmLocation || MDs.empty())
+    return;
+  const auto *Call = dyn_cast<CallBase>(&I);
+  if (!Call || !Call->isInlineAsm())
+    return;
+  llvm::erase_if(MDs, [&](const auto &MD) {
+    if (MD.first != OmittedAsmLocation || !isa<MDTuple>(MD.second) ||
+        MD.second->getNumOperands() != 1)
+      return false;
+    auto *Cookie = mdconst::dyn_extract_or_null<ConstantInt>(
+        MD.second->getOperand(0));
+    return Cookie && Cookie->getBitWidth() == 64;
+  });
+}
+
 ValueEnumerator::ValueEnumerator(const Module &M,
                                  bool ShouldPreserveUseListOrder,
                                  MachineUseState *Uses,
                                  ValueEnumerationHints Hints)
-    : ShouldPreserveUseListOrder(ShouldPreserveUseListOrder) {
+    : OmittedAsmLocation(Hints.OmittedAsmLocation),
+      ShouldPreserveUseListOrder(ShouldPreserveUseListOrder) {
   if (ShouldPreserveUseListOrder)
     UseListOrders = predictUseListOrder(M, Uses, Hints);
   MetadataMap.reserve(Hints.InstructionCount / 2);
@@ -746,7 +766,7 @@ ValueEnumerator::ValueEnumerator(const Module &M,
 
         // Enumerate metadata attached with this instruction.
         MDs.clear();
-        I.getAllMetadataOtherThanDebugLoc(MDs);
+        getNonDebugAttachments(I, MDs);
         for (const auto &MD : MDs)
           EnumerateMetadata(&F, MD.second);
 

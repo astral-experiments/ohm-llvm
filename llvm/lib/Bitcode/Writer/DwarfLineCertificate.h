@@ -98,6 +98,14 @@ class DwarfLineCertificate {
   llvm::ValueEnumerationHints Hints{0, false};
 
 public:
+  void omitAsmLocations(const llvm::LLVMContext &C) {
+    llvm::SmallVector<llvm::StringRef> Kinds;
+    C.getMDKindNames(Kinds);
+    for (auto [ID, Name] : llvm::enumerate(Kinds))
+      if (Name == "srcloc")
+        Hints.OmittedAsmLocation = ID;
+  }
+
   llvm::ValueEnumerationHints enumerationHints() const { return Hints; }
 
   bool prepare(const llvm::Module &M) {
