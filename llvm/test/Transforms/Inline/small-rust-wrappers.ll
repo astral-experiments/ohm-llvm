@@ -1,5 +1,6 @@
 ; RUN: opt -passes=inline-small-rust-functions -verify-each -S %s | FileCheck %s
-; RUN: opt -passes='default<O1>' -inline-threshold=0 -S %s | FileCheck %s --check-prefix=BUDGET
+; RUN: opt -passes='default<O1>' -inline-threshold=0 -S %s | FileCheck %s --check-prefix=OUTLINED
+; RUN: opt -passes='default<O1>' -passes-ep-pipeline-early-simplification=print -disable-output %s 2>&1 | FileCheck %s --check-prefix=OUTLINED
 ; RUN: opt -passes='default<O1>' -S %s | FileCheck %s --check-prefix=INSTRUMENT
 
 target triple = "x86_64-unknown-linux-gnu"
@@ -7,8 +8,8 @@ target triple = "x86_64-unknown-linux-gnu"
 ; Each layer is small and adds no basic blocks when inlined. Expanding
 ; each newly cloned call into the next layer multiplies the work.
 define void @_Rroot() {
-; BUDGET-LABEL: define void @_Rroot(
-; BUDGET: call {{.*}}@_Router()
+; OUTLINED-LABEL: define void @_Rroot(
+; OUTLINED: call {{.*}}@_Router()
 ; CHECK-LABEL: define void @_Rroot(
 ; CHECK: call void @_Rinner()
 ; CHECK-NOT: call void @_Rrequired()
