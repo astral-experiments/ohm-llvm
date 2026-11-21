@@ -1013,6 +1013,23 @@ MergeIdenticalRustFunctionsPass::run(Module &M, ModuleAnalysisManager &AM) {
   return MergeFunctionsPass().run(M, AM);
 }
 
+PreservedAnalyses
+EliminateDeadSharedArgumentsPass::run(Module &M, ModuleAnalysisManager &AM) {
+  if (!isRustModule(M))
+    return PreservedAnalyses::all();
+
+  // Late scalar optimizations can delete the last indirect call in a
+  // shared body. Its thunks would still take the address of each target.
+  for (Function &F : M)
+    if (F.hasLocalLinkage() &&
+        F.getName().ends_with(GlobalMergeFunc::MergingInstanceSuffix) &&
+        any_of(F.args(), [](const Argument &Arg) {
+          return Arg.getType()->isPointerTy() && Arg.use_empty();
+        }))
+      return DeadArgumentEliminationPass().run(M, AM);
+  return PreservedAnalyses::all();
+}
+
 PreservedAnalyses MergeRepeatedCallsPass::run(Module &M,
                                               ModuleAnalysisManager &AM) {
   if (!isRustModule(M))
@@ -1912,6 +1929,9 @@ PassBuilder::buildModuleOptimizationPipeline(OptimizationLevel Level,
   // structurally similar regions.
   if (EnableIROutliner)
     MPM.addPass(IROutlinerPass());
+
+  if (deferLocalSimplification(Level, LTOPhase) && supportsCallSharing(TM))
+    MPM.addPass(EliminateDeadSharedArgumentsPass());
 
   // Now we need to do some global optimization transforms.
   // FIXME: It would seem like these should come first in the optimization
