@@ -28,6 +28,7 @@
 #include "llvm/Analysis/ScopedNoAliasAA.h"
 #include "llvm/Analysis/TypeBasedAliasAnalysis.h"
 #include "llvm/CodeGen/GlobalMergeFunctions.h"
+#include "llvm/Demangle/Demangle.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/PassManager.h"
 #include "llvm/IR/RustSymbolChecks.h"
@@ -991,12 +992,30 @@ static bool isRustModule(const Module &M) {
          });
 }
 
+// Cargo marks the entire dependency tree. Spend the additional compile time
+// on libraries that import Rust's proc_macro API. An unrecognized mangling
+// falls back to the ordinary O0 pipeline.
+static bool importsProcMacro(const Module &M) {
+  return llvm::any_of(M, [](const Function &F) {
+    StringRef Name = F.getName();
+    if (!F.isDeclaration() || F.use_empty() || !Name.starts_with("_R") ||
+        !Name.contains("proc_macro"))
+      return false;
+
+    std::string Demangled = llvm::demangle(Name);
+    StringRef Path(Demangled);
+    Path.consume_front("<");
+    return Path.starts_with("proc_macro::");
+  });
+}
+
 PreservedAnalyses SimplifyRustMacroHelpersPass::run(Module &M,
                                                     ModuleAnalysisManager &AM) {
   auto *Flag = mdconst::dyn_extract_or_null<ConstantInt>(
       M.getModuleFlag("ohm.proc-macro-helper"));
   if (!Flag || !Flag->getType()->isIntegerTy(32) || !Flag->isOne() ||
-      !isRustModule(M) || M.getNamedMetadata("llvm.dbg.cu"))
+      !isRustModule(M) || M.getNamedMetadata("llvm.dbg.cu") ||
+      !importsProcMacro(M))
     return PreservedAnalyses::all();
 
   // Cargo builds these libraries once, then rustc runs their code on every
@@ -1015,10 +1034,12 @@ PreservedAnalyses SimplifyRustMacroHelpersPass::run(Module &M,
 
   ModulePassManager MPM;
   MPM.addPass(Simplify(false));
-  CGSCCPassManager CGPM;
-  CGPM.addPass(InlinerPass());
-  CGPM.addPass(PostOrderFunctionAttrsPass());
-  MPM.addPass(createModuleToPostOrderCGSCCPassAdaptor(std::move(CGPM)));
+  // Use the size threshold to limit the work left for the O0 backend.
+  ModuleInlinerWrapperPass Inliner(
+      getInlineParams(InlineConstants::OptSizeThreshold),
+      /*MandatoryFirst=*/false);
+  Inliner.getPM().addPass(PostOrderFunctionAttrsPass());
+  MPM.addPass(std::move(Inliner));
   MPM.addPass(Simplify(true));
   MPM.addPass(GlobalDCEPass());
   return MPM.run(M, AM);
