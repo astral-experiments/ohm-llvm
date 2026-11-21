@@ -12,6 +12,7 @@
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/Bitcode/BitcodeWriter.h"
+#include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
 #include "llvm/MC/StringTableBuilder.h"
@@ -225,6 +226,21 @@ static bool isDirectImport(const Function &F) {
   });
 }
 
+bool ohm::isRegisterBarrier(const CallBase &CB) {
+  // 'r' selects a general-purpose register. The 'q' modifier prints its
+  // 64-bit name inside a fixed comment. No symbol spelling or assembler
+  // directive can enter the template through this substitution.
+  const auto *Asm = dyn_cast<InlineAsm>(CB.getCalledOperand());
+  return Asm && CB.getModule()->getTargetTriple().getArch() == Triple::x86_64 &&
+         isa<CallInst>(CB) && CB.getType()->isVoidTy() && CB.arg_size() == 1 &&
+         CB.getArgOperand(0)->getType()->isIntegerTy(64) &&
+         !CB.getFunctionType()->isVarArg() && Asm->hasSideEffects() &&
+         !Asm->isAlignStack() && !Asm->canThrow() &&
+         Asm->getDialect() == InlineAsm::AD_Intel &&
+         Asm->getAsmString() == "/* ${0:q} */" &&
+         Asm->getConstraintString() == "r,~{dirflag},~{fpsr},~{flags}";
+}
+
 bool ohm::writeTraitImportSignature(const Module &M, SmallVectorImpl<char> &Key,
                                     SmallVectorImpl<char> &Manifest,
                                     function_ref<bool(StringRef)> ShouldProbe) {
@@ -259,18 +275,24 @@ bool ohm::writeTraitImportSignature(const Module &M, SmallVectorImpl<char> &Key,
     return false;
 
   // Assembly can reference spelling-dependent symbols outside IR use lists.
+  bool HasBarrier = false;
   for (const Function &F : M)
     for (const BasicBlock &BB : F)
       for (const Instruction &I : BB)
-        if (auto *CB = dyn_cast<CallBase>(&I); CB && CB->isInlineAsm())
-          return false;
+        if (auto *CB = dyn_cast<CallBase>(&I); CB && CB->isInlineAsm()) {
+          if (!isRegisterBarrier(*CB))
+            return false;
+          HasBarrier = true;
+        }
   auto GetName = [&](const Function &F) {
     auto It = Paths.find(&F);
     return It != Paths.end() ? It->second : F.getName();
   };
   SmallVector<char, 0> Certificate;
   raw_svector_ostream Stream(Certificate);
-  if (!writeProjectedDwarfLineCertificate(M, Stream, GetName))
+  // Rust encodes source spans in !srcloc for inline asm diagnostics. Keep
+  // the original locations on the live module, including on a cache miss.
+  if (!writeProjectedDwarfLineCertificate(M, Stream, GetName, HasBarrier))
     return false;
   CertificateReader Reader{StringRef(Certificate.data(), Certificate.size())};
   StringRef Directory, Digest;

@@ -2838,7 +2838,7 @@ void ModuleBitcodeWriter::writeFunctionMetadataAttachment(const Function &F) {
     for (const Instruction &I : BB) {
       unsigned InstructionID = NextInstruction++;
       MDs.clear();
-      I.getAllMetadataOtherThanDebugLoc(MDs);
+      VE.getNonDebugAttachments(I, MDs);
 
       // If no metadata, ignore instruction.
       if (MDs.empty()) continue;
@@ -5879,12 +5879,20 @@ bool llvm::writeClosedDwarfLineCertificateV1(const Module &M, raw_ostream &Out) 
 bool llvm::writeProjectedDwarfLineCertificate(
     const Module &M, raw_ostream &Out,
     function_ref<StringRef(const Function &)> GetName) {
+  return writeProjectedDwarfLineCertificate(M, Out, GetName, false);
+}
+
+bool llvm::writeProjectedDwarfLineCertificate(
+    const Module &M, raw_ostream &Out,
+    function_ref<StringRef(const Function &)> GetName, bool OmitAsmLocations) {
   if (!M.isMaterialized() || !M.getTargetTriple().isOSBinFormatELF() ||
       !preserveUseListOrder(true))
     return false;
   DwarfLineCertificate Certificate;
   if (!Certificate.prepare(M))
     return false;
+  if (OmitAsmLocations)
+    Certificate.omitAsmLocations(M.getContext());
   std::array<uint8_t, 32> Context;
   if (!getClosedOptimizerContextV1(M, Context))
     return false;

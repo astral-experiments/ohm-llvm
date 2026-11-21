@@ -533,7 +533,8 @@ struct Origin {
   }
 };
 
-bool ordinaryModule(const Module &M, bool WithoutDebug) {
+bool ordinaryModule(const Module &M, bool WithoutDebug,
+                    bool *HasBarrier = nullptr) {
   if (!M.getModuleInlineAsm().empty() || M.getModuleFlag("ProfileSummary") ||
       M.getModuleFlag("CSProfileSummary") ||
       M.getModuleFlag("Debug Info For Profiling"))
@@ -588,8 +589,11 @@ bool ordinaryModule(const Module &M, bool WithoutDebug) {
       for (const Instruction &Inst : BB) {
         if (Inst.hasDbgRecords() || (WithoutDebug && Inst.getDebugLoc()))
           return false;
-        if (const auto *CB = dyn_cast<CallBase>(&Inst); CB && CB->isInlineAsm())
-          return false;
+        if (const auto *CB = dyn_cast<CallBase>(&Inst); CB && CB->isInlineAsm()) {
+          if (!HasBarrier || !ohm::isRegisterBarrier(*CB))
+            return false;
+          *HasBarrier = true;
+        }
       }
   }
   return true;
@@ -702,16 +706,16 @@ bool splitTraitRecord(StringRef Payload, StringRef &Object,
 // A quick way to recognize a unit from the common ancestor when switching
 // branches. This only decides when to serialize the full LLVM input. A
 // collision can cost a probe, but cannot authorize a hit.
-std::string inputShape(const Module &M, bool TestHarness) {
+std::string inputShape(const Module &M, bool ProbeLineMovement) {
   BLAKE3 Hash;
   for (const Function &F : M) {
     frame(Hash, F.getName());
     char Blocks[8];
     support::endian::write64le(Blocks, F.size());
     Hash.update(StringRef(Blocks, sizeof(Blocks)));
-    // rustc checks for line movement on successive library builds. Test
-    // executables need that probe here, even if the source checksum changed.
-    if (TestHarness)
+    // Test executables and modules with inline assembly rely on this
+    // probe for line movement, including across source checksum changes.
+    if (ProbeLineMovement)
       continue;
     auto *SP = F.getSubprogram();
     auto *File = SP ? SP->getFile() : nullptr;
@@ -727,7 +731,7 @@ std::string inputShape(const Module &M, bool TestHarness) {
 // spelling of selected Rust method imports projected out. Verify the
 // method paths and restore their current bindings before replay.
 bool tryTraitObject(Module &M, TargetMachine &TM, const Invocation &I,
-                    StringRef Output, void **Ticket) {
+                    StringRef Output, bool HasBarrier, void **Ticket) {
   if (TM.getOptLevel() != CodeGenOptLevel::Less)
     return false;
   auto Trait = std::make_unique<TraitOrigin>();
@@ -748,7 +752,7 @@ bool tryTraitObject(Module &M, TargetMachine &TM, const Invocation &I,
     frame(Slot, "ohm-line-object-hint-v2");
     frame(Slot, M.getModuleIdentifier());
     auto Path = joinPath(I.Entries, "llvmcache-" + toHex(Slot.final(), true));
-    std::string Shape = inputShape(M, I.TestHarness);
+    std::string Shape = inputShape(M, I.TestHarness || HasBarrier);
     std::string Roster = hexDigest(Imports);
     StringRef First = Shape;
     size_t Size = Shape.size() + Roster.size();
@@ -1225,8 +1229,9 @@ extern "C" int ohm_early_object_begin_v1(LLVMModuleRef Ref,
   if (!Large && !Leaf)
     return 0;
   const auto &I = invocation(/*ForLineObjects=*/!WithoutDebug);
+  bool HasBarrier = false;
   if (I.Root.empty() || I.WithoutDebug != WithoutDebug || !I.imagesUnchanged() ||
-      !ordinaryModule(M, I.WithoutDebug))
+      !ordinaryModule(M, I.WithoutDebug, WithoutDebug ? nullptr : &HasBarrier))
     return 0;
   auto &C = M.getContext();
   auto *Handler = C.getDiagHandlerPtr();
@@ -1237,9 +1242,10 @@ extern "C" int ohm_early_object_begin_v1(LLVMModuleRef Ref,
     if (!ohm::canUseDebugObjectCache())
       return 0;
     auto &Machine = *reinterpret_cast<TargetMachine *>(TM);
-    if (Large && tryTraitObject(M, Machine, I, StringRef(Output, Length), Ticket))
+    if (Large && tryTraitObject(M, Machine, I, StringRef(Output, Length),
+                                HasBarrier, Ticket))
       return 1;
-    if (Leaf && !I.TestHarness)
+    if (Leaf && !I.TestHarness && !HasBarrier)
       startLeafObject(M, Machine, I, Ticket);
     return 0;
   }

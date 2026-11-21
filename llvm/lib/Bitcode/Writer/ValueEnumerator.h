@@ -52,13 +52,18 @@ struct MachineUseState {
 struct ValueEnumerationHints {
   unsigned InstructionCount = 0;
   bool MayHaveMetadataOperands = true;
+  unsigned OmittedAsmLocation = 0;
 };
 
 class ValueEnumerator {
+  unsigned OmittedAsmLocation;
   DebugObjectSourceMap *SourceMap = nullptr;
   unsigned getRawValueID(const Value *V) const;
 
 public:
+  void getNonDebugAttachments(
+      const Instruction &I,
+      SmallVectorImpl<std::pair<unsigned, MDNode *>> &MDs) const;
   void setSourceMap(DebugObjectSourceMap *Map) { SourceMap = Map; }
   DebugObjectSourceMap *getSourceMap() const { return SourceMap; }
   StringRef callerTail(const ConstantDataSequential *C) const {

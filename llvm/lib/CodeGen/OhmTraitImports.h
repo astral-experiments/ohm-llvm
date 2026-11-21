@@ -14,8 +14,12 @@
 #include "llvm/ADT/StringRef.h"
 
 namespace llvm {
+class CallBase;
 class Module;
 namespace ohm {
+/// Recognize the x86-64 optimization barrier with one integer register input.
+bool isRegisterBarrier(const CallBase &CB);
+
 /// Compute a closed line certificate with normalized paths for selected
 /// direct method imports. Key selects candidate donors. Manifest retains
 /// their complete proof and original import names for checked rebinding.
