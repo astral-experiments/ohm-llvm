@@ -20,6 +20,7 @@ add_llvm_component_library(LLVMPasses
   GlobalISel
   Core
   Coroutines
+  Demangle
   HipStdPar
   IPO
   InstCombine

@@ -1,5 +1,8 @@
 ; REQUIRES: x86-registered-target
 ; RUN: opt -passes='default<O0>' -verify-each -S %s | FileCheck %s --check-prefix=HELPER
+; RUN: sed 's/_RNvC10proc_macro4test/_RNvC11proc_macro24test/g' %s | opt -passes='default<O0>' -S | FileCheck %s --check-prefix=PLAIN
+; RUN: sed 's/_RNvC10proc_macro4test/_RNvNtC4user10proc_macro4test/g' %s | opt -passes='default<O0>' -S | FileCheck %s --check-prefix=PLAIN
+; RUN: sed '/^  call void/d' %s | opt -passes='default<O0>' -S | FileCheck %s --check-prefix=PLAIN
 ; RUN: sed 's/ohm.proc-macro-helper/other/' %s | opt -passes='default<O0>' -S | FileCheck %s --check-prefix=PLAIN
 ; RUN: sed 's/!"ohm.proc-macro-helper", i32 1/!"ohm.proc-macro-helper", i32 2/' %s | opt -passes='default<O0>' -S | FileCheck %s --check-prefix=PLAIN
 ; RUN: sed 's/!"ohm.proc-macro-helper", i32 1/!"ohm.proc-macro-helper", i64 1/' %s | opt -passes='default<O0>' -S | FileCheck %s --check-prefix=PLAIN
@@ -9,6 +12,13 @@
 ; RUN: opt -passes='thinlto-pre-link<O0>' -S %s | FileCheck %s --check-prefix=PLAIN
 
 target triple = "x86_64-unknown-linux-gnu"
+
+declare void @_RNvC10proc_macro4test()
+
+define void @use_api() {
+  call void @_RNvC10proc_macro4test()
+  ret void
+}
 
 ; HELPER-LABEL: @expand(
 ; HELPER-NOT: alloca
