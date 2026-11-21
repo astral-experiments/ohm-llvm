@@ -1,10 +1,13 @@
 ; RUN: opt -passes=inline-small-rust-functions -verify-each -S %s | FileCheck %s
+; RUN: opt -passes='default<O1>' -inline-threshold=0 -S %s | FileCheck %s --check-prefix=BUDGET
 
 target triple = "x86_64-unknown-linux-gnu"
 
 ; Each layer is small and adds no basic blocks when inlined. Expanding
 ; each newly cloned call into the next layer multiplies the work.
 define void @_Rroot() {
+; BUDGET-LABEL: define void @_Rroot(
+; BUDGET: call {{.*}}@_Router()
 ; CHECK-LABEL: define void @_Rroot(
 ; CHECK: call void @_Rinner()
 ; CHECK-NOT: call void @_Rrequired()

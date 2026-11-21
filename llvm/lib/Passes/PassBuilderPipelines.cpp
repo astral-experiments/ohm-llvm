@@ -1379,7 +1379,8 @@ PassBuilder::buildModuleSimplificationPipeline(OptimizationLevel Level,
     MPM.addPass(InferFunctionAttrsPass());
     MPM.addPass(CoroEarlyPass());
     // Expose the operations behind small wrappers before simplification.
-    if (deferLocalSimplification(Level, Phase) && supportsCallSharing(TM))
+    if (deferLocalSimplification(Level, Phase) && supportsCallSharing(TM) &&
+        PTO.InlinerThreshold == -1 && !hasInlineThresholdOverride())
       MPM.addPass(InlineSmallRustFunctionsPass());
 
     FunctionPassManager EarlyFPM;
