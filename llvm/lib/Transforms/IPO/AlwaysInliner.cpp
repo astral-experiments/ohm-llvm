@@ -12,6 +12,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/Transforms/IPO/AlwaysInliner.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/Analysis/AliasAnalysis.h"
 #include "llvm/Analysis/AssumptionCache.h"
@@ -53,6 +54,7 @@ bool AlwaysInlineImpl(
            none_of(instructions(F),
                    [](const Instruction &I) { return isa<AllocaInst>(I); });
   };
+  DenseMap<Function *, unsigned> ExtraCalls;
   SmallSetVector<CallBase *, 16> Calls;
   bool Changed = false;
   SmallVector<Function *, 16> InlinedComdatFunctions;
@@ -70,6 +72,7 @@ bool AlwaysInlineImpl(
     std::optional<InlineResult> CanInlineWithAttributes =
         getAttributeBasedInliningDecision(CB, &Callee, CalleeTTI, GetTLI);
     if (!CanInlineWithAttributes && IsSmall(Callee) && Caller->size() < 256 &&
+        ExtraCalls.lookup(Caller) < MaxInstructions &&
         AttributeFuncs::areInlineCompatible(*Caller, Callee))
       CanInlineWithAttributes = InlineResult::success();
     if (!CanInlineWithAttributes || !CanInlineWithAttributes->isSuccess()) {
@@ -98,6 +101,11 @@ bool AlwaysInlineImpl(
       });
       return false;
     }
+
+    // Later callees see the calls cloned by earlier inlines. Bound their
+    // growth even when every layer fits in a single basic block.
+    if (MaxInstructions && IFI.InlinedCallSites.size() > 1)
+      ExtraCalls[Caller] += IFI.InlinedCallSites.size() - 1;
 
     emitInlinedIntoBasedOnCost(ORE, DLoc, Block, Callee, *Caller,
                                InlineCost::getAlways(InlineReason),
