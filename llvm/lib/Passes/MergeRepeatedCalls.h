@@ -12,6 +12,11 @@
 #include "llvm/IR/PassManager.h"
 
 namespace llvm {
+struct SimplifyRustMacroHelpersPass
+    : OptionalPassInfoMixin<SimplifyRustMacroHelpersPass> {
+  PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM);
+};
+
 struct InlineSmallRustFunctionsPass
     : OptionalPassInfoMixin<InlineSmallRustFunctionsPass> {
   PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM);

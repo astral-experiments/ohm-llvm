@@ -28,6 +28,7 @@
 #include "llvm/Analysis/ScopedNoAliasAA.h"
 #include "llvm/Analysis/TypeBasedAliasAnalysis.h"
 #include "llvm/CodeGen/GlobalMergeFunctions.h"
+#include "llvm/IR/Constants.h"
 #include "llvm/IR/PassManager.h"
 #include "llvm/IR/RustSymbolChecks.h"
 #include "llvm/IR/ValueMap.h"
@@ -988,6 +989,39 @@ static bool isRustModule(const Module &M) {
            return Producer &&
                   Producer->getString().starts_with("rustc version ");
          });
+}
+
+PreservedAnalyses SimplifyRustMacroHelpersPass::run(Module &M,
+                                                    ModuleAnalysisManager &AM) {
+  auto *Flag = mdconst::dyn_extract_or_null<ConstantInt>(
+      M.getModuleFlag("ohm.proc-macro-helper"));
+  if (!Flag || !Flag->getType()->isIntegerTy(32) || !Flag->isOne() ||
+      !isRustModule(M) || M.getNamedMetadata("llvm.dbg.cu"))
+    return PreservedAnalyses::all();
+
+  // Cargo builds these libraries once, then rustc runs their code on every
+  // expansion. Expose cheap callees before inlining. Clean up once per
+  // function after inlining to avoid revisiting it as the call graph changes.
+  auto Simplify = [](bool AfterInlining) {
+    FunctionPassManager FPM;
+    FPM.addPass(SROAPass(SROAOptions::ModifyCFG));
+    FPM.addPass(EarlyCSEPass());
+    if (AfterInlining)
+      FPM.addPass(JumpThreadingPass());
+    FPM.addPass(InstCombinePass());
+    FPM.addPass(SimplifyCFGPass());
+    return createModuleToFunctionPassAdaptor(std::move(FPM));
+  };
+
+  ModulePassManager MPM;
+  MPM.addPass(Simplify(false));
+  CGSCCPassManager CGPM;
+  CGPM.addPass(InlinerPass());
+  CGPM.addPass(PostOrderFunctionAttrsPass());
+  MPM.addPass(createModuleToPostOrderCGSCCPassAdaptor(std::move(CGPM)));
+  MPM.addPass(Simplify(true));
+  MPM.addPass(GlobalDCEPass());
+  return MPM.run(M, AM);
 }
 
 PreservedAnalyses RustJumpThreadingPass::run(Function &F,
@@ -2666,6 +2700,9 @@ PassBuilder::buildO0DefaultPipeline(OptimizationLevel Level,
   // code generation.
   MPM.addPass(AlwaysInlinerPass(
       /*InsertLifetimeIntrinsics=*/false));
+
+  if (Phase == ThinOrFullLTOPhase::None && !PGOOpt && supportsCallSharing(TM))
+    MPM.addPass(SimplifyRustMacroHelpersPass());
 
   if (PTO.MergeFunctions)
     MPM.addPass(MergeFunctionsPass());
