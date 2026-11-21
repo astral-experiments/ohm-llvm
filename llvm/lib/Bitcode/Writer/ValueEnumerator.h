@@ -48,6 +48,12 @@ struct MachineUseState {
   SmallVector<SmallVector<uint64_t, 8>, 0> MetadataUses;
 };
 
+// Information already collected by the DWARF line certificate's IR walk.
+struct ValueEnumerationHints {
+  unsigned InstructionCount = 0;
+  bool MayHaveMetadataOperands = true;
+};
+
 class ValueEnumerator {
   DebugObjectSourceMap *SourceMap = nullptr;
   unsigned getRawValueID(const Value *V) const;
@@ -149,10 +155,6 @@ private:
   /// the "getGlobalBasicBlockID" method.
   mutable DenseMap<const BasicBlock*, unsigned> GlobalBasicBlockIDs;
 
-  using InstructionMapType = DenseMap<const Instruction *, unsigned>;
-  InstructionMapType InstructionMap;
-  unsigned InstructionCount;
-
   /// BasicBlocks - This contains all the basic blocks for the currently
   /// incorporated function.  Their reverse mapping is stored in ValueMap.
   std::vector<const BasicBlock*> BasicBlocks;
@@ -171,7 +173,8 @@ private:
 
 public:
   ValueEnumerator(const Module &M, bool ShouldPreserveUseListOrder,
-                  MachineUseState *Uses = nullptr);
+                  MachineUseState *Uses = nullptr,
+                  ValueEnumerationHints Hints = {});
   ValueEnumerator(const ValueEnumerator &) = delete;
   ValueEnumerator &operator=(const ValueEnumerator &) = delete;
 
@@ -205,8 +208,6 @@ public:
     return I->second-1;
   }
 
-  unsigned getInstructionID(const Instruction *I) const;
-  void setInstructionID(const Instruction *I);
 
   unsigned getAttributeListID(AttributeList PAL) const {
     if (PAL.isEmpty()) return 0;  // Null maps to zero.

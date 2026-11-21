@@ -31,6 +31,11 @@ class raw_ostream;
 struct DebugObjectSourceMap;
 struct MachineUseState;
 
+/// Write a closed line certificate with projected declaration names.
+LLVM_ABI bool writeProjectedDwarfLineCertificate(
+    const Module &M, raw_ostream &Out,
+    function_ref<StringRef(const Function &)> GetName);
+
 class BitcodeWriter {
   friend bool writeDebugObjectBitcode(const Module &, SmallVectorImpl<char> &,
                                       DebugObjectSourceMap *, bool);
@@ -38,6 +43,9 @@ class BitcodeWriter {
                        ModuleHash *, DebugObjectSourceMap *,
                        MachineUseState *Uses = nullptr);
 
+  friend bool writeProjectedDwarfLineCertificate(
+      const Module &M, raw_ostream &Out,
+      function_ref<StringRef(const Function &)> GetName);
   friend bool writeClosedDwarfLineCertificateV1(const Module &, raw_ostream &);
 
   std::unique_ptr<BitstreamWriter> Stream;

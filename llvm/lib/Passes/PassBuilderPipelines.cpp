@@ -14,6 +14,7 @@
 ///
 //===----------------------------------------------------------------------===//
 
+#include "MergeRepeatedCalls.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/Analysis/AliasAnalysis.h"
 #include "llvm/Analysis/BasicAliasAnalysis.h"
@@ -26,7 +27,9 @@
 #include "llvm/Analysis/ProfileSummaryInfo.h"
 #include "llvm/Analysis/ScopedNoAliasAA.h"
 #include "llvm/Analysis/TypeBasedAliasAnalysis.h"
+#include "llvm/CodeGen/GlobalMergeFunctions.h"
 #include "llvm/IR/PassManager.h"
+#include "llvm/IR/RustSymbolChecks.h"
 #include "llvm/IR/ValueMap.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/Pass.h"
@@ -139,6 +142,7 @@
 #include "llvm/Transforms/Scalar/SpeculativeExecution.h"
 #include "llvm/Transforms/Scalar/TailRecursionElimination.h"
 #include "llvm/Transforms/Scalar/WarnMissedTransforms.h"
+#include "llvm/Transforms/Utils/LowerSwitch.h"
 #include "llvm/Transforms/Utils/AddDiscriminators.h"
 #include "llvm/Transforms/Utils/AssignGUID.h"
 #include "llvm/Transforms/Utils/AssumeBundleBuilder.h"
@@ -967,6 +971,57 @@ static InlineParams getInlineParamsFromOptLevel(OptimizationLevel Level) {
   return getInlineParamsFromOptLevel(static_cast<unsigned>(Level));
 }
 
+static bool supportsCallSharing(const TargetMachine *TM) {
+  return TM && TM->getTargetTriple().getArch() == Triple::x86_64 &&
+         TM->getTargetTriple().isOSLinux();
+}
+
+static bool isRustModule(const Module &M) {
+  if (M.getTargetTriple().getArch() != Triple::x86_64 ||
+      !M.getTargetTriple().isOSLinux())
+    return false;
+  auto *Ident = M.getNamedMetadata("llvm.ident");
+  return Ident && llvm::any_of(Ident->operands(), [](const MDNode *Entry) {
+           if (Entry->getNumOperands() != 1)
+             return false;
+           auto *Producer = dyn_cast_or_null<MDString>(Entry->getOperand(0));
+           return Producer &&
+                  Producer->getString().starts_with("rustc version ");
+         });
+}
+
+PreservedAnalyses RustJumpThreadingPass::run(Function &F,
+                                             FunctionAnalysisManager &AM) {
+  // Avoid expensive threading through large generated dispatches.
+  if (F.size() > 256 || !isRustModule(*F.getParent()))
+    return PreservedAnalyses::all();
+  return JumpThreadingPass().run(F, AM);
+}
+
+PreservedAnalyses InlineSmallRustFunctionsPass::run(Module &M,
+                                                    ModuleAnalysisManager &AM) {
+  if (!isRustModule(M))
+    return PreservedAnalyses::all();
+
+  return AlwaysInlinerPass().runWithSmallCallees(M, AM, /*MaxInstructions=*/16);
+}
+
+PreservedAnalyses
+MergeIdenticalRustFunctionsPass::run(Module &M, ModuleAnalysisManager &AM) {
+  if (!isRustModule(M) || !canIntroduceRustSymbols(M))
+    return PreservedAnalyses::all();
+  return MergeFunctionsPass().run(M, AM);
+}
+
+PreservedAnalyses MergeRepeatedCallsPass::run(Module &M,
+                                              ModuleAnalysisManager &AM) {
+  if (!isRustModule(M))
+    return PreservedAnalyses::all();
+  bool Changed = GlobalMergeFunc::shareCallTargets(M);
+  auto PA = MergeFunctionsPass().run(M, AM);
+  return Changed ? PreservedAnalyses::none() : PA;
+}
+
 namespace {
 
 // Keep the pending work attached to the original definition. If inlining
@@ -983,13 +1038,15 @@ class LocalFunctionSimplification
     FunctionPassManager Pipeline;
     ValueMap<Function *, bool, DeferredFunctionConfig> Pending;
     std::optional<bool> HasCoroutines;
+    bool DeferRoots = false;
   };
   std::shared_ptr<State> S;
   bool AfterInlining = false;
+  bool Share;
 
 public:
-  explicit LocalFunctionSimplification(FunctionPassManager Pipeline)
-      : S(std::make_shared<State>(std::move(Pipeline))) {}
+  explicit LocalFunctionSimplification(FunctionPassManager Pipeline, bool Share)
+      : S(std::make_shared<State>(std::move(Pipeline))), Share(Share) {}
 
   LocalFunctionSimplification afterInlining() const {
     auto Late = *this;
@@ -998,16 +1055,33 @@ public:
   }
 
   PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM) {
+    // CoroElide belongs before the CGSCC coroutine passes.
+    if (!S->HasCoroutines) {
+      S->HasCoroutines = any_of(*F.getParent(), [](const Function &Fn) {
+        return Fn.isPresplitCoroutine() ||
+               (Fn.isIntrinsic() && Fn.getName().starts_with("llvm.coro."));
+      });
+      S->DeferRoots =
+          Share && !*S->HasCoroutines && isRustModule(*F.getParent());
+    }
+
+    bool Rust = S->DeferRoots && F.getName().starts_with("_R");
+    if (Rust && F.hasFnAttribute(Attribute::NoInline)) {
+      // This also covers shared bodies introduced between the sweeps.
+      if (AfterInlining)
+        return S->Pipeline.run(F, AM);
+      return PreservedAnalyses::all();
+    }
     if (AfterInlining) {
       if (!S->Pending.erase(&F))
         return PreservedAnalyses::all();
     } else {
-      // CoroElide belongs before the CGSCC coroutine passes.
-      if (!S->HasCoroutines)
-        S->HasCoroutines = any_of(*F.getParent(), [](const Function &Fn) {
-          return Fn.isPresplitCoroutine() ||
-                 (Fn.isIntrinsic() && Fn.getName().starts_with("llvm.coro."));
-        });
+      // A function without callers cannot affect an inlining decision.
+      // Simplify it after merging any repeated bodies.
+      if (Rust && F.use_empty()) {
+        S->Pending.insert({&F, true});
+        return PreservedAnalyses::all();
+      }
       if (!*S->HasCoroutines && F.hasLocalLinkage() && !F.hasOptNone() &&
           !F.hasFnAttribute(Attribute::NoInline) && !F.hasAddressTaken() &&
           // Simplifying loops can make a multi-use callee small enough to
@@ -1145,7 +1219,10 @@ PassBuilder::buildInlinerPipelineImpl(OptimizationLevel Level,
   // CGSCC walk.
   auto Simplify = buildFunctionSimplificationPipeline(Level, Phase);
   if (DeferLocal) {
-    LocalFunctionSimplification Local(std::move(Simplify));
+    bool Share = supportsCallSharing(TM);
+    LocalFunctionSimplification Local(std::move(Simplify), Share);
+    if (Share)
+      MIWP.addLateModulePass(MergeRepeatedCallsPass());
     MIWP.addLateModulePass(
         createModuleToFunctionPassAdaptor(Local.afterInlining()));
     MainCGPipeline.addPass(createCGSCCToFunctionPassAdaptor(
@@ -1275,6 +1352,9 @@ PassBuilder::buildModuleSimplificationPipeline(OptimizationLevel Level,
     // libraries and other oracles.
     MPM.addPass(InferFunctionAttrsPass());
     MPM.addPass(CoroEarlyPass());
+    // Expose the operations behind small wrappers before simplification.
+    if (deferLocalSimplification(Level, Phase) && supportsCallSharing(TM))
+      MPM.addPass(InlineSmallRustFunctionsPass());
 
     FunctionPassManager EarlyFPM;
     EarlyFPM.addPass(EntryExitInstrumenterPass(/*PostInlining=*/false));
@@ -1333,6 +1413,10 @@ PassBuilder::buildModuleSimplificationPipeline(OptimizationLevel Level,
   // years, it should be re-analyzed.
   MPM.addPass(
       IPSCCPPass(IPSCCPOptions(/*AllowFuncSpec=*/!isLTOPreLink(Phase))));
+
+  // Preserve caller-specific constants discovered by IPSCCP.
+  if (deferLocalSimplification(Level, Phase) && supportsCallSharing(TM))
+    MPM.addPass(MergeIdenticalRustFunctionsPass());
 
   // Attach metadata to indirect call sites indicating the set of functions
   // they may target at run-time. This should follow IPSCCP.
@@ -1432,6 +1516,11 @@ PassBuilder::buildModuleSimplificationPipeline(OptimizationLevel Level,
 
   MPM.addPass(AlwaysInlinerPass(/*InsertLifetimeIntrinsics=*/true));
 
+  if (deferLocalSimplification(Level, Phase) && TM &&
+      TM->getTargetTriple().getArch() == Triple::x86_64 &&
+      TM->getTargetTriple().isOSLinux())
+    MPM.addPass(LowerSwitchCallsPass());
+
   if (EnableModuleInliner)
     MPM.addPass(buildModuleInlinerPipeline(Level, Phase));
   else if (deferLocalSimplification(Level, Phase))
@@ -1508,7 +1597,9 @@ void PassBuilder::addVectorPasses(OptimizationLevel Level,
     // of the current iteration.
     FPM.addPass(LoopLoadEliminationPass());
   }
-  // Cleanup after the loop optimization passes.
+  // Recover branches exposed by wrapper inlining before the existing cleanup.
+  if (deferLocalSimplification(Level, LTOPhase) && supportsCallSharing(TM))
+    FPM.addPass(RustJumpThreadingPass());
   FPM.addPass(InstCombinePass());
 
   if (Level > OptimizationLevel::O1 && ExtraVectorizerPasses) {

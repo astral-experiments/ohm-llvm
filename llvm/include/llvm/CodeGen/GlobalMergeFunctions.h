@@ -34,6 +34,7 @@ enum class HashFunctionMode {
   Local,
   BuildingHashFuncion,
   UsingHashFunction,
+  LocalCallTargets,
 };
 
 namespace llvm {
@@ -65,6 +66,10 @@ public:
   LLVM_ABI void initializeMergerMode(const Module &M);
 
   LLVM_ABI bool run(Module &M);
+
+  /// Factor calls to opaque Rust functions in the current module. Follow
+  /// this with MergeFunctions to fold equivalent parameterized bodies.
+  LLVM_ABI static bool shareCallTargets(Module &M);
 
   /// Analyze module to create stable function into LocalFunctionMap.
   LLVM_ABI void analyze(Module &M);
