@@ -228,9 +228,10 @@ public:
                           BitstreamWriter &Stream,
                           bool ShouldPreserveUseListOrder,
                           const ModuleSummaryIndex *Index,
-                          MachineUseState *Uses = nullptr)
+                          MachineUseState *Uses = nullptr,
+                          ValueEnumerationHints Hints = {})
       : BitcodeWriterBase(Stream, StrtabBuilder), M(M),
-        VE(M, preserveUseListOrder(ShouldPreserveUseListOrder), Uses),
+        VE(M, preserveUseListOrder(ShouldPreserveUseListOrder), Uses, Hints),
         Index(Index) {
     // Assign ValueIds to any callee values in the index that came from
     // indirect call profiles and were recorded as a GUID not a Value*
@@ -328,10 +329,12 @@ public:
                       DebugObjectSourceMap *SourceMap = nullptr,
                       MachineUseState *Uses = nullptr,
                       DwarfLineCertificate *LineCertificate = nullptr)
-      : ModuleBitcodeWriterBase(M, StrtabBuilder, Stream,
-                                ShouldPreserveUseListOrder, Index, Uses),
-        LineCertificate(LineCertificate), GenerateHash(GenerateHash), ModHash(ModHash),
-        BitcodeStartBit(Stream.GetCurrentBitNo()) {
+      : ModuleBitcodeWriterBase(
+            M, StrtabBuilder, Stream, ShouldPreserveUseListOrder, Index, Uses,
+            LineCertificate ? LineCertificate->enumerationHints()
+                            : ValueEnumerationHints()),
+        LineCertificate(LineCertificate), GenerateHash(GenerateHash),
+        ModHash(ModHash), BitcodeStartBit(Stream.GetCurrentBitNo()) {
     assert(!(SourceMap && LineCertificate));
     VE.setSourceMap(SourceMap);
   }
@@ -2805,15 +2808,18 @@ void ModuleBitcodeWriter::writeFunctionMetadataAttachment(const Function &F) {
   // Write metadata attachments
   // METADATA_ATTACHMENT - [m x [value, [n x [id, mdnode]]]
   SmallVector<std::pair<unsigned, MDNode *>, 4> MDs;
+  // Attachment records refer to the instruction ordinal in writeFunction.
+  unsigned NextInstruction = 0;
   for (const BasicBlock &BB : F)
     for (const Instruction &I : BB) {
+      unsigned InstructionID = NextInstruction++;
       MDs.clear();
       I.getAllMetadataOtherThanDebugLoc(MDs);
 
       // If no metadata, ignore instruction.
       if (MDs.empty()) continue;
 
-      Record.push_back(VE.getInstructionID(&I));
+      Record.push_back(InstructionID);
 
       for (const auto &[ID, MD] : MDs) {
         Record.push_back(ID);
@@ -3255,7 +3261,6 @@ void ModuleBitcodeWriter::writeInstruction(const Instruction &I,
                                            SmallVectorImpl<unsigned> &Vals) {
   unsigned Code = 0;
   unsigned AbbrevToUse = 0;
-  VE.setInstructionID(&I);
   switch (I.getOpcode()) {
   default:
     if (Instruction::isCast(I.getOpcode())) {
