@@ -2632,6 +2632,24 @@ void ModuleBitcodeWriter::writeMetadataStrings(
 
   // Emit the final record.
   Stream.EmitRecordWithBlob(createMetadataStringsAbbrev(), Record, Blob);
+  if (auto *Map = VE.getSourceMap(); Map && !Map->Dwarf4Origin.empty()) {
+    // The blob is word-aligned and padded. The last field gives the byte
+    // offset of the first string after the encoded string lengths.
+    size_t Offset = Stream.GetCurrentBitNo() / 8 - alignTo(Blob.size(), 4) +
+                    Record.back();
+    for (auto *MD : Strings) {
+      auto *S = cast<MDString>(MD);
+      StringRef Written = VE.debugString(S);
+      if (Written.size() == 32 && Written == S->getString()) {
+        StringRef Old = Map->Dwarf4Origin.substr(Offset, Written.size());
+        if (Old.size() == Written.size() && Old != Written &&
+            llvm::all_of(Old, llvm::isHexDigit) &&
+            llvm::all_of(Written, llvm::isHexDigit))
+          Map->ChecksumCandidates.push_back({Offset, S});
+      }
+      Offset += Written.size();
+    }
+  }
   Record.clear();
 }
 
@@ -5766,6 +5784,33 @@ void BitcodeWriter::writeModuleImpl(const Module &M,
                                    GenerateHash, ModHash, SourceMap, Uses);
   if (!Uses || Uses->Complete)
     ModuleWriter.write();
+}
+
+bool llvm::DebugObjectSourceMap::matchesWithDwarf4Checksums(
+    const Module &M, StringRef Bytes) const {
+  if (ChecksumCandidates.empty() || Bytes.size() != Dwarf4Origin.size())
+    return false;
+
+  // Require exact equality of the ordered bitcode outside these fixed-width
+  // string payloads, including all lengths, metadata IDs and their uses.
+  size_t Pos = 0;
+  for (auto [Offset, S] : ChecksumCandidates) {
+    if (Offset < Pos || Bytes.substr(Offset, S->getLength()) != S->getString() ||
+        Bytes.slice(Pos, Offset) != Dwarf4Origin.slice(Pos, Offset))
+      return false;
+    Pos = Offset + S->getLength();
+  }
+  if (Bytes.drop_front(Pos) != Dwarf4Origin.drop_front(Pos))
+    return false;
+
+  // DwarfDebug::getMD5AsBytes omits these checksums from DWARF4. Use the
+  // line certificate's graph walk to reject even one ordinary metadata use
+  // of an interned string, and only pay for it on a potential hit.
+  DwarfLineCertificate Certificate;
+  return Certificate.prepare(M) &&
+         llvm::all_of(ChecksumCandidates, [&](const StringDifference &Diff) {
+           return Certificate.isChecksumOnly(Diff.String);
+         });
 }
 
 bool llvm::writeDebugObjectBitcode(const Module &M,

@@ -163,8 +163,16 @@ extern "C" int ohm_bc_match_relocatable_v1(
     }
   }
   SmallVector<char, 0> Bytes;
-  if (!writeDebugObjectBitcode(*unwrap(Ref), Bytes, &*Map) ||
-      StringRef(Origin, OriginLength) != StringRef(Bytes.data(), Bytes.size()))
+  const Module &M = *unwrap(Ref);
+  // A runtime location can move in one file while an imported file changes
+  // its checksum alone. The caller already checked the native DWARF4 rewrite.
+  if (Runtime && M.getDwarfVersion() == 4 && !M.getCodeViewFlag())
+    Map->Dwarf4Origin = StringRef(Origin, OriginLength);
+  if (!writeDebugObjectBitcode(M, Bytes, &*Map))
+    return 0;
+  StringRef Written(Bytes.data(), Bytes.size());
+  if (StringRef(Origin, OriginLength) != Written &&
+      !Map->matchesWithDwarf4Checksums(M, Written))
     return 0;
   return Runtime ? 2 : 1;
 }
