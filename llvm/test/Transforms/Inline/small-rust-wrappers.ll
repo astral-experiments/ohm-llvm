@@ -1,5 +1,6 @@
 ; RUN: opt -passes=inline-small-rust-functions -verify-each -S %s | FileCheck %s
 ; RUN: opt -passes='default<O1>' -inline-threshold=0 -S %s | FileCheck %s --check-prefix=BUDGET
+; RUN: opt -passes='default<O1>' -S %s | FileCheck %s --check-prefix=INSTRUMENT
 
 target triple = "x86_64-unknown-linux-gnu"
 
@@ -57,6 +58,20 @@ define internal void @_Rwrapper() {
 ; CHECK: call void @single_site()
   call void @single_site()
   ret void
+}
+
+define i32 @_Rmeasured() {
+; INSTRUMENT-LABEL: define {{.*}}@_Rmeasured(
+; INSTRUMENT: call void @__cyg_profile_func_enter(
+; INSTRUMENT: call void @__cyg_profile_func_exit(
+; INSTRUMENT: ret i32 8
+  %v = call i32 @seven()
+  %r = add i32 %v, 1
+  ret i32 %r
+}
+
+define i32 @seven() alwaysinline "instrument-function-entry"="__cyg_profile_func_enter" "instrument-function-exit"="__cyg_profile_func_exit" {
+  ret i32 7
 }
 
 declare void @single_site() noduplicate
