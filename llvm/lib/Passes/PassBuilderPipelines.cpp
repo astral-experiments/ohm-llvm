@@ -1518,8 +1518,10 @@ PassBuilder::buildModuleSimplificationPipeline(OptimizationLevel Level,
 
   if (deferLocalSimplification(Level, Phase) && TM &&
       TM->getTargetTriple().getArch() == Triple::x86_64 &&
-      TM->getTargetTriple().isOSLinux())
+      TM->getTargetTriple().isOSLinux()) {
+    MPM.addPass(LowerStringMatchPass());
     MPM.addPass(LowerSwitchCallsPass());
+  }
 
   if (EnableModuleInliner)
     MPM.addPass(buildModuleInlinerPipeline(Level, Phase));
