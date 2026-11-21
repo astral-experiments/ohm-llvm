@@ -17,6 +17,7 @@
 #include "MergeRepeatedCalls.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/Analysis/AliasAnalysis.h"
+#include "llvm/Analysis/AssumptionCache.h"
 #include "llvm/Analysis/BasicAliasAnalysis.h"
 #include "llvm/Analysis/CGSCCPassManager.h"
 #include "llvm/Analysis/CtxProfAnalysis.h"
@@ -1106,6 +1107,11 @@ public:
           (F.hasOneUse() || F.size() == 1 ||
            AM.getResult<LoopAnalysis>(F).empty())) {
         S->Pending.insert({&F, true});
+        // Fold facts such as assume(!overflow) into the arithmetic while
+        // they still dominate the return. After inlining a range step the
+        // conditional increment can hide the caller's induction variable.
+        if (!AM.getResult<AssumptionAnalysis>(F).assumptions().empty())
+          return InstCombinePass().run(F, AM);
         return PreservedAnalyses::all();
       }
       // A revisit can remove eligibility before the late sweep.
