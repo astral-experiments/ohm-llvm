@@ -22,9 +22,9 @@ class CodeGenTargetMachineImpl;
 class raw_svector_ostream;
 namespace ohm {
 #if defined(__linux__) && defined(__x86_64__)
-/// Stabilize the impl disambiguator on private Rust comparisons before
-/// computing the keys for ordinary incremental line-table objects.
-void prepareLocalTraitComparisons(Module &M);
+/// Stabilize disambiguators on small local Rust impl methods before computing
+/// the keys for ordinary incremental line-table objects.
+void prepareLocalImplMethods(Module &M);
 
 struct DebugObjectImage {
   std::string Path;
