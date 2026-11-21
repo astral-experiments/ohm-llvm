@@ -12,6 +12,7 @@
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringExtras.h"
+#include "llvm/BinaryFormat/Dwarf.h"
 #include "llvm/Bitcode/BitcodeWriter.h"
 #include "llvm/Bitcode/OhmDebugObjectSignature.h"
 #include "llvm/CodeGen/CodeGenTargetMachineImpl.h"
@@ -24,6 +25,7 @@
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/OhmOptimizerState.h"
+#include "llvm/IR/RustSymbolChecks.h"
 #include "llvm/Support/BLAKE3.h"
 #include "llvm/Support/CachePruning.h"
 #include "llvm/Support/Endian.h"
@@ -238,6 +240,7 @@ bool contains(ArrayRef<StringRef> Choices, StringRef Value) {
 struct Invocation {
   std::string Root, Entries, Blobs, Cwd, Remap, Namespace;
   bool WithoutDebug = false;
+  bool PrepareComparisons = false;
   std::optional<ohm::DebugObjectImageGeneration> Generation;
   bool imagesUnchanged() const {
     return Generation && Generation == ohm::getDebugObjectImageGeneration();
@@ -257,6 +260,7 @@ struct Invocation {
     StringRef Incremental, Opt, LTO, Embed, Debug, Crate, Outputs, Source;
     bool Ohm = false;
     bool Strip = false;
+    bool ForceWarn = false;
     for (size_t I = 1; I < Args.size(); ++I) {
       StringRef A = Args[I], Key, V;
       // Cargo requests this frontend lint when compiling workspace crates.
@@ -265,11 +269,14 @@ struct Invocation {
         continue;
       if (A.starts_with("--")) {
         std::tie(Key, V) = A.split('=');
-        if (!contains({"--crate-name", "--crate-type", "--edition", "--emit",
-                       "--error-format", "--json", "--out-dir", "--extern",
-                       "--check-cfg", "--cfg", "--allow", "--warn", "--deny",
-                       "--forbid", "--cap-lints", "--remap-path-scope"},
-                      Key))
+        if (Key == "--force-warn")
+          ForceWarn = true;
+        else if (!contains({"--crate-name", "--crate-type", "--edition",
+                            "--emit", "--error-format", "--json", "--out-dir",
+                            "--extern", "--check-cfg", "--cfg", "--allow",
+                            "--warn", "--deny", "--forbid", "--cap-lints",
+                            "--remap-path-scope"},
+                           Key))
           return;
         if (!A.contains('=')) {
           if (++I == Args.size())
@@ -345,6 +352,11 @@ struct Invocation {
         Embed != "no" ||
         (!WithoutDebug && (Debug != "line-tables-only" || Strip)) ||
         Remap.empty())
+      return;
+    // Preparing the IR is independent of whether we can cache the resulting
+    // object. Lint selection is immaterial until we might skip diagnostics.
+    PrepareComparisons = !WithoutDebug;
+    if (ForceWarn)
       return;
     // An ELF extension can change target passes without changing rustc, its
     // driver, libLLVM, or the input IR. getenv() loses constructors' unsets.
@@ -879,6 +891,94 @@ bool llvm::ohm::runDebugObjectCache(Module &M, CodeGenTargetMachineImpl &TM,
 #endif
 }
 
+#if defined(__linux__) && defined(__x86_64__)
+// The disambiguator in a Rust v0 impl path counts earlier impls in the
+// module. Removing an unrelated impl can rename a tiny comparison in every
+// CGU that uses it. The trait and Self paths already identify the operation.
+// Give local copies a consistent disambiguator before computing the cache
+// keys. Edit one base-62 digit in place to preserve v0 backreference offsets.
+static std::optional<std::string> localTraitComparisonName(Function &F) {
+  StringRef Name = F.getName();
+  if (!Name.starts_with("_RNvXs") || Name.size() < 9 || Name[7] != '_' ||
+      !F.hasInternalLinkage() || F.hasSection() || F.size() != 1 ||
+      F.front().size() > 8 || !F.getReturnType()->isIntegerTy(1) ||
+      F.hasOptNone() || F.hasFnAttribute(Attribute::NoInline) ||
+      F.hasAddressTaken())
+    return std::nullopt;
+
+  constexpr StringLiteral Digits =
+      "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+  size_t Digit = Digits.find(Name[6]);
+  if (Digit == StringRef::npos)
+    return std::nullopt;
+  auto *SP = F.getSubprogram();
+  if (!SP || !SP->isDistinct() || SP->getLinkageName() != Name ||
+      !SP->getUnit() || SP->getUnit()->getSourceLanguage().hasVersionedName() ||
+      SP->getUnit()->getSourceLanguage().getUnversionedName() !=
+          dwarf::DW_LANG_Rust ||
+      SP->getUnit()->getEmissionKind() != DICompileUnit::LineTablesOnly ||
+      SP->getUnit()->getDebugInfoForProfiling())
+    return std::nullopt;
+  auto *Scope = dyn_cast_or_null<DINamespace>(SP->getScope());
+  // s_ encodes 1 and s0_ encodes 2. Require rustc's corresponding
+  // anonymous impl namespace before rewriting either spelling.
+  if (!Scope || Scope->getName() != ("{impl#" + Twine(Digit + 2) + "}").str())
+    return std::nullopt;
+
+  auto *Ret = dyn_cast<ReturnInst>(F.front().getTerminator());
+  auto *Cmp = Ret ? dyn_cast<ICmpInst>(Ret->getReturnValue()) : nullptr;
+  if (!Cmp || !Cmp->isEquality() ||
+      !all_of(F.front(), [](const Instruction &I) {
+        if (auto *Load = dyn_cast<LoadInst>(&I))
+          return Load->isSimple();
+        return isa<CastInst, ICmpInst, ReturnInst>(I);
+      }))
+    return std::nullopt;
+
+  std::string Result = Name.str();
+  Result[6] = '0';
+  return Result;
+}
+
+void llvm::ohm::prepareLocalTraitComparisons(Module &M) {
+  if (M.getModuleFlag("ProfileSummary"))
+    return;
+  struct Method {
+    std::string Name;
+    Function *F;
+  };
+  SmallVector<Method, 4> Methods;
+  for (Function &F : M)
+    if (auto Name = localTraitComparisonName(F))
+      Methods.push_back({std::move(*Name), &F});
+  if (Methods.empty() || !canIntroduceRustSymbols(M))
+    return;
+
+  llvm::sort(Methods,
+             [](const Method &A, const Method &B) { return A.Name < B.Name; });
+  for (auto [I, Entry] : enumerate(Methods)) {
+    const auto &[Name, F] = Entry;
+    if ((I && Methods[I - 1].Name == Name) ||
+        (I + 1 < Methods.size() && Methods[I + 1].Name == Name))
+      continue;
+    if (auto *Existing = M.getNamedValue(Name); Existing && Existing != F)
+      continue;
+
+    F->setName(Name);
+    auto *SP = F->getSubprogram();
+    SP->replaceLinkageName(MDString::get(M.getContext(), Name));
+    auto *NS = cast<DINamespace>(SP->getScope());
+    SP->replaceOperandWith(
+        /*Scope=*/1, DINamespace::get(M.getContext(), NS->getScope(),
+                                      "{impl#2}", NS->getExportSymbols()));
+    // Rust places methods by mangled name. Put the selected functions in
+    // canonical order so ordered bitcode agrees across an impl renumbering.
+    M.getFunctionList().splice(M.end(), M.getFunctionList(), F->getIterator());
+  }
+}
+
+#endif
+
 extern "C" int ohm_early_object_begin_v1(LLVMModuleRef Ref,
                                          LLVMTargetMachineRef TM,
                                          const char *Output, size_t Length,
@@ -895,6 +995,10 @@ extern "C" int ohm_early_object_begin_v1(LLVMModuleRef Ref,
       std::getenv("OHM_DISABLE_EARLY_OBJECT_CACHE"))
     return 0;
   bool WithoutDebug = !M.getNamedMetadata("llvm.dbg.cu");
+  // Rust probes this cache before the line-table cache on regular
+  // incremental units. Prepare the module before taking either key.
+  if (!WithoutDebug && invocation().PrepareComparisons)
+    ohm::prepareLocalTraitComparisons(M);
   if (WithoutDebug ? !ohm::isLargeDebugObjectInput(M, true)
                    : !ohm_leaf::candidate(M))
     return 0;
