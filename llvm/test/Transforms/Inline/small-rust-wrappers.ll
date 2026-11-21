@@ -39,6 +39,25 @@ define internal void @_Rrequired() alwaysinline {
   ret void
 }
 
+; Both calls must continue to share the single noduplicate site.
+define void @_Rtwice() {
+; CHECK-LABEL: define void @_Rtwice(
+; CHECK: call void @_Rwrapper()
+; CHECK: call void @_Rwrapper()
+  call void @_Rwrapper()
+  call void @_Rwrapper()
+  ret void
+}
+
+define internal void @_Rwrapper() {
+; CHECK-LABEL: define internal void @_Rwrapper(
+; CHECK: call void @single_site()
+  call void @single_site()
+  ret void
+}
+
+declare void @single_site() noduplicate
+
 declare void @opaque()
 declare void @required_leaf()
 
