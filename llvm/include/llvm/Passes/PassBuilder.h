@@ -15,6 +15,8 @@
 #ifndef LLVM_PASSES_PASSBUILDER_H
 #define LLVM_PASSES_PASSBUILDER_H
 
+#define LLVM_OHM_RUST_FUNCTION_MERGING_OPTION 1
+
 #include "llvm/Analysis/CGSCCPassManager.h"
 #include "llvm/CodeGen/MachinePassManager.h"
 #include "llvm/CodeGen/RegAllocCommon.h"
@@ -87,6 +89,9 @@ public:
   /// Tuning option to enable/disable function merging. Its default value is
   /// false.
   bool MergeFunctions;
+
+  /// Enable the Rust-specific function merging passes in the O1 pipeline.
+  bool MergeRustFunctions;
 
   /// Tuning option to override the default inliner threshold.
   int InlinerThreshold;
