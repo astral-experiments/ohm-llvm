@@ -1383,6 +1383,7 @@ PassBuilder::buildModuleSimplificationPipeline(OptimizationLevel Level,
     // Expose small wrappers after inserting their instrumentation and before
     // simplification.
     if (deferLocalSimplification(Level, Phase) && supportsCallSharing(TM) &&
+        PipelineEarlySimplificationEPCallbacks.empty() &&
         PTO.InlinerThreshold == -1 && !hasInlineThresholdOverride()) {
       MPM.addPass(createModuleToFunctionPassAdaptor(std::move(Instrument)));
       MPM.addPass(InlineSmallRustFunctionsPass());
