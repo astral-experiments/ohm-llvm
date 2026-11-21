@@ -56,3 +56,45 @@ define i32 @caller(i32 %x) {
   %s = call i32 @erased(i32 %r)
   ret i32 %s
 }
+
+declare { i32, i1 } @llvm.sadd.with.overflow.i32(i32, i32)
+declare void @llvm.assume(i1)
+
+; The range iterator establishes that advancing its index cannot overflow.
+; Fold that fact before inlining so the caller can count the iterations.
+; IR-LABEL: define {{.*}}i8 @xor_range(
+; IR: ret i8 0
+define i8 @xor_range(i8 %x) {
+entry:
+  %p = alloca i32
+  store i32 0, ptr %p
+  br label %loop
+loop:
+  %sum = phi i8 [0, %entry], [%add, %body]
+  %m = call i32 @range_next(ptr %p)
+  %more = icmp eq i32 %m, 1
+  br i1 %more, label %body, label %exit
+body:
+  %add = xor i8 %sum, %x
+  br label %loop
+exit:
+  ret i8 %sum
+}
+
+define internal i32 @range_next(ptr %p) {
+entry:
+  %i = load i32, ptr %p
+  %more = icmp slt i32 %i, 64
+  br i1 %more, label %step, label %exit
+step:
+  %res = call { i32, i1 } @llvm.sadd.with.overflow.i32(i32 %i, i32 1)
+  %overflow = extractvalue { i32, i1 } %res, 1
+  %ok = xor i1 %overflow, true
+  call void @llvm.assume(i1 %ok)
+  %v = extractvalue { i32, i1 } %res, 0
+  store i32 %v, ptr %p
+  br label %exit
+exit:
+  %z = phi i32 [1, %step], [0, %entry]
+  ret i32 %z
+}
