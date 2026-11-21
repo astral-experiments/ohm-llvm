@@ -84,6 +84,66 @@ static bool signature(StringRef IR, Bytes &Input) {
   return M && ohm::writeTraitImportSignature(*M, Input, Names);
 }
 
+constexpr StringLiteral Barrier =
+    R"(asm sideeffect inteldialect "/* ${0:q} */", "r,~{dirflag},~{fpsr},~{flags}")";
+
+static std::string withBarrier(StringRef Asm, unsigned Cookie,
+                               unsigned Operand = 1) {
+  std::string IR = withLines(Name, 10, 'a');
+  IR.insert(IR.find("  %v"),
+            ("  call void " + Asm + "(i64 " + Twine(Operand) +
+             "), !srcloc !{i64 " + Twine(Cookie) + "}, !dbg !7\n")
+                .str());
+  return IR;
+}
+
+TEST(OhmTraitImports, RegisterBarrierProjectsOnlyDiagnosticLocation) {
+  Bytes Before, After, Changed;
+  ASSERT_TRUE(signature(withBarrier(Barrier, 100), Before));
+  ASSERT_TRUE(signature(withBarrier(Barrier, 200), After));
+  EXPECT_EQ(Before, After);
+
+  ASSERT_TRUE(signature(withBarrier(Barrier, 200, 2), Changed));
+  EXPECT_NE(Before, Changed);
+
+  auto WithOtherLocation = [](unsigned Cookie) {
+    std::string IR = withBarrier(Barrier, Cookie);
+    IR.insert(IR.find(", !dbg !8"), ", !srcloc !{i64 " +
+                                         std::to_string(Cookie) + "}");
+    return IR;
+  };
+  Before.clear();
+  After.clear();
+  ASSERT_TRUE(signature(WithOtherLocation(100), Before));
+  ASSERT_TRUE(signature(WithOtherLocation(200), After));
+  EXPECT_NE(Before, After);
+
+  auto WithTwoLocations = [](unsigned Cookie) {
+    std::string IR = withBarrier(Barrier, Cookie);
+    IR.insert(IR.find("!{i64 ") + 2, "i64 50, ");
+    return IR;
+  };
+  Before.clear();
+  After.clear();
+  ASSERT_TRUE(signature(WithTwoLocations(100), Before));
+  ASSERT_TRUE(signature(WithTwoLocations(200), After));
+  EXPECT_NE(Before, After);
+}
+
+TEST(OhmTraitImports, RefusesOtherAssemblyAlongsideRegisterBarrier) {
+  for (StringRef Other : {
+           R"(asm sideeffect inteldialect "/* ${0:q} */", "i,~{dirflag},~{fpsr},~{flags}")",
+           R"(asm sideeffect inteldialect "/* ${0:q} */\0A.include \22file.s\22", "r,~{dirflag},~{fpsr},~{flags}")",
+           R"(asm sideeffect inteldialect "/* ${0:c} */", "r,~{dirflag},~{fpsr},~{flags}")",
+           R"(asm sideeffect "/* ${0:q} */", "r,~{dirflag},~{fpsr},~{flags}")",
+       }) {
+    std::string IR = withBarrier(Barrier, 100);
+    IR.insert(IR.find("  %v"), ("  call void " + Other + "(i64 1)\n").str());
+    Bytes Key;
+    EXPECT_FALSE(signature(IR, Key)) << Other.str();
+  }
+}
+
 TEST(OhmTraitImports, EmptyImportRosterHasCompleteProof) {
   auto Capture = [](StringRef IR, Bytes &Key, Bytes &Manifest) {
     LLVMContext C;

@@ -36,6 +36,12 @@ LLVM_ABI bool writeProjectedDwarfLineCertificate(
     const Module &M, raw_ostream &Out,
     function_ref<StringRef(const Function &)> GetName);
 
+/// Optionally omit inline assembly diagnostic locations from the certificate.
+/// The caller must check that the assembly has no external inputs.
+LLVM_ABI bool writeProjectedDwarfLineCertificate(
+    const Module &M, raw_ostream &Out,
+    function_ref<StringRef(const Function &)> GetName, bool OmitAsmLocations);
+
 class BitcodeWriter {
   friend bool writeDebugObjectBitcode(const Module &, SmallVectorImpl<char> &,
                                       DebugObjectSourceMap *, bool);
@@ -45,7 +51,7 @@ class BitcodeWriter {
 
   friend bool writeProjectedDwarfLineCertificate(
       const Module &M, raw_ostream &Out,
-      function_ref<StringRef(const Function &)> GetName);
+      function_ref<StringRef(const Function &)> GetName, bool OmitAsmLocations);
   friend bool writeClosedDwarfLineCertificateV1(const Module &, raw_ostream &);
 
   std::unique_ptr<BitstreamWriter> Stream;
