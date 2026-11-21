@@ -218,6 +218,30 @@ static bool rebind(ArrayRef<char> Input, StringLiteral Old,
                                  bytes(NewManifest), Out);
 }
 
+TEST(OhmTraitImports, RebasesLinesWithEmptyImportRoster) {
+  auto Capture = [](StringRef IR, Bytes &Manifest) {
+    LLVMContext C;
+    auto M = read(C, IR);
+    Bytes Key;
+    return M && ohm::writeTraitImportSignature(
+                    *M, Key, Manifest, [](StringRef) { return true; });
+  };
+  auto Old = withLines("ordinary", 80, 'a');
+  auto New = withLines("ordinary", 82, 'b');
+  Bytes Before, Fresh, Rebound, Manifest, NewManifest;
+  ASSERT_TRUE(emit(Old, Before));
+  ASSERT_TRUE(emit(New, Fresh));
+  ASSERT_TRUE(Capture(Old, Manifest));
+  ASSERT_TRUE(Capture(New, NewManifest));
+  ASSERT_TRUE(ohm::rebindTraitImports(bytes(Before), bytes(Manifest),
+                                      bytes(NewManifest), Rebound));
+  EXPECT_EQ(Fresh, Rebound);
+  Bytes SameChecksum;
+  ASSERT_TRUE(Capture(withLines("ordinary", 82, 'a'), SameChecksum));
+  EXPECT_FALSE(ohm::rebindTraitImports(bytes(Before), bytes(Manifest),
+                                       bytes(SameChecksum), Rebound));
+}
+
 TEST(OhmTraitImports, RebindsAfterInterveningLineEdits) {
   Bytes Before, Fresh, Rebound, Key, NewKey, Manifest, NewManifest;
   auto Old = withLines(Name, 80, 'a');
