@@ -19,6 +19,8 @@ namespace ohm {
 /// Compute a closed line certificate with a provider-independent path for
 /// each direct trait import. Key selects candidate donors. Manifest retains
 /// their complete proof and original import names for checked rebinding.
+/// By default a signature requires at least one such import. A caller
+/// interested in exact replay can also request a proof for an empty roster.
 bool writeTraitImportSignature(const Module &M, SmallVectorImpl<char> &Key,
                                SmallVectorImpl<char> &Manifest,
                                function_ref<bool(StringRef)> ShouldProbe = {});
