@@ -5,6 +5,7 @@
 #include "llvm/Bitcode/OhmDebugObjectSignature.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/AsmParser/Parser.h"
+#include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/Bitcode/BitcodeReader.h"
 #include "llvm/Bitcode/BitcodeWriter.h"
 #include "llvm/IR/IRBuilder.h"
@@ -604,6 +605,77 @@ TEST_F(DebugObjectSignatureTest, ChecksRuntimeLocationAgainstOriginalObject) {
   EXPECT_NE(Records.find("\"old_line\":3"), std::string::npos);
   EXPECT_NE(Records.find("\"new_line\":4"), std::string::npos);
   EXPECT_EQ(relocatable(*B, decline, nullptr), 0);
+}
+
+namespace {
+constexpr StringLiteral OldImport = "cccccccccccccccccccccccccccccccc";
+constexpr StringLiteral NewImport = "dddddddddddddddddddddddddddddddd";
+
+void importedFile(Module &M, StringRef Checksum, unsigned Version = 4) {
+  M.addModuleFlag(Module::Warning, "Dwarf Version", Version);
+  auto *File = DIFile::get(
+      M.getContext(), "import.rs", "/dep",
+      DIFile::ChecksumInfo<StringRef>(DIFile::CSK_MD5, Checksum));
+  M.getOrInsertNamedMetadata("import")->addOperand(File);
+}
+} // namespace
+
+TEST_F(DebugObjectSignatureTest, PatchesLocationAlongsideDwarf4ChecksumEdit) {
+  LLVMContext C1, C2;
+  auto A = module(C1, OldSum, 3, "payload");
+  auto B = module(C2, NewSum, 4, "payload");
+  ASSERT_TRUE(A && B);
+  importedFile(*A, OldImport);
+  importedFile(*B, NewImport);
+  location(*A, 3);
+  location(*B, 4);
+  train(*A);
+  std::string Records;
+  EXPECT_EQ(relocatable(*B, accept, &Records), 2);
+  EXPECT_EQ(relocatable(*B, decline, nullptr), 0);
+  EXPECT_FALSE(matches(*B));
+}
+
+TEST_F(DebugObjectSignatureTest, PreservesDwarf5ChecksumsOnLocationEdit) {
+  LLVMContext C1, C2;
+  auto A = module(C1, OldSum, 3, "payload");
+  auto B = module(C2, NewSum, 4, "payload");
+  ASSERT_TRUE(A && B);
+  importedFile(*A, OldImport, 5);
+  importedFile(*B, NewImport, 5);
+  location(*A, 3);
+  location(*B, 4);
+  train(*A);
+  std::string Records;
+  EXPECT_EQ(relocatable(*B, accept, &Records), 0);
+}
+
+TEST_F(DebugObjectSignatureTest, PreservesChecksumWithOrdinaryMetadataUse) {
+  LLVMContext C1, C2;
+  auto A = module(C1, OldSum, 3, OldImport);
+  auto B = module(C2, NewSum, 4, NewImport);
+  ASSERT_TRUE(A && B);
+  importedFile(*A, OldImport);
+  importedFile(*B, NewImport);
+  location(*A, 3);
+  location(*B, 4);
+  train(*A);
+  std::string Records;
+  EXPECT_EQ(relocatable(*B, accept, &Records), 0);
+}
+
+TEST_F(DebugObjectSignatureTest, ChecksRemainingBitsAfterChecksumProjection) {
+  LLVMContext C1, C2;
+  auto A = module(C1, OldSum, 3, "payload");
+  auto B = module(C2, NewSum, 4, "changed");
+  ASSERT_TRUE(A && B);
+  importedFile(*A, OldImport);
+  importedFile(*B, NewImport);
+  location(*A, 3);
+  location(*B, 4);
+  train(*A);
+  std::string Records;
+  EXPECT_EQ(relocatable(*B, accept, &Records), 0);
 }
 
 TEST_F(DebugObjectSignatureTest, ForwardsTheOpaqueLocationThroughALocalCall) {
