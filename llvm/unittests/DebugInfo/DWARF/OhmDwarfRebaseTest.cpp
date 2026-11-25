@@ -58,11 +58,14 @@ std::unique_ptr<object::ObjectFile> fixture(SmallString<0> &Storage,
                                             unsigned RuntimeLine = 0) {
   // A compile unit, a declaration, an inline call and a concrete instance
   // which may override only the file of an abstract declaration.
+  const uint8_t Form = Call <= UINT8_MAX    ? dwarf::DW_FORM_data1
+                       : Call <= UINT16_MAX ? dwarf::DW_FORM_data2
+                                            : dwarf::DW_FORM_data4;
   std::string Abbrev;
   bytes(Abbrev,
         {1,    0x11, 1,    0x10, 0x17, 0x1b, 8,    0,    0,    2,    0x2e, 0,
          0x3a, 0x0b, 0x3b, 0x0b, 0,    0,    3,    0x1d, 0,    0x58, 0x0b, 0x59,
-         0x0b, 0,    0,    4,    0x2e, 0,    0x31, 0x13, 0x3a, 0x0b, 0,    0,
+         Form, 0,    0,    4,    0x2e, 0,    0x31, 0x13, 0x3a, 0x0b, 0,    0,
          5,    0x11, 0,    0x10, 0x17, 0x1b, 8,    0x3a, 0x0b, 0x3b, 0x0b, 0,
          0,    6,    0x11, 0,    0x10, 0x17, 0x1b, 8,    0,    0,    0});
   auto Root = [](unsigned Code) {
@@ -85,8 +88,14 @@ std::unique_ptr<object::ObjectFile> fixture(SmallString<0> &Storage,
   } else {
     std::string B = Root(1);
     uint32_t AbstractOffset = 4 + B.size();
-    bytes(B,
-          {2, 1, static_cast<uint8_t>(Decl), 3, 1, static_cast<uint8_t>(Call)});
+    bytes(B, {2, 1, static_cast<uint8_t>(Decl), 3, 1});
+    if (Form == dwarf::DW_FORM_data4) {
+      word(B, Call);
+    } else {
+      B.push_back(static_cast<char>(Call));
+      if (Form == dwarf::DW_FORM_data2)
+        B.push_back(static_cast<char>(Call >> 8));
+    }
     if (Kind == InheritedLine) {
       bytes(B, {4});
       word(B, AbstractOffset);
@@ -288,6 +297,28 @@ TEST(OhmDwarfRebase, RejectsUnrepresentableDIEAndInheritedFile) {
   ASSERT_FALSE(static_cast<bool>(Split));
   EXPECT_NE(toString(Split.takeError()).find("paired line"), std::string::npos);
 }
+TEST(OhmDwarfRebase, RejectsNarrowerInlineCallLines) {
+  for (unsigned Boundary : {256u, 65536u}) {
+    SmallString<0> Old, Native;
+    ASSERT_TRUE(fixture(Old, 20, Boundary + 1, 20));
+    ASSERT_TRUE(fixture(Native, 20, Boundary, 20));
+    auto SameWidth = ohm::rebaseDwarf4(
+        {Old, "cached"},
+        {{"/fixture/src/same.rs", {{Boundary + 1, Boundary}}}});
+    ASSERT_TRUE(static_cast<bool>(SameWidth))
+        << toString(SameWidth.takeError());
+    EXPECT_EQ(StringRef(SameWidth->Bytes.data(), SameWidth->Bytes.size()),
+              Native.str());
+
+    auto Narrower = ohm::rebaseDwarf4(
+        {Native, "cached"},
+        {{"/fixture/src/same.rs", {{Boundary, Boundary - 1}}}});
+    ASSERT_FALSE(static_cast<bool>(Narrower));
+    EXPECT_NE(toString(Narrower.takeError()).find("encoded width"),
+              std::string::npos);
+  }
+}
+
 TEST(OhmDwarfRebase, TruncatedDIECannotRewriteFollowingUnitLength) {
   SmallString<0> Old;
   ASSERT_TRUE(fixture(Old, 0, 0, 20, TruncatedCU));
