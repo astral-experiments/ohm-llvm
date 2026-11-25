@@ -7,9 +7,10 @@
 //===----------------------------------------------------------------------===//
 //
 // Adding an enum variant can renumber functions that return discriminants.
-// After the IR transforms, project only ranges whose precise upper bound
-// is irrelevant to the remaining machine operations. Compare every other
-// operand, attribute, metadata and live use order in the machine input.
+// Before optimization, select isolated literals, opaque transfers and
+// bounded bitset projections. After optimization, recognize additional
+// machine projections. Apply the selected ranges to the live module and
+// compare the complete input at the corresponding pipeline stage.
 // Require each changed return to occupy its own mov/ret section, with no
 // aliases or incoming code/data relocations.
 //
@@ -19,12 +20,14 @@
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringMap.h"
+#include "llvm/Bitcode/BitcodeWriter.h"
 #include "llvm/Bitcode/OhmDebugObjectSignature.h"
 #include "llvm/IR/ConstantRange.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/MDBuilder.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/OhmOptimizerState.h"
 #include "llvm/Object/ELF.h"
 #include "llvm/Support/BLAKE3.h"
 #include "llvm/Support/Endian.h"
@@ -245,6 +248,111 @@ bool hasTagRange(const MDNode *MD, uint16_t Upper) {
          High->getZExtValue() == Upper;
 }
 
+// Before inlining, a bitset lookup can pass the tag through local calls.
+// Follow only unique, direct transfers. No alias, second caller, operand
+// bundle or other use of the argument may observe the precise range.
+bool canProjectEarlyLoad(Instruction &I, Attribute Tag, unsigned Upper,
+                         unsigned Rounded,
+                         SmallVectorImpl<Argument *> &Checked) {
+  auto *L = dyn_cast<LoadInst>(&I);
+  if (!L || !L->isSimple() || !L->getType()->isIntegerTy(16) ||
+      !L->getMetadata(LLVMContext::MD_noundef) ||
+      !canProjectLoadsIn(*L->getFunction(), Upper, Rounded))
+    return false;
+
+  Value *V = L;
+  for (unsigned Hop = 0; Hop < 2 && V->hasOneUse(); ++Hop) {
+    const Use &U = *V->use_begin();
+    auto *Call = dyn_cast<CallBase>(U.getUser());
+    if (V->isUsedByMetadata() || !isa_and_nonnull<CallInst, InvokeInst>(Call) ||
+        !Call->isArgOperand(&U) || Call->hasOperandBundles() ||
+        Call->getReturnedArgOperand() ||
+        Call->getCallingConv() != CallingConv::C)
+      return false;
+    auto *F = Call->getCalledFunction();
+    if (!F || !F->hasLocalLinkage() || F->isDeclaration() || F->isVarArg() ||
+        !F->hasOneUse() || F->isUsedByMetadata() ||
+        F->getCallingConv() != CallingConv::C)
+      return false;
+    unsigned N = Call->getArgOperandNo(&U);
+    auto Param = F->getAttributes().getParamAttrs(N);
+    auto Arg = Call->getAttributes().getParamAttrs(N);
+    if (!hasOnlyTagAttributes(Param) || !hasOnlyTagAttributes(Arg) ||
+        Param.getAttribute(Attribute::Range) != Tag ||
+        Arg.hasAttribute(Attribute::Range))
+      return false;
+    Checked.push_back(F->getArg(N));
+    V = F->getArg(N);
+  }
+
+  // The terminal uses partition the tag into a word index and a bit
+  // position. Retain the full remainder interval and the largest possible
+  // quotient. The actual optimizer sees the widened bound on cache misses
+  // as well: marginal intervals alone do not prove optimizer equivalence.
+  if (V->isUsedByMetadata() || !V->hasNUses(2))
+    return false;
+  uint64_t Divisor = 0, Modulus = 0;
+  for (User *U : V->users()) {
+    if (auto *Ext = dyn_cast<ZExtInst>(U)) {
+      if (!Ext->getType()->isIntegerTy(64) || !Ext->hasOneUse() ||
+          Ext->isUsedByMetadata())
+        return false;
+      auto *Op = dyn_cast<BinaryOperator>(*Ext->user_begin());
+      if (!Op || Op->getOpcode() != Instruction::UDiv || Op->isExact() ||
+          Op->getOperand(0) != Ext)
+        return false;
+      auto *K = dyn_cast<ConstantInt>(Op->getOperand(1));
+      if (!K)
+        return false;
+      Divisor = K->getZExtValue();
+    } else {
+      auto *Op = dyn_cast<BinaryOperator>(U);
+      if (!Op || Op->getOpcode() != Instruction::URem || Op->getOperand(0) != V)
+        return false;
+      auto *K = dyn_cast<ConstantInt>(Op->getOperand(1));
+      if (!K)
+        return false;
+      Modulus = K->getZExtValue();
+    }
+  }
+  return Divisor == Modulus && isPowerOf2_64(Divisor) && Divisor <= Upper &&
+         (Upper - 1) / Divisor == (Rounded - 1) / Divisor;
+}
+
+// Replacing a load range leaves its uniqued tuple in the context. The
+// closed-input check must see that tuple and its metadata users. Root the
+// entire group in a fixed order, including on an aligned bound. Keep this
+// private metadata on success so later line and trait proofs also see the
+// complete context. Never overwrite an existing named node.
+bool hashEarlyModule(Module &M, unsigned Rounded, bool HasLoads, Digest &Out) {
+  constexpr StringLiteral Name = "ohm.leaf.ranges";
+  if (M.getNamedMetadata(Name))
+    return false;
+  NamedMDNode *Ranges = nullptr;
+  if (HasLoads) {
+    Ranges = M.getOrInsertNamedMetadata(Name);
+    MDBuilder B(M.getContext());
+    for (unsigned N = Rounded - 15; N <= Rounded; ++N)
+      Ranges->addOperand(B.createRange(APInt(16, 0), APInt(16, N)));
+  }
+  auto Erase = scope_exit([&] {
+    if (Ranges)
+      M.eraseNamedMetadata(Ranges);
+  });
+  SmallVector<char, 128> State;
+  SmallVector<char, 0> Input;
+  if (!ohm::getOptimizerContextState(M, State) ||
+      !writeClosedOptimizerInput(M, Input))
+    return false;
+  BLAKE3 Hash;
+  Hash.update(digest(M.getModuleIdentifier()));
+  Hash.update(digest(StringRef(State.data(), State.size())));
+  Hash.update(StringRef(Input.data(), Input.size()));
+  Out = Hash.final();
+  Erase.release();
+  return true;
+}
+
 struct ProjectedFunction {
   Function *F;
   AttributeList Original;
@@ -446,8 +554,9 @@ bool ohm_leaf::candidate(const Module &M) {
          none_of(M, needsStackProtection);
 }
 
-std::string ohm_leaf::prepare(Module &M, StringRef Configuration) {
-  if (Configuration.empty() || !candidate(M))
+static std::string prepareLeaf(Module &M, StringRef Configuration, bool Early) {
+  if (Configuration.empty() || !ohm_leaf::candidate(M) ||
+      (Early && (M.size() > 4096 || M.getInstructionCount() > 100000)))
     return {};
   Attribute Tag;
   SmallVector<Leaf> Leaves;
@@ -458,8 +567,13 @@ std::string ohm_leaf::prepare(Module &M, StringRef Configuration) {
     if (Tag.isValid() && Tag != Range)
       return {};
     Tag = Range;
-    if (auto Slot = isolatedLeaf(F, Tag.getValueAsConstantRange()))
+    if (auto Slot = isolatedLeaf(F, Tag.getValueAsConstantRange())) {
+      // Masking the last IR reference must not hide a context observer
+      // of the original integer from the optimizer input check.
+      if (Early && Slot->Value->isUsedByMetadata())
+        return {};
       Leaves.push_back(*Slot);
+    }
   }
 
   const auto &Range = Tag.getValueAsConstantRange();
@@ -471,7 +585,11 @@ std::string ohm_leaf::prepare(Module &M, StringRef Configuration) {
   auto &C = M.getContext();
   SmallVector<ProjectedFunction> Functions;
   SmallVector<std::pair<Instruction *, MDNode *>> Loads;
-  if (Rounded != Range.getUpper()) {
+  if (Early && (Rounded.isNegative() ||
+                Log2_32(Upper - 1) != Log2_32(Rounded.getZExtValue() - 1)))
+    return {};
+  if (Early || Rounded != Range.getUpper()) {
+    SmallVector<Argument *, 8> Pending, Checked;
     auto To = Attribute::get(C, Attribute::Range,
                              ConstantRange(Range.getLower(), Rounded));
     for (auto &F : M) {
@@ -486,7 +604,11 @@ std::string ohm_leaf::prepare(Module &M, StringRef Configuration) {
         unsigned N = Arg.getArgNo();
         if (Attrs.getParamAttr(N, Attribute::Range) != Tag)
           continue;
-        if (!canProjectArgument(Arg, Tag))
+        if (Early && !F.isDeclaration()) {
+          if (Pending.size() == 8)
+            return {};
+          Pending.push_back(&Arg);
+        } else if (!canProjectArgument(Arg, Tag))
           return {};
         Attrs = Attrs.removeParamAttribute(C, N, Attribute::Range)
                     .addParamAttribute(C, N, To);
@@ -500,14 +622,22 @@ std::string ohm_leaf::prepare(Module &M, StringRef Configuration) {
           auto *MD = I.getMetadata(LLVMContext::MD_range);
           if (!hasTagRange(MD, Upper))
             continue;
-          if (!canProjectLoad(I, Upper, Rounded.getZExtValue()))
+          if (Early) {
+            if (Loads.size() == 4 ||
+                !canProjectEarlyLoad(I, Tag, Upper, Rounded.getZExtValue(),
+                                     Checked))
+              return {};
+          } else if (!canProjectLoad(I, Upper, Rounded.getZExtValue()))
             return {};
           Loads.emplace_back(&I, MD);
         }
     }
+    for (auto *Arg : Pending)
+      if (!is_contained(Checked, Arg))
+        return {};
   }
 
-  // The actual machine pipeline sees the same range bounds as the proof.
+  // The actual compiler pipeline sees the same range bounds as the proof.
   // Integer literals have no use list, so restoring them preserves use order.
   for (const auto &Function : Functions)
     Function.F->setAttributes(Function.Rounded);
@@ -524,7 +654,11 @@ std::string ohm_leaf::prepare(Module &M, StringRef Configuration) {
   });
   char *IR = nullptr;
   size_t Size = 0;
-  if (!ohm_bc_save_v1(reinterpret_cast<LLVMModuleRef>(&M), &IR, &Size)) {
+  Digest Closed;
+  bool Valid =
+      Early ? hashEarlyModule(M, Rounded.getZExtValue(), !Loads.empty(), Closed)
+            : ohm_bc_save_v1(reinterpret_cast<LLVMModuleRef>(&M), &IR, &Size);
+  if (!Valid) {
     for (const auto &Load : Loads)
       Load.first->setMetadata(LLVMContext::MD_range, Load.second);
     for (const auto &Function : Functions)
@@ -532,11 +666,15 @@ std::string ohm_leaf::prepare(Module &M, StringRef Configuration) {
     return {};
   }
   BLAKE3 Hash;
-  Hash.update("ohm-enum-isel-v1");
+  Hash.update(Early ? "ohm-enum-optimizer-v1" : "ohm-enum-isel-v1");
   Hash.update(digest(Configuration));
-  Hash.update(digest(M.getModuleIdentifier()));
-  Hash.update(StringRef(IR, Size));
-  ohm_bc_free_v1(IR);
+  if (Early) {
+    Hash.update(Closed);
+  } else {
+    Hash.update(digest(M.getModuleIdentifier()));
+    Hash.update(StringRef(IR, Size));
+    ohm_bc_free_v1(IR);
+  }
   std::string Proof = bytes(Hash.final()).str();
   for (auto &L : Leaves) {
     StringRef Name = L.Ret->getFunction()->getName();
@@ -547,6 +685,14 @@ std::string ohm_leaf::prepare(Module &M, StringRef Configuration) {
     Proof.append(Value, 2);
   }
   return Proof;
+}
+
+std::string ohm_leaf::prepare(Module &M, StringRef Configuration) {
+  return prepareLeaf(M, Configuration, false);
+}
+
+std::string ohm_leaf::prepareEarly(Module &M, StringRef Configuration) {
+  return prepareLeaf(M, Configuration, true);
 }
 
 std::string ohm_leaf::enroll(StringRef Proof, StringRef Object) {

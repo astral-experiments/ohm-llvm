@@ -21,6 +21,7 @@
 #include "llvm/CodeGen/OhmEarlyObjectCache.h"
 #include "llvm/CodeGen/OhmLineCertificate.h"
 #include "llvm/DebugInfo/DWARF/OhmRuntimeLocations.h"
+#include "llvm/IR/Constants.h"
 #include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/IR/DiagnosticObservation.h"
 #include "llvm/IR/Instructions.h"
@@ -672,6 +673,7 @@ struct TraitOrigin {
 };
 struct LeafOrigin {
   const TargetMachine *Target;
+  std::string InputProof;
   std::string Proof;
   std::string Object;
 };
@@ -717,6 +719,20 @@ std::string inputShape(const Module &M, bool ProbeLineMovement) {
     // probe for line movement, including across source checksum changes.
     if (ProbeLineMovement)
       continue;
+    // The trait signature preserves a literal discriminant even when
+    // the enum cache can patch it. A changed tag rules out the first
+    // trait entry, just like a change to the function's shape.
+    if (F.getReturnType()->isIntegerTy(16) && F.arg_empty() &&
+        F.use_empty() && hasSingleElement(F) &&
+        hasSingleElement(F.getEntryBlock())) {
+      if (const auto *Ret = dyn_cast<ReturnInst>(&F.getEntryBlock().front()))
+        if (const auto *Value =
+                dyn_cast_or_null<ConstantInt>(Ret->getReturnValue())) {
+          char Tag[2];
+          support::endian::write16le(Tag, Value->getZExtValue());
+          frame(Hash, StringRef(Tag, sizeof(Tag)));
+        }
+    }
     auto *SP = F.getSubprogram();
     auto *File = SP ? SP->getFile() : nullptr;
     if (File && File->getChecksum())
@@ -797,39 +813,45 @@ bool tryTraitObject(Module &M, TargetMachine &TM, const Invocation &I,
   return false;
 }
 
-// Check the binding to this exact object before adjusting any leaf.
-std::string loadLeafObject(StringRef Path, StringRef Proof) {
+// The input and optimized proofs each bind the same native object. A
+// failed input match leaves the optimized lookup available after O1.
+std::string loadLeafObject(StringRef Path, StringRef Proof, bool Early) {
   auto Buffer = readPrivate(Path, MaxOrigin);
   if (!Buffer)
     return {};
   StringRef Record = Buffer->getBuffer();
-  if (!Record.consume_front("OHMLEAF1") || Record.size() < 8)
+  if (!Record.consume_front("OHMLEAF2") || Record.size() < 16)
     return {};
-  uint64_t N = support::endian::read64le(Record.data());
-  Record = Record.drop_front(8);
-  if (!N || N >= Record.size())
+  uint64_t A = support::endian::read64le(Record.data());
+  uint64_t B = support::endian::read64le(Record.data() + 8);
+  Record = Record.drop_front(16);
+  if (A > Record.size() || B >= Record.size() - A)
     return {};
-  return ohm_leaf::tryReuse(Proof, Record.take_front(N), Record.drop_front(N));
+  StringRef Witness = Early ? Record.take_front(A) : Record.substr(A, B);
+  return ohm_leaf::tryReuse(Proof, Witness, Record.drop_front(A + B));
 }
 
-void startLeafObject(Module &M, TargetMachine &TM, const Invocation &I,
-                     void **Ticket) {
+std::string leafKey(Module &M, TargetMachine &TM, const Invocation &I) {
   BLAKE3 H;
-  frame(H, "ohm-leaf-object-v2");
+  frame(H, "ohm-leaf-object-v3");
   frame(H, I.Namespace);
   frame(H, machineTarget(M, TM));
   frame(H, M.getModuleIdentifier());
-  auto Key = toHex(H.final(), true);
+  return toHex(H.final(), true);
+}
+
+void startLeafObject(Module &M, TargetMachine &TM, std::string Key,
+                     std::string Input, void **Ticket) {
   if (*Ticket) {
     // Both caches can enroll the object emitted for this module. Share
     // its diagnostic observation and retain their independent keys.
     auto &Origin = *static_cast<std::shared_ptr<EarlyOrigin> *>(*Ticket);
     Origin->Key = std::move(Key);
-    Origin->Leaf = LeafOrigin{&TM, {}, {}};
+    Origin->Leaf = LeafOrigin{&TM, std::move(Input), {}, {}};
     return;
   }
   auto Origin = std::make_shared<EarlyOrigin>(M, std::move(Key));
-  Origin->Leaf = LeafOrigin{&TM, {}, {}};
+  Origin->Leaf = LeafOrigin{&TM, std::move(Input), {}, {}};
   PendingEarly = Origin;
   *Ticket = new std::shared_ptr<EarlyOrigin>(std::move(Origin));
 }
@@ -838,13 +860,16 @@ void storeLeafObject(StringRef Path, const EarlyOrigin &Entry) {
   const auto &L = *Entry.Leaf;
   if (L.Object.empty())
     return;
-  auto Witness = ohm_leaf::enroll(L.Proof, L.Object);
-  if (Witness.empty() || Witness.size() + L.Object.size() + 16 > MaxOrigin)
+  auto A = ohm_leaf::enroll(L.InputProof, L.Object);
+  auto B = ohm_leaf::enroll(L.Proof, L.Object);
+  if ((A.empty() && B.empty()) ||
+      A.size() + B.size() + L.Object.size() + 24 > MaxOrigin)
     return;
-  char Size[8];
-  support::endian::write64le(Size, Witness.size());
-  if (writeAtomic(Path, {"OHMLEAF1", StringRef(Size, sizeof(Size)), Witness,
-                         L.Object}))
+  char Size[16];
+  support::endian::write64le(Size, A.size());
+  support::endian::write64le(Size + 8, B.size());
+  if (writeAtomic(Path,
+                  {"OHMLEAF2", StringRef(Size, sizeof(Size)), A, B, L.Object}))
     event(Entry.Input->getModuleIdentifier(), "leaf-committed");
 }
 
@@ -935,13 +960,17 @@ bool llvm::ohm::runLeafObjectCache(Module &M, CodeGenTargetMachineImpl &TM,
   PendingEarly.reset();
   auto &Leaf = *Origin->Leaf;
   Leaf.Proof = ohm_leaf::prepare(M, Origin->Key);
-  if (Leaf.Proof.empty())
+  if (Leaf.Proof.empty() && Leaf.InputProof.empty())
     return Emit();
   const auto &I = invocation(/*ForLineObjects=*/true);
   auto Path = joinPath(I.Entries, "llvmcache-" + Origin->Key);
-  auto Object = loadLeafObject(Path, Leaf.Proof);
+  auto Object = Leaf.Proof.empty()
+                    ? std::string()
+                    : loadLeafObject(Path, Leaf.Proof, /*Early=*/false);
   if (!Object.empty() && I.imagesUnchanged()) {
     Out << Object;
+    if (!Leaf.InputProof.empty())
+      Leaf.Object = std::move(Object);
     event(M.getModuleIdentifier(), "leaf-hit");
     return false;
   }
@@ -1242,11 +1271,28 @@ extern "C" int ohm_early_object_begin_v1(LLVMModuleRef Ref,
     if (!ohm::canUseDebugObjectCache())
       return 0;
     auto &Machine = *reinterpret_cast<TargetMachine *>(TM);
+    std::string Key, Input;
+    if (Leaf && !I.TestHarness && !HasBarrier) {
+      Key = leafKey(M, Machine, I);
+      // Range facts in the live input must already agree when taking
+      // either key and when running the optimizer on a miss.
+      if (!Machine.Options.EnableFastISel && !Machine.Options.EnableGlobalISel)
+        Input = ohm_leaf::prepareEarly(M, Key);
+      if (!Input.empty()) {
+        auto Path = joinPath(I.Entries, "llvmcache-" + Key);
+        auto Object = loadLeafObject(Path, Input, /*Early=*/true);
+        if (!Object.empty() && I.imagesUnchanged() &&
+            writeAtomic(StringRef(Output, Length), {Object}, 0666)) {
+          event(M.getModuleIdentifier(), "early-leaf-hit");
+          return 1;
+        }
+      }
+    }
     if (Large && tryTraitObject(M, Machine, I, StringRef(Output, Length),
                                 HasBarrier, Ticket))
       return 1;
-    if (Leaf && !I.TestHarness && !HasBarrier)
-      startLeafObject(M, Machine, I, Ticket);
+    if (!Key.empty())
+      startLeafObject(M, Machine, std::move(Key), std::move(Input), Ticket);
     return 0;
   }
   SmallVector<char, 128> State;

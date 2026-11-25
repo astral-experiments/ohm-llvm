@@ -7,6 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "../../lib/CodeGen/OhmLeafObject.h"
+#include "llvm/Bitcode/ClosedModuleHash.h"
 #include "llvm/IR/ConstantRange.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/LegacyPassManager.h"
@@ -185,6 +186,142 @@ TEST(OhmLeafInput, KeepsRangesDistinguishableWhenNarrowingLoads) {
   // SelectionDAG can truncate [0, 976) on the i32 load to i16. Preserve
   // the distinct range of the first load when memory nodes are merged.
   EXPECT_TRUE(loadKey(974, LoadUse::Collision).empty());
+}
+
+enum class EarlyUse {
+  Split,
+  OtherComputation,
+  Compare,
+  Signed,
+  Narrow,
+  CallSiteRange,
+  NonLocal,
+  ExtraCaller,
+  Occupied,
+  OpenContext
+};
+
+std::string earlyKey(unsigned Upper, EarlyUse Use = EarlyUse::Split) {
+  LLVMContext C;
+  auto M = rules(C, 501, Upper);
+  IRBuilder<> B(C);
+  auto *I16 = B.getInt16Ty();
+  auto *I64 = B.getInt64Ty();
+  auto *Leaf = M->getFunction(Name);
+  Attribute Tag = Leaf->getAttributes().getRetAttr(Attribute::Range);
+  auto Helper = [&](StringRef Name) {
+    auto *F = Function::Create(FunctionType::get(I64, {I16}, false),
+                               GlobalValue::InternalLinkage, Name, *M);
+    F->addParamAttr(0, Tag);
+    B.SetInsertPoint(BasicBlock::Create(C, "entry", F));
+    return F;
+  };
+  auto *Split = Helper("split");
+  Value *Arg = Split->getArg(0);
+  unsigned K = Use == EarlyUse::Narrow ? 2 : 64;
+  auto *Extended = B.CreateZExt(Arg, I64);
+  Value *Index = Use == EarlyUse::Signed
+                     ? B.CreateSDiv(Extended, B.getInt64(K))
+                     : B.CreateUDiv(Extended, B.getInt64(K));
+  Value *Bit = B.CreateZExt(B.CreateURem(Arg, B.getInt16(K)), I64);
+  Value *Result = B.CreateAdd(Index, Bit);
+  if (Use == EarlyUse::Compare)
+    Result = B.CreateSelect(B.CreateICmpULT(Arg, B.getInt16(974)), Result, Bit);
+  if (Use == EarlyUse::OtherComputation)
+    Result = B.CreateAdd(Result, B.getInt64(1));
+  B.CreateRet(Result);
+
+  auto *Forward = Helper("forward");
+  if (Use == EarlyUse::NonLocal)
+    Forward->setLinkage(GlobalValue::ExternalLinkage);
+  auto *Call = B.CreateCall(Split, {Forward->getArg(0)});
+  if (Use == EarlyUse::CallSiteRange)
+    Call->addParamAttr(0, Tag);
+  B.CreateRet(Call);
+  auto *Root = Function::Create(FunctionType::get(I64, {B.getPtrTy()}, false),
+                                GlobalValue::ExternalLinkage, "reader", *M);
+  B.SetInsertPoint(BasicBlock::Create(C, "entry", Root));
+  auto *Load = B.CreateLoad(I16, Root->getArg(0));
+  auto *MD = MDTuple::get(C, {ConstantAsMetadata::get(B.getInt16(0)),
+                              ConstantAsMetadata::get(B.getInt16(Upper))});
+  Load->setMetadata(LLVMContext::MD_range, MD);
+  Load->setMetadata(LLVMContext::MD_noundef, MDTuple::get(C, {}));
+  if (Use == EarlyUse::ExtraCaller)
+    B.CreateCall(Forward, {B.getInt16(0)});
+  B.CreateRet(B.CreateCall(Forward, {Load}));
+
+  constexpr StringLiteral Anchor = "ohm.leaf.ranges";
+  if (Use == EarlyUse::Occupied)
+    M->getOrInsertNamedMetadata(Anchor)->addOperand(MD);
+  std::unique_ptr<Module> Other;
+  if (Use == EarlyUse::OpenContext)
+    Other = std::make_unique<Module>("other", C);
+
+  std::string Proof = ohm_leaf::prepareEarly(*M, "session");
+  unsigned Actual = Proof.empty() ? Upper : 976;
+  EXPECT_EQ(Actual, getConstantRangeFromMetadata(
+                        *Load->getMetadata(LLVMContext::MD_range))
+                        .getUpper()
+                        .getZExtValue());
+  EXPECT_EQ(Actual, Leaf->getAttributes()
+                        .getRetAttr(Attribute::Range)
+                        .getValueAsConstantRange()
+                        .getUpper()
+                        .getZExtValue());
+  for (auto *F : {Forward, Split})
+    EXPECT_EQ(Actual, F->getAttributes()
+                          .getParamAttr(0, Attribute::Range)
+                          .getValueAsConstantRange()
+                          .getUpper()
+                          .getZExtValue());
+  EXPECT_EQ(B.getInt16(501), Leaf->front().front().getOperand(0));
+  if (Proof.empty()) {
+    EXPECT_EQ(Use == EarlyUse::Occupied,
+              M->getNamedMetadata(Anchor) != nullptr);
+    if (Use == EarlyUse::Occupied && M->getNamedMetadata(Anchor))
+      EXPECT_EQ(MD, M->getNamedMetadata(Anchor)->getOperand(0));
+  } else {
+    auto *Ranges = M->getNamedMetadata(Anchor);
+    EXPECT_NE(nullptr, Ranges);
+    if (Ranges)
+      EXPECT_EQ(16u, Ranges->getNumOperands());
+    // A subsequent proof still sees all rooted metadata in this context.
+    std::array<uint8_t, 32> Closed;
+    EXPECT_TRUE(getClosedModuleHashV1(*M, Closed));
+  }
+  return Proof;
+}
+
+TEST(OhmLeafInput, EarlyTransfersRetainBothProjectionIntervals) {
+  auto Key = earlyKey(974);
+  ASSERT_FALSE(Key.empty());
+  EXPECT_EQ(Key, earlyKey(975));
+  EXPECT_EQ(Key, earlyKey(976));
+  auto Other = earlyKey(975, EarlyUse::OtherComputation);
+  ASSERT_FALSE(Other.empty());
+  EXPECT_NE(Key, Other);
+}
+
+TEST(OhmLeafInput, EarlyMaskDoesNotHideMetadataObservers) {
+  LLVMContext C;
+  auto M = rules(C, 502);
+  auto *Literal =
+      cast<ConstantInt>(M->getFunction(Name)->front().front().getOperand(0));
+  // Only the isolated return references this integer in the module.
+  // Its detached metadata holder must remain visible to the context check.
+  MDTuple::get(C, {ConstantAsMetadata::get(Literal)});
+  ASSERT_TRUE(Literal->isUsedByMetadata());
+  EXPECT_TRUE(ohm_leaf::prepareEarly(*M, "session").empty());
+}
+
+TEST(OhmLeafInput, EarlyRejectionRestoresInput) {
+  for (auto Use :
+       {EarlyUse::Compare, EarlyUse::Signed, EarlyUse::Narrow,
+        EarlyUse::CallSiteRange, EarlyUse::NonLocal, EarlyUse::ExtraCaller,
+        EarlyUse::Occupied, EarlyUse::OpenContext})
+    EXPECT_TRUE(earlyKey(974, Use).empty());
+  // Even when the upper bound is already aligned, validate the observation.
+  EXPECT_TRUE(earlyKey(976, EarlyUse::Compare).empty());
 }
 
 TEST(OhmLeafInput, RefusesOtherTargetsAndSmallTags) {
