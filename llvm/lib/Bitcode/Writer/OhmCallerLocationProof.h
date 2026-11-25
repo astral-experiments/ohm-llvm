@@ -108,29 +108,27 @@ inline bool passedToCallee(const Use &U, const Function *&F, unsigned &I) {
          pointerAttributes(F->getAttributes().getParamAttrs(I));
 }
 
-inline bool opaqueCall(const Use &U) {
-  const Function *F = nullptr;
-  unsigned I;
-  return passedToCallee(U, F, I) && F->isDeclaration();
-}
-
-// The local callee can forward the pointer only to the existing opaque call.
-// Any extra use of its formal can inspect or escape the initializer.
+// Each local argument must be passed unmodified exactly once. Bound the
+// walk so even mutually recursive chains decline the fast path.
 inline bool addressOnly(const GlobalVariable &G) {
   if (G.use_empty() || G.isUsedByMetadata())
     return false;
   for (const Use &U : G.uses()) {
-    if (opaqueCall(U))
-      continue;
-    const Function *F = nullptr;
-    unsigned I;
-    if (!passedToCallee(U, F, I) || F->isDeclaration() ||
-        !F->hasLocalLinkage())
-      return false;
-    const Argument *Formal = F->getArg(I);
-    if (Formal->isUsedByMetadata() || !Formal->hasOneUse() ||
-        !opaqueCall(*Formal->use_begin()))
-      return false;
+    const Use *ArgumentUse = &U;
+    for (unsigned Depth = 0;; ++Depth) {
+      const Function *F = nullptr;
+      unsigned I;
+      if (!passedToCallee(*ArgumentUse, F, I))
+        return false;
+      if (F->isDeclaration())
+        break;
+      if (Depth == 2 || !F->hasLocalLinkage())
+        return false;
+      const Argument *Formal = F->getArg(I);
+      if (Formal->isUsedByMetadata() || !Formal->hasOneUse())
+        return false;
+      ArgumentUse = &*Formal->use_begin();
+    }
   }
   return true;
 }
