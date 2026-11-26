@@ -10,6 +10,7 @@
 #include "llvm-c/Core.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringExtras.h"
+#include "llvm/BinaryFormat/Dwarf.h"
 #include "llvm/DebugInfo/DWARF/OhmRuntimeLocations.h"
 #include "llvm/Object/ObjectFile.h"
 #include "llvm/ObjectYAML/yaml2obj.h"
@@ -42,6 +43,7 @@ enum Case {
   InheritedLine,
   TruncatedCU,
   ResizedLine,
+  TrailingTables,
   NoRoom,
   InteriorRef,
   CrossFileMCForm,
@@ -52,8 +54,8 @@ enum Case {
 };
 std::unique_ptr<object::ObjectFile> fixture(SmallString<0> &Storage,
                                             unsigned Decl, unsigned Call,
-                                            unsigned Row,
-                                            Case Kind = Ordinary) {
+                                            unsigned Row, Case Kind = Ordinary,
+                                            unsigned RuntimeLine = 0) {
   // A compile unit, a declaration, an inline call and a concrete instance
   // which may override only the file of an abstract declaration.
   std::string Abbrev;
@@ -109,10 +111,16 @@ std::unique_ptr<object::ObjectFile> fixture(SmallString<0> &Storage,
   bytes(Line, {4, 0});
   word(Line, Header.size());
   Line += Header;
-  const bool Resize =
-      Kind == ResizedLine || Kind == NoRoom || Kind == InteriorRef;
+  const bool Resize = Kind == ResizedLine || Kind == TrailingTables ||
+                      Kind == NoRoom || Kind == InteriorRef;
   unsigned AddressOffset = 0;
   if (Resize) {
+    if (Kind == TrailingTables) {
+      // Align the end of the one-byte advance and keep the same line-program
+      // prefix when an independently emitted advance needs two bytes.
+      const unsigned Padding = (8 - ((4 + Line.size() + 19) % 8)) % 8;
+      Line.append(Padding, char(dwarf::DW_LNS_set_basic_block));
+    }
     bytes(Line, {3});
     uint8_t Encoded[16];
     unsigned N = encodeSLEB128(int64_t(Row) - 1, Encoded);
@@ -153,21 +161,57 @@ Sections:
   - Name: .text
     Type: SHT_PROGBITS
     Flags: [ SHF_ALLOC, SHF_EXECINSTR ]
-    Content: 'C3'
 )";
+  Yaml +=
+      RuntimeLine ? "    Content: '488D0500000000C3'\n" : "    Content: 'C3'\n";
+  if (RuntimeLine) {
+    std::string Record(16, '\0');
+    Record[8] = 11; // Length of "src/same.rs".
+    word(Record, RuntimeLine);
+    word(Record, 13);
+    Yaml += R"(  - Name: .rodata.str1.1
+    Type: SHT_PROGBITS
+    Flags: [SHF_ALLOC, SHF_MERGE, SHF_STRINGS]
+    EntSize: 1
+    AddressAlign: 1
+    Content: '7372632f73616d652e727300'
+  - Name: .data.rel.ro..Lanon.0123456789abcdef0123456789abcdef.3
+    Type: SHT_PROGBITS
+    Flags: [SHF_ALLOC, SHF_WRITE]
+    AddressAlign: 8
+)";
+    Yaml += "    Content: '" + toHex(Record) + "'\n";
+    Yaml +=
+        R"(  - Name: .rela.data.rel.ro..Lanon.0123456789abcdef0123456789abcdef.3
+    Type: SHT_RELA
+    Link: .symtab
+    Info: .data.rel.ro..Lanon.0123456789abcdef0123456789abcdef.3
+    Relocations:
+      - { Offset: 0, Type: R_X86_64_64, Symbol: file_section }
+  - Name: .rela.text
+    Type: SHT_RELA
+    Link: .symtab
+    Info: .text
+    Relocations:
+      - { Offset: 3, Type: R_X86_64_PC32, Symbol: runtime_section, Addend: -4 }
+)";
+  }
   auto Section = [&](StringRef N, StringRef V) {
-    Yaml += "  - Name: " + N.str() +
-            "\n    Type: SHT_PROGBITS\n    Content: '" + toHex(V) + "'\n";
+    Yaml += "  - Name: " + N.str() + "\n    Type: SHT_PROGBITS\n";
+    if (Kind == TrailingTables && N == ".debug_line")
+      Yaml += "    AddressAlign: 8\n";
+    Yaml += "    Content: '" + toHex(V) + "'\n";
   };
   Section(".debug_abbrev", Abbrev);
   Section(".debug_info", Info);
   Section(".debug_line", unit(Line));
   if (Resize) {
+    if (Kind != TrailingTables)
+      Yaml += "  - Name: .rodata.after_line\n    Type: SHT_PROGBITS\n    "
+              "AddressAlign: " +
+              std::to_string(Kind == NoRoom ? 1 : 32) +
+              "\n    Content: '0000000000000000'\n";
     Yaml +=
-        "  - Name: .rodata.after_line\n    Type: SHT_PROGBITS\n    "
-        "AddressAlign: " +
-        std::to_string(Kind == NoRoom ? 1 : 32) +
-        "\n    Content: '0000000000000000'\n"
         "  - Name: .rela.debug_line\n    Type: SHT_RELA\n    Link: .symtab\n"
         "    Info: .debug_line\n    Relocations:\n      - Offset: " +
         std::to_string(AddressOffset) +
@@ -181,6 +225,14 @@ Sections:
             "STT_SECTION\n    Section: .text\n"
             "  - Name: line_section\n    StName: 0\n    Type: STT_SECTION\n    "
             "Section: .debug_line\n";
+    if (RuntimeLine)
+      Yaml +=
+          R"(  - { Name: file_section, StName: 0, Type: STT_SECTION, Section: .rodata.str1.1 }
+  - Name: runtime_section
+    StName: 0
+    Type: STT_SECTION
+    Section: .data.rel.ro..Lanon.0123456789abcdef0123456789abcdef.3
+)";
   }
   return yaml::yaml2ObjectFile(
       Storage, Yaml, [](const Twine &Error) { errs() << Error << "\n"; });
@@ -270,6 +322,42 @@ TEST(OhmDwarfRebase, ResizesAnExplicitLineOperandAndRelocatesAddresses) {
                              {{"/fixture/src/same.rs", {{60, 90}}}});
   ASSERT_TRUE(bool(R)) << toString(R.takeError());
   EXPECT_EQ(Future.str(), StringRef(R->Bytes.data(), R->Bytes.size()));
+}
+
+TEST(OhmDwarfRebase, GrowsAndShrinksLineTablesBeforeRelocations) {
+  SmallString<0> Old, Future;
+  ASSERT_TRUE(fixture(Old, 20, 20, 60, TrailingTables));
+  ASSERT_TRUE(fixture(Future, 20, 20, 90, TrailingTables));
+  ASSERT_GT(Future.size(), Old.size());
+  auto Grow = ohm::rebaseDwarf4({Old, "cached"},
+                                {{"/fixture/src/same.rs", {{60, 90}}}});
+  ASSERT_TRUE(bool(Grow)) << toString(Grow.takeError());
+  EXPECT_EQ(StringRef(Grow->Bytes.data(), Grow->Bytes.size()), Future.str());
+  auto Shrink = ohm::rebaseDwarf4({Future, "cached"},
+                                  {{"/fixture/src/same.rs", {{90, 60}}}});
+  ASSERT_TRUE(bool(Shrink)) << toString(Shrink.takeError());
+  EXPECT_EQ(StringRef(Shrink->Bytes.data(), Shrink->Bytes.size()), Old.str());
+}
+
+TEST(OhmDwarfRebase, UpdatesTheCallerRecordBeforeItsObjectGrows) {
+  SmallString<0> Old, Future;
+  ASSERT_TRUE(fixture(Old, 20, 20, 60, TrailingTables, 60));
+  ASSERT_TRUE(fixture(Future, 20, 20, 90, TrailingTables, 90));
+  ASSERT_GT(Future.size(), Old.size());
+  constexpr StringLiteral Map =
+      R"({"version":1,"files":[{"directory":"/fixture","filename":"src/same.rs","lines":[[60,90]]}]})";
+  constexpr StringLiteral Witness =
+      R"([{"global":"anon.0123456789abcdef0123456789abcdef.3","file_global":"anon.0123456789abcdef0123456789abcdef.2","directory":"/fixture","file":"src/same.rs","file_nul":true,"old_line":60,"new_line":90,"column":13}])";
+  const char *Reason = nullptr;
+  LLVMMemoryBufferRef Result = nullptr;
+  ASSERT_EQ(0, ohm_debug_rebase_locations_v1(
+                   Map.data(), Map.size(), Witness.data(), Witness.size(),
+                   Old.data(), Old.size(), &Result, &Reason))
+      << (Reason ? Reason : "");
+  ASSERT_NE(Result, nullptr);
+  EXPECT_EQ(Future.str(),
+            StringRef(LLVMGetBufferStart(Result), LLVMGetBufferSize(Result)));
+  LLVMDisposeMemoryBuffer(Result);
 }
 
 TEST(OhmDwarfRebase, ResizingRequiresStableLayoutAndNoInteriorReferences) {
