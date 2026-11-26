@@ -18,6 +18,7 @@
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseMapInfo.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/PointerUnion.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
@@ -407,6 +408,12 @@ public:
   }
 
   LLVMContext &getContext() const { return Context; }
+
+  /// Check whether an optimization could notify a metadata owner outside the
+  /// represented graph. A zero-use value wrapper has no outgoing callback.
+  static LLVM_ABI bool
+  hasOnlyRepresentedUsers(Metadata &MD, const DenseSet<Value *> &Values,
+                          const DenseSet<Metadata *> &Nodes);
 
   /// Replace all uses of this with MD.
   ///
