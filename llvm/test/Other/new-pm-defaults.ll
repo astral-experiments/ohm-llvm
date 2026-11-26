@@ -120,7 +120,7 @@
 ; CHECK-O-NEXT: Running pass: SimplifyCFGPass
 ; CHECK-O-NEXT: Running pass: AlwaysInlinerPass
 ; CHECK-O-NEXT: Running analysis: ProfileSummaryAnalysis
-; CHECK-O-NEXT: Running pass: ModuleInlinerWrapperPass
+; CHECK-O-NEXT: Running pass: {{(ModuleInlinerWrapperPass|.*O1LocalInlinerPass)}}
 ; CHECK-O-NEXT: Running analysis: InlineAdvisorAnalysis
 ; CHECK-O-NEXT: Running pass: RequireAnalysisPass<{{.*}}GlobalsAA
 ; CHECK-O-NEXT: Running analysis: GlobalsAA
@@ -139,6 +139,7 @@
 ; CHECK-O2-NEXT: Running pass: OpenMPOptCGSCCPass on (foo)
 ; CHECK-O3-NEXT: Running pass: OpenMPOptCGSCCPass on (foo)
 ; CHECK-EP-CGSCC-LATE-NEXT: Running pass: NoOpCGSCCPass
+; CHECK-O1-NEXT: Running pass: {{.*}}LocalFunctionSimplification on foo
 ; CHECK-O-NEXT: Running pass: SROAPass
 ; CHECK-O-NEXT: Running pass: EarlyCSEPass
 ; CHECK-O-NEXT: Running analysis: MemorySSAAnalysis
@@ -218,6 +219,7 @@
 ; CHECK-O-NEXT: Running analysis: ShouldNotRunFunctionPassesAnalysis
 ; CHECK-O-NEXT: Running pass: CoroSplitPass
 ; CHECK-O-NEXT: Running pass: CoroAnnotationElidePass
+; CHECK-O1-NEXT: Running pass: {{.*}}LocalFunctionSimplification on foo
 ; CHECK-O-NEXT: Running pass: InvalidateAnalysisPass<{{.*}}ShouldNotRunFunctionPassesAnalysis
 ; CHECK-O-NEXT: Invalidating analysis: ShouldNotRunFunctionPassesAnalysis
 ; CHECK-O-NEXT: Invalidating analysis: InlineAdvisorAnalysis

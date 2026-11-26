@@ -98,6 +98,7 @@ MODULE_PASS("inferattrs", InferFunctionAttrsPass())
 MODULE_PASS("inliner-ml-advisor-release",
             ModuleInlinerWrapperPass(getInlineParams(), true, {},
                                      InliningAdvisorMode::Release, 0))
+MODULE_PASS("o1-local-inliner", buildO1LocalInlinerPipeline())
 MODULE_PASS("inliner-wrapper", ModuleInlinerWrapperPass())
 MODULE_PASS("inliner-wrapper-no-mandatory-first",
             ModuleInlinerWrapperPass(getInlineParams(), false))
