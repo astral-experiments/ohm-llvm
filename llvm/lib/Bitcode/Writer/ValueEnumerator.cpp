@@ -706,6 +706,9 @@ ValueEnumerator::ValueEnumerator(const Module &M,
     for (const auto &I : MDs)
       EnumerateMetadata(F.isDeclaration() ? nullptr : &F, I.second);
 
+    const Metadata *LastScope = nullptr;
+    const Metadata *LastInlinedAt = nullptr;
+    unsigned FunctionID = getMetadataFunctionID(&F);
     for (const BasicBlock &BB : F)
       for (const Instruction &I : BB) {
         // Local metadata is enumerated during function-incorporation, but
@@ -716,31 +719,31 @@ ValueEnumerator::ValueEnumerator(const Module &M,
           if (const auto *AL = dyn_cast<DIArgList>(MD)) {
             for (const auto *VAM : AL->getArgs()) {
               if (isa<ConstantAsMetadata>(VAM))
-                EnumerateMetadata(&F, VAM);
+                EnumerateMetadata(FunctionID, VAM);
             }
             return;
           }
 
           if (!isa<LocalAsMetadata>(MD))
-            EnumerateMetadata(&F, MD);
+            EnumerateMetadata(FunctionID, MD);
         };
 
         for (DbgRecord &DR : I.getDbgRecordRange()) {
           if (DbgLabelRecord *DLR = dyn_cast<DbgLabelRecord>(&DR)) {
-            EnumerateMetadata(&F, DLR->getLabel());
-            EnumerateMetadata(&F, &*DLR->getDebugLoc());
+            EnumerateMetadata(FunctionID, DLR->getLabel());
+            EnumerateMetadata(FunctionID, &*DLR->getDebugLoc());
             continue;
           }
           // Enumerate non-local location metadata.
           DbgVariableRecord &DVR = cast<DbgVariableRecord>(DR);
           EnumerateNonLocalValuesFromMetadata(DVR.getRawLocation());
-          EnumerateMetadata(&F, DVR.getExpression());
-          EnumerateMetadata(&F, DVR.getVariable());
-          EnumerateMetadata(&F, &*DVR.getDebugLoc());
+          EnumerateMetadata(FunctionID, DVR.getExpression());
+          EnumerateMetadata(FunctionID, DVR.getVariable());
+          EnumerateMetadata(FunctionID, &*DVR.getDebugLoc());
           if (DVR.isDbgAssign()) {
             EnumerateNonLocalValuesFromMetadata(DVR.getRawAddress());
-            EnumerateMetadata(&F, DVR.getAssignID());
-            EnumerateMetadata(&F, DVR.getAddressExpression());
+            EnumerateMetadata(FunctionID, DVR.getAssignID());
+            EnumerateMetadata(FunctionID, DVR.getAddressExpression());
           }
         }
         for (const Use &Op : I.operands()) {
@@ -765,16 +768,27 @@ ValueEnumerator::ValueEnumerator(const Module &M,
         }
 
         // Enumerate metadata attached with this instruction.
-        MDs.clear();
-        getNonDebugAttachments(I, MDs);
-        for (const auto &MD : MDs)
-          EnumerateMetadata(&F, MD.second);
+        if (I.hasMetadataOtherThanDebugLoc()) {
+          MDs.clear();
+          getNonDebugAttachments(I, MDs);
+          for (const auto &MD : MDs)
+            EnumerateMetadata(FunctionID, MD.second);
+        }
 
         // Don't enumerate the location directly -- it has a special record
         // type -- but enumerate its operands.
-        if (DILocation *L = I.getDebugLoc())
-          for (const Metadata *Op : L->operands())
-            EnumerateMetadata(&F, Op);
+        // Adjacent locations often share both operands. Once enumerated in
+        // this function, an operand can only keep its tag or become global.
+        if (DILocation *L = I.getDebugLoc()) {
+          const Metadata *Scope = L->getRawScope();
+          const Metadata *InlinedAt = L->getRawInlinedAt();
+          if (Scope != LastScope)
+            EnumerateMetadata(FunctionID, Scope);
+          if (InlinedAt != LastInlinedAt)
+            EnumerateMetadata(FunctionID, InlinedAt);
+          LastScope = Scope;
+          LastInlinedAt = InlinedAt;
+        }
       }
   }
   for (const GlobalIFunc &GIF : M.ifuncs()) {
@@ -1277,7 +1291,7 @@ void ValueEnumerator::EnumerateValue(const Value *V) {
 }
 
 
-void ValueEnumerator::EnumerateType(Type *Ty) {
+void ValueEnumerator::EnumerateTypeImpl(Type *Ty) {
   unsigned *TypeID = &TypeMap[Ty];
 
   // We've already seen this type.
@@ -1326,7 +1340,7 @@ void ValueEnumerator::EnumerateOperandType(const Value *V) {
 
   // If this constant is already enumerated, ignore it, we know its type must
   // be enumerated.
-  if (ValueMap.count(C))
+  if (isa<ConstantData>(C) || ValueMap.count(C))
     return;
 
   // This constant may have operands, make sure to enumerate the types in
@@ -1352,11 +1366,10 @@ void ValueEnumerator::EnumerateAttributes(AttributeList PAL) {
 
   // Do a lookup.
   unsigned &Entry = AttributeListMap[PAL];
-  if (Entry == 0) {
-    // Never saw this before, add it.
-    AttributeLists.push_back(PAL);
-    Entry = AttributeLists.size();
-  }
+  if (Entry)
+    return;
+  AttributeLists.push_back(PAL);
+  Entry = AttributeLists.size();
 
   // Do lookups for all attribute groups.
   for (unsigned i : PAL.indexes()) {
@@ -1396,33 +1409,6 @@ void ValueEnumerator::incorporateFunction(const Function &F) {
   }
   FirstFuncConstantID = Values.size();
 
-  // Add all function-level constants to the value table.
-  for (const BasicBlock &BB : F) {
-    for (const Instruction &I : BB) {
-      for (const Use &OI : I.operands()) {
-        if ((isa<Constant>(OI) && !isa<GlobalValue>(OI)) || isa<InlineAsm>(OI))
-          EnumerateValue(OI);
-      }
-      if (auto *SVI = dyn_cast<ShuffleVectorInst>(&I))
-        EnumerateValue(SVI->getShuffleMaskForBitcode());
-      if (auto *SI = dyn_cast<SwitchInst>(&I)) {
-        for (const auto &Case : SI->cases())
-          EnumerateValue(Case.getCaseValue());
-      }
-    }
-    BasicBlocks.push_back(&BB);
-    ValueMap[&BB] = BasicBlocks.size();
-  }
-
-  // Optimize the constant layout.
-  OptimizeConstants(FirstFuncConstantID, Values.size());
-
-  // Add the function's parameter attributes so they are available for use in
-  // the function's instruction.
-  EnumerateAttributes(F.getAttributes());
-
-  FirstInstID = Values.size();
-
   SmallVector<LocalAsMetadata *, 8> FnLocalMDVector;
   SmallVector<DIArgList *, 8> ArgListMDVector;
 
@@ -1444,11 +1430,15 @@ void ValueEnumerator::incorporateFunction(const Function &F) {
     }
   };
 
-  // Add all of the instructions.
+  // Add function-level constants and collect references to local metadata in
+  // the same operand walk. Defer assigning metadata IDs until all instruction
+  // values have been numbered.
   for (const BasicBlock &BB : F) {
     for (const Instruction &I : BB) {
       for (const Use &OI : I.operands()) {
-        if (auto *MD = dyn_cast<MetadataAsValue>(&OI))
+        if ((isa<Constant>(OI) && !isa<GlobalValue>(OI)) || isa<InlineAsm>(OI))
+          EnumerateValue(OI);
+        else if (auto *MD = dyn_cast<MetadataAsValue>(&OI))
           AddFnLocalMetadata(MD->getMetadata());
       }
       /// RemoveDIs: Add non-instruction function-local metadata uses.
@@ -1462,8 +1452,35 @@ void ValueEnumerator::incorporateFunction(const Function &F) {
           AddFnLocalMetadata(DVR.getRawAddress());
         }
       }
-      if (!I.getType()->isVoidTy())
-        EnumerateValue(&I);
+      if (auto *SVI = dyn_cast<ShuffleVectorInst>(&I))
+        EnumerateValue(SVI->getShuffleMaskForBitcode());
+      if (auto *SI = dyn_cast<SwitchInst>(&I)) {
+        for (const auto &Case : SI->cases())
+          EnumerateValue(Case.getCaseValue());
+      }
+    }
+    BasicBlocks.push_back(&BB);
+    ValueMap[&BB] = BasicBlocks.size();
+  }
+
+  // Optimize the constant layout.
+  OptimizeConstants(FirstFuncConstantID, Values.size());
+
+  // Add the function's parameter attributes so they are available for use in
+  // the function's instruction.
+  EnumerateAttributes(F.getAttributes());
+
+  FirstInstID = Values.size();
+
+  // Add all of the instructions.
+  for (const BasicBlock &BB : F) {
+    for (const Instruction &I : BB) {
+      if (!I.getType()->isVoidTy()) {
+        // Instruction definitions are unique and the module walk already
+        // enumerated all result types.
+        Values.emplace_back(&I, 1U);
+        ValueMap[&I] = Values.size();
+      }
     }
   }
 

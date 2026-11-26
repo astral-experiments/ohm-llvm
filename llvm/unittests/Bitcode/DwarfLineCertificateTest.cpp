@@ -70,6 +70,34 @@ protected:
   }
 };
 
+TEST_F(DwarfLineCertificateTest, KeepsInlineSitesAndAttachmentOrdinals) {
+  auto *F = M->getFunction("run");
+  auto *Scope = F->getSubprogram();
+  Instruction &A = F->getEntryBlock().front();
+  Instruction &B = F->back().front();
+  auto *First = DILocation::get(C, 10, 2, Scope);
+  auto *Second = DILocation::get(C, 11, 2, Scope);
+  for (auto &BB : *F)
+    BB.front().setDebugLoc(DILocation::get(C, 3, 1, Scope, First));
+  auto Initial = certificate();
+  ASSERT_TRUE(Initial);
+
+  B.setDebugLoc(DILocation::get(C, 3, 1, Scope, Second));
+  auto ChangedSite = certificate();
+  ASSERT_TRUE(ChangedSite);
+  EXPECT_NE(Initial, ChangedSite);
+
+  auto *Tag = MDNode::get(C, {});
+  B.setMetadata("custom", Tag);
+  auto OnLast = certificate();
+  ASSERT_TRUE(OnLast);
+  B.setMetadata("custom", nullptr);
+  A.setMetadata("custom", Tag);
+  auto OnFirst = certificate();
+  ASSERT_TRUE(OnFirst);
+  EXPECT_NE(OnFirst, OnLast);
+}
+
 TEST_F(DwarfLineCertificateTest, IncludesTerminalStorageSlice) {
   auto Initial = certificate();
   addSlice(M->getNamedGlobal("storage"));

@@ -2837,6 +2837,8 @@ void ModuleBitcodeWriter::writeFunctionMetadataAttachment(const Function &F) {
   for (const BasicBlock &BB : F)
     for (const Instruction &I : BB) {
       unsigned InstructionID = NextInstruction++;
+      if (!I.hasMetadataOtherThanDebugLoc())
+        continue;
       MDs.clear();
       VE.getNonDebugAttachments(I, MDs);
 
