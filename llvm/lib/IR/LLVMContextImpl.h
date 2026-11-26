@@ -41,6 +41,7 @@
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/StringSaver.h"
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
@@ -1834,6 +1835,9 @@ public:
   ///
   /// Start a 1 because 0 means the source location isn't part of an atom group.
   uint64_t NextAtomGroup = 1;
+
+  std::atomic<unsigned> DiagnosticObservers{0};
+  std::atomic<uint64_t> ObservedDiagnostics{0};
 };
 
 } // end namespace llvm
