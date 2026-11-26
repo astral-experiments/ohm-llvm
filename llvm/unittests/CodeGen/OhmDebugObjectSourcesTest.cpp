@@ -6,6 +6,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "../../lib/CodeGen/OhmDebugObjectSourceLines.h"
 #include "llvm/CodeGen/OhmDebugObjectSources.h"
 #include "llvm-c/Core.h"
 #include "llvm/ADT/SmallString.h"
@@ -95,6 +96,43 @@ protected:
     return {Status, Take(N), Take(A), Take(B), Why ? Why : ""};
   }
 };
+#if defined(__linux__) && defined(SYS_renameat2)
+TEST(OhmDebugSourceLines, DistinguishesMandatoryOccurrencesFromDuplicates) {
+  auto Check = [](ArrayRef<StringRef> Old, ArrayRef<StringRef> New,
+                  ArrayRef<uint32_t> Expected) {
+    SmallVector<uint32_t> Forward(Old.size(), 99);
+    ASSERT_TRUE(ohm::getMandatoryDebugSourceLines(Old, New, Forward));
+    EXPECT_EQ(ArrayRef<uint32_t>(Forward), Expected);
+  };
+  // Each old copy can be the deleted one, even though its only possible
+  // destination is the same new line.
+  Check({"start", "copy", "copy", "end"}, {"start", "copy", "end"},
+        {1, 0, 0, 3});
+  Check({"start", "copy", "end"}, {"start", "copy", "copy", "end"},
+        {1, 0, 4});
+  Check({"start", "left", "right"}, {"start", "right", "left"}, {1, 0, 0});
+  Check({"start", "old", "end"}, {"start", "new", "end"}, {1, 0, 3});
+  Check({"copy", "copy", "end"}, {"copy", "copy", "end"}, {1, 2, 3});
+}
+
+TEST(OhmDebugSourceLines, BoundsTheNumberOfChangedLines) {
+  SmallVector<StringRef> Old(32, "removed"), New(32, "added");
+  Old.push_back("end");
+  New.push_back("end");
+  SmallVector<uint32_t> Forward(Old.size(), 99);
+  ASSERT_TRUE(ohm::getMandatoryDebugSourceLines(Old, New, Forward));
+  EXPECT_EQ(Forward.back(), 33u);
+  EXPECT_TRUE(llvm::all_of(ArrayRef<uint32_t>(Forward).drop_back(),
+                           [](uint32_t Line) { return Line == 0; }));
+
+  Old.push_back("one more old");
+  New.push_back("one more new");
+  Forward.resize(Old.size());
+  EXPECT_FALSE(ohm::getMandatoryDebugSourceLines(Old, New, Forward));
+}
+
+#endif
+
 TEST_F(OhmDebugObjectSources, CapturesOriginAndProvesExactOrderedLines) {
   StringRef Old = "first\nsecond\n", New = "first\ninserted\nsecond\n";
   write(Old);
