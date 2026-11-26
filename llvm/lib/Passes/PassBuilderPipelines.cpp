@@ -355,6 +355,8 @@ PipelineTuningOptions::PipelineTuningOptions() {
   CallGraphProfile = true;
   UnifiedLTO = false;
   MergeFunctions = EnableMergeFunctions;
+  MergeRustFunctions =
+      EnableMergeFunctions.getNumOccurrences() == 0 || EnableMergeFunctions;
   InlinerThreshold = -1;
   EagerlyInvalidateAnalyses = EnableEagerlyInvalidateAnalyses;
   DevirtualizeSpeculatively = EnableDevirtualizeSpeculatively;
@@ -1243,7 +1245,7 @@ PassBuilder::buildInlinerPipelineImpl(OptimizationLevel Level,
   // CGSCC walk.
   auto Simplify = buildFunctionSimplificationPipeline(Level, Phase);
   if (DeferLocal) {
-    bool Share = supportsCallSharing(TM);
+    bool Share = PTO.MergeRustFunctions && supportsCallSharing(TM);
     LocalFunctionSimplification Local(std::move(Simplify), Share);
     if (Share)
       MIWP.addLateModulePass(MergeRepeatedCallsPass());
@@ -1439,7 +1441,8 @@ PassBuilder::buildModuleSimplificationPipeline(OptimizationLevel Level,
       IPSCCPPass(IPSCCPOptions(/*AllowFuncSpec=*/!isLTOPreLink(Phase))));
 
   // Preserve caller-specific constants discovered by IPSCCP.
-  if (deferLocalSimplification(Level, Phase) && supportsCallSharing(TM))
+  if (PTO.MergeRustFunctions && deferLocalSimplification(Level, Phase) &&
+      supportsCallSharing(TM))
     MPM.addPass(MergeIdenticalRustFunctionsPass());
 
   // Attach metadata to indirect call sites indicating the set of functions
@@ -1937,7 +1940,8 @@ PassBuilder::buildModuleOptimizationPipeline(OptimizationLevel Level,
   if (EnableIROutliner)
     MPM.addPass(IROutlinerPass());
 
-  if (deferLocalSimplification(Level, LTOPhase) && supportsCallSharing(TM))
+  if (PTO.MergeRustFunctions && deferLocalSimplification(Level, LTOPhase) &&
+      supportsCallSharing(TM))
     MPM.addPass(EliminateDeadSharedArgumentsPass());
 
   // Now we need to do some global optimization transforms.
