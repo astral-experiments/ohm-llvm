@@ -9,6 +9,7 @@
 #ifndef LLVM_BITCODE_DWARFLINECERTIFICATE_H
 #define LLVM_BITCODE_DWARFLINECERTIFICATE_H
 #define LLVM_OHM_CLOSED_DWARF_LINE_CERTIFICATE_V1 1
+#define LLVM_OHM_REPLAYABLE_DWARF_LINE_SCOPES_V1 1
 
 #include "llvm/Support/Compiler.h"
 
@@ -16,7 +17,8 @@ namespace llvm {
 class Module;
 class raw_ostream;
 
-/// Write an ordered bitcode fingerprint, source filenames and source coordinates.
+/// Write a fingerprint of the module identifier, ordered bitcode and live
+/// optimizer context together with source filenames and coordinates.
 /// The fingerprint preserves location order and equality within each file. Only
 /// line numbers and strings used exclusively as DIFile checksums may vary. The
 /// caller must also compare filenames, checksums and a monotone map of the old

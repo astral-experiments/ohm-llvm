@@ -13,8 +13,10 @@
 #include "llvm/Bitcode/BitcodeWriter.h"
 #include "ValueEnumerator.h"
 #include "DwarfLineCertificate.h"
+#include "llvm/Bitcode/ClosedModuleHash.h"
 #include "llvm/Bitcode/DwarfLineCertificate.h"
 #include "llvm/IR/ClosedOptimizerContext.h"
+#include "llvm/Support/BLAKE3.h"
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/ArrayRef.h"
@@ -121,6 +123,12 @@ static cl::opt<bool> PreserveBitcodeUseListOrder(
     "preserve-bc-uselistorder", cl::Hidden, cl::init(true),
     cl::desc("Preserve use-list order when writing LLVM bitcode."));
 
+static bool preserveUseListOrder(bool Requested) {
+  return PreserveBitcodeUseListOrder.getNumOccurrences()
+             ? PreserveBitcodeUseListOrder.getValue()
+             : Requested;
+}
+
 namespace llvm {
 extern FunctionSummary::ForceSummaryHotnessType ForceSummaryEdgesCold;
 }
@@ -222,11 +230,7 @@ public:
                           const ModuleSummaryIndex *Index,
                           MachineUseState *Uses = nullptr)
       : BitcodeWriterBase(Stream, StrtabBuilder), M(M),
-        VE(M,
-           PreserveBitcodeUseListOrder.getNumOccurrences()
-               ? PreserveBitcodeUseListOrder
-               : ShouldPreserveUseListOrder,
-           Uses),
+        VE(M, preserveUseListOrder(ShouldPreserveUseListOrder), Uses),
         Index(Index) {
     // Assign ValueIds to any callee values in the index that came from
     // indirect call profiles and were recorded as a GUID not a Value*
@@ -5751,8 +5755,7 @@ bool llvm::writeDebugObjectBitcode(const Module &M,
   // Use-list ordering can affect machine-code generation. If the process
   // explicitly forbids writing it, this compilation cannot supply a key.
   if (!M.isMaterialized() || !M.getTargetTriple().isOSBinFormatELF() ||
-      (PreserveBitcodeUseListOrder.getNumOccurrences() &&
-       !PreserveBitcodeUseListOrder))
+      !preserveUseListOrder(true))
     return false;
   if (Map)
     Map->prepare();
@@ -5786,9 +5789,28 @@ bool llvm::writeClosedOptimizerInput(const Module &M,
                                  /*AllowMachineOnlyUses=*/false);
 }
 
+bool llvm::getClosedModuleHashV1(const Module &M,
+                                 std::array<uint8_t, 32> &Digest) {
+  std::array<uint8_t, 32> Context;
+  if (!preserveUseListOrder(true) || !getClosedOptimizerContextV1(M, Context))
+    return false;
+
+  // A bitcode reader receives the module identifier from its caller.
+  BLAKE3 Hash;
+  Hash.update(arrayRefFromStringRef("llvm-closed-module-v1"));
+  Hash.update(Context);
+  Hash.update(BLAKE3::hash<32>(arrayRefFromStringRef(M.getModuleIdentifier())));
+  SmallVector<char, 0> Bytes;
+  raw_svector_ostream OS(Bytes);
+  WriteBitcodeToFile(M, OS, /*ShouldPreserveUseListOrder=*/true);
+  Hash.update(arrayRefFromStringRef(OS.str()));
+  Digest = Hash.final();
+  return true;
+}
+
 bool llvm::writeClosedDwarfLineCertificateV1(const Module &M, raw_ostream &Out) {
   if (!M.isMaterialized() || !M.getTargetTriple().isOSBinFormatELF() ||
-      (PreserveBitcodeUseListOrder.getNumOccurrences() && !PreserveBitcodeUseListOrder))
+      !preserveUseListOrder(true))
     return false;
   DwarfLineCertificate Certificate;
   if (!Certificate.prepare(M))
@@ -5812,7 +5834,7 @@ bool llvm::writeClosedDwarfLineCertificateV1(const Module &M, raw_ostream &Out) 
     Writer.writeStrtab();
   }
   Bytes.append(StringRef(reinterpret_cast<const char *>(Context.data()), Context.size()));
-  return Certificate.write(Bytes, Out);
+  return Certificate.write(Bytes, M.getModuleIdentifier(), Out);
 }
 
 void BitcodeWriter::writeIndex(
