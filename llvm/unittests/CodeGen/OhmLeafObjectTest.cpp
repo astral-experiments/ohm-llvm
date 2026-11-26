@@ -367,6 +367,45 @@ protected:
   }
 };
 
+TEST_F(OhmLeafObject, EarlyReusePreservesWhichReturnsAreEqual) {
+  // The sibling returns 501 throughout. LLVM can merge the two functions
+  // when the edited return becomes 501, but not when it becomes 503.
+  enum class Peer { Mangled, Exported, WiderExport };
+  for (auto Kind : {Peer::Mangled, Peer::Exported, Peer::WiderExport}) {
+    auto make = [Kind](LLVMContext &C, unsigned Value, unsigned Upper = 974) {
+      auto M = rules(C, Value, Upper);
+      auto *F = M->getFunction(Sibling);
+      if (Kind != Peer::Mangled)
+        F->setName("exported");
+      if (Kind == Peer::WiderExport) {
+        // The return ranges match only after projection.
+        F->removeRetAttr(Attribute::Range);
+        F->addRetAttr(Attribute::get(
+            C, Attribute::Range, ConstantRange(APInt(16, 0), APInt(16, 976))));
+      }
+      return M;
+    };
+
+    LLVMContext Old, Equal, Distinct;
+    auto Before = make(Old, 502);
+    auto First = ohm_leaf::prepareEarly(*Before, "session");
+    auto Donor = emit(*Before);
+    auto Witness = ohm_leaf::enroll(First, Donor);
+    ASSERT_FALSE(Witness.empty());
+
+    auto Same = make(Equal, 501);
+    auto SameProof = ohm_leaf::prepareEarly(*Same, "session");
+    ASSERT_FALSE(SameProof.empty());
+    EXPECT_TRUE(ohm_leaf::tryReuse(SameProof, Witness, Donor).empty());
+
+    auto Renumbered = make(Distinct, 503, 975);
+    auto Proof = ohm_leaf::prepareEarly(*Renumbered, "session");
+    auto Actual = ohm_leaf::tryReuse(Proof, Witness, Donor);
+    ASSERT_FALSE(Actual.empty());
+    EXPECT_EQ(Actual, emit(*Renumbered));
+  }
+}
+
 TEST_F(OhmLeafObject, MatchesAFreshObjectAfterOneOfTwoEqualReturnsChanges) {
   LLVMContext Old, Current;
   auto Before = rules(Old, 501);

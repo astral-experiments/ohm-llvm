@@ -17,6 +17,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "OhmLeafObject.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringMap.h"
@@ -567,12 +568,9 @@ static std::string prepareLeaf(Module &M, StringRef Configuration, bool Early) {
     if (Tag.isValid() && Tag != Range)
       return {};
     Tag = Range;
-    if (auto Slot = isolatedLeaf(F, Tag.getValueAsConstantRange())) {
-      // Masking the last IR reference must not hide a context observer
-      // of the original integer from the optimizer input check.
-      if (Early && Slot->Value->isUsedByMetadata())
-        return {};
-      Leaves.push_back(*Slot);
+    if (!Early) {
+      if (auto Slot = isolatedLeaf(F, Tag.getValueAsConstantRange()))
+        Leaves.push_back(*Slot);
     }
   }
 
@@ -594,12 +592,23 @@ static std::string prepareLeaf(Module &M, StringRef Configuration, bool Early) {
                              ConstantRange(Range.getLower(), Rounded));
     for (auto &F : M) {
       AttributeList Attrs = F.getAttributes();
-      if (Attrs.getRetAttr(Attribute::Range) == Tag) {
-        if (!canProjectReturn(F, Tag))
+      auto Ret = Attrs.getRetAttr(Attribute::Range);
+      if (Early && !F.isDeclaration() && (Ret == Tag || Ret == To)) {
+        // Collect every definition with the projected return range. LLVM
+        // can merge a Rust function with an unmangled export, even if the
+        // export already had the wider range.
+        auto Slot = isolatedLeaf(F, Ret.getValueAsConstantRange());
+        // Masking the last IR reference must not hide a context observer
+        // of the original integer from the optimizer input check.
+        if (!Slot || Slot->Value->isUsedByMetadata())
           return {};
+        Leaves.push_back(*Slot);
+      } else if (Ret == Tag && !canProjectReturn(F, Tag)) {
+        return {};
+      }
+      if (Ret == Tag)
         Attrs = Attrs.removeRetAttribute(C, Attribute::Range)
                     .addRetAttribute(C, To);
-      }
       for (auto &Arg : F.args()) {
         unsigned N = Arg.getArgNo();
         if (Attrs.getParamAttr(N, Attribute::Range) != Tag)
@@ -666,10 +675,21 @@ static std::string prepareLeaf(Module &M, StringRef Configuration, bool Early) {
     return {};
   }
   BLAKE3 Hash;
-  Hash.update(Early ? "ohm-enum-optimizer-v1" : "ohm-enum-isel-v1");
+  Hash.update(Early ? "ohm-enum-optimizer-v2" : "ohm-enum-isel-v1");
   Hash.update(digest(Configuration));
   if (Early) {
     Hash.update(Closed);
+    if (Leaves.size() > 1) {
+      // LLVM can merge functions that return the same tag. Preserve which
+      // returns are equal without adding distinct constants to the bitcode.
+      SmallDenseMap<ConstantInt *, unsigned> Tags;
+      for (const auto &L : Leaves) {
+        unsigned Index = Tags.try_emplace(L.Value, Tags.size()).first->second;
+        char Bytes[2];
+        support::endian::write16le(Bytes, Index);
+        Hash.update(StringRef(Bytes, sizeof(Bytes)));
+      }
+    }
   } else {
     Hash.update(digest(M.getModuleIdentifier()));
     Hash.update(StringRef(IR, Size));
