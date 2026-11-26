@@ -38,6 +38,11 @@ public:
       : InsertLifetime(InsertLifetime) {}
 
   LLVM_ABI PreservedAnalyses run(Module &M, ModuleAnalysisManager &);
+
+  /// Also consider ordinary calls to functions of at most MaxInstructions.
+  LLVM_ABI PreservedAnalyses runWithSmallCallees(Module &M,
+                                                 ModuleAnalysisManager &,
+                                                 unsigned MaxInstructions);
 };
 
 /// Create a legacy pass manager instance of a pass to inline and remove
