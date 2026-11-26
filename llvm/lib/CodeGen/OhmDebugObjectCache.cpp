@@ -124,7 +124,8 @@ bool privateDirectory(StringRef Name) {
          S.st_uid == ::geteuid() && (S.st_mode & 0077) == 0;
 }
 std::unique_ptr<MemoryBuffer> readPrivate(StringRef Path, uint64_t Limit) {
-  int FD = ::open(Path.str().c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+  int FD = ::open(Path.str().c_str(),
+                  O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
   if (FD < 0)
     return nullptr;
   auto Close = scope_exit([&] { ::close(FD); });
@@ -190,7 +191,7 @@ std::optional<std::string>
 componentIdentity(const ohm::DebugObjectImage &Component, StringRef Maps,
                   StringRef Cache) {
   StringRef Path = Component.Path;
-  int FD = ::open(Component.Path.c_str(), O_RDONLY | O_CLOEXEC);
+  int FD = ::open(Component.Path.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC);
   if (FD < 0)
     return std::nullopt;
   auto Close = scope_exit([&] { ::close(FD); });
