@@ -428,7 +428,7 @@ bool ohm::rebindTraitImports(StringRef Object, StringRef Old, StringRef Current,
     return false;
   Old = Previous.Bytes;
   Current = Next.Bytes;
-  if (Old.empty() || Current.empty() || Old.back() || Current.back())
+  if ((!Old.empty() && Old.back()) || (!Current.empty() && Current.back()))
     return false;
   StringMap<StringRef> Renames;
   while (!Old.empty() && !Current.empty()) {
@@ -444,10 +444,10 @@ bool ohm::rebindTraitImports(StringRef Object, StringRef Old, StringRef Current,
     Old = OldTail;
     Current = NewTail;
   }
-  if (!Old.empty() || !Current.empty() || Renames.empty())
+  if (!Old.empty() || !Current.empty())
     return false;
   if (BeforeLines == AfterLines)
-    return renameObjectImports(Object, Renames, Output);
+    return !Renames.empty() && renameObjectImports(Object, Renames, Output);
   SourceMap Map;
   if (!compareLines(BeforeLines, AfterLines, Map))
     return false;
@@ -456,6 +456,10 @@ bool ohm::rebindTraitImports(StringRef Object, StringRef Old, StringRef Current,
   if (!Rebased) {
     consumeError(Rebased.takeError());
     return false;
+  }
+  if (Renames.empty()) {
+    Output.assign(Rebased->Bytes.begin(), Rebased->Bytes.end());
+    return true;
   }
   return renameObjectImports(
       StringRef(Rebased->Bytes.data(), Rebased->Bytes.size()), Renames, Output);
