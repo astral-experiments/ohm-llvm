@@ -8,6 +8,7 @@
 
 #include "OhmDebugObjectCache.h"
 #include "OhmLeafObject.h"
+#include "OhmTraitImports.h"
 #include "llvm-c/Core.h"
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/SmallVector.h"
@@ -245,7 +246,7 @@ struct Invocation {
   bool imagesUnchanged() const {
     return Generation && Generation == ohm::getDebugObjectImageGeneration();
   }
-  explicit Invocation(bool Leaf = false) {
+  explicit Invocation(bool ForLineObjects = false) {
     if (std::getenv("OHM_DISABLE_DEBUG_OBJECT_CACHE"))
       return;
     auto Cmd = MemoryBuffer::getFileAsStream("/proc/self/cmdline");
@@ -265,18 +266,17 @@ struct Invocation {
       StringRef A = Args[I], Key, V;
       // Cargo requests this frontend lint when compiling workspace crates.
       // The whole command line still contributes to the object namespace.
-      if (Leaf && A == "--force-warn=unused_crate_dependencies")
+      if (ForLineObjects && A == "--force-warn=unused_crate_dependencies")
         continue;
       if (A.starts_with("--")) {
         std::tie(Key, V) = A.split('=');
         if (Key == "--force-warn")
           ForceWarn = true;
-        else if (!contains({"--crate-name", "--crate-type", "--edition",
-                            "--emit", "--error-format", "--json", "--out-dir",
-                            "--extern", "--check-cfg", "--cfg", "--allow",
-                            "--warn", "--deny", "--forbid", "--cap-lints",
-                            "--remap-path-scope"},
-                           Key))
+        else if (!contains({"--crate-name", "--crate-type", "--edition", "--emit",
+                       "--error-format", "--json", "--out-dir", "--extern",
+                       "--check-cfg", "--cfg", "--allow", "--warn", "--deny",
+                       "--forbid", "--cap-lints", "--remap-path-scope"},
+                      Key))
           return;
         if (!A.contains('=')) {
           if (++I == Args.size())
@@ -424,10 +424,10 @@ struct Invocation {
     Root = std::move(Base);
   }
 };
-Invocation &invocation(bool Leaf = false) {
-  if (Leaf) {
-    static Invocation ForLeaf(/*Leaf=*/true);
-    return ForLeaf;
+Invocation &invocation(bool ForLineObjects = false) {
+  if (ForLineObjects) {
+    static Invocation WithLines(/*ForLineObjects=*/true);
+    return WithLines;
   }
   static Invocation I;
   return I;
@@ -597,8 +597,23 @@ std::string exactObjectKey(Module &M, const Invocation &I, StringRef Target) {
   return toHex(H.final(), true);
 }
 
-StringRef exactObjectPayload(StringRef Record, StringRef Key) {
-  if (!Record.consume_front("OHMOBJ01") || Record.size() < 64)
+constexpr StringLiteral ExactMagic("OHMOBJ01");
+
+bool saveCheckedObject(StringRef Path, StringRef Key, StringRef Object,
+                       StringRef Header = ExactMagic) {
+  if (Object.size() > MaxOrigin - Header.size() - 64 ||
+      !Object.starts_with("\x7f"
+                          "ELF"))
+    return false;
+  BLAKE3 H;
+  frame(H, Key);
+  frame(H, Object);
+  auto Sum = toHex(H.final(), true);
+  return writeAtomic(Path, {Header, Sum, Object});
+}
+StringRef exactObjectPayload(StringRef Record, StringRef Key,
+                             StringRef Header = ExactMagic) {
+  if (!Record.consume_front(Header) || Record.size() < 64)
     return {};
   auto Stored = Record.take_front(64);
   auto Payload = Record.drop_front(64);
@@ -618,12 +633,19 @@ std::string machineTarget(const Module &M, const TargetMachine &TM) {
          std::to_string(unsigned(TM.getCodeModel())) + "|" +
          M.getDataLayoutStr();
 }
+struct TraitOrigin {
+  const TargetMachine *TM;
+  SmallVector<char, 0> Manifest;
+  std::string Key;
+  std::string Object;
+};
 struct LeafOrigin {
   const TargetMachine *Target;
   std::string Proof;
   std::string Object;
 };
 struct EarlyOrigin {
+  std::unique_ptr<TraitOrigin> Trait;
   Module *Input;
   std::string Key;
   std::string MachineKey;
@@ -633,6 +655,86 @@ struct EarlyOrigin {
       : Input(&M), Key(std::move(K)), Diagnostics(M.getContext()) {}
 };
 thread_local std::weak_ptr<EarlyOrigin> PendingEarly;
+constexpr StringLiteral TraitMagic("OHMTRAI2");
+
+// The checked payload contains the original ELF, followed by the line
+// certificate and import manifest. Only deliver the ELF after rebinding.
+bool splitTraitRecord(StringRef Payload, StringRef &Object,
+                      StringRef &Imports) {
+  if (Payload.size() < 8)
+    return false;
+  uint64_t Size = support::endian::read64le(Payload.take_back(8).data());
+  Payload = Payload.drop_back(8);
+  if (!Size || Size >= Payload.size())
+    return false;
+  Imports = Payload.take_back(Size);
+  Object = Payload.drop_back(Size);
+  return true;
+}
+
+// An imported Rust default method can move when its original provider stops
+// using it. Look for the same closed optimizer input with that provider and
+// source lines projected out, then check the exact changes before replay.
+bool tryTraitObject(Module &M, TargetMachine &TM, const Invocation &I,
+                    StringRef Output, void **Ticket) {
+  if (TM.getOptLevel() != CodeGenOptLevel::Less)
+    return false;
+  auto Trait = std::make_unique<TraitOrigin>();
+  Trait->TM = &TM;
+  SmallVector<char, 0> Input;
+  BLAKE3 H;
+  frame(H, TraitMagic);
+  frame(H, I.Namespace);
+  frame(H, machineTarget(M, TM));
+  frame(H, M.getModuleIdentifier());
+  // A ticket suppresses optimized DWARF replay in rustc.
+  // A second generation with the same imports cannot reuse the first by
+  // rebinding a name. Remember only the latest roster digest per CGU and
+  // skip serialization until its imports change again. This may forgo
+  // refreshing a donor on body edits. The marker is a negative hint only:
+  // a race or interrupted compilation can cost a hit, never grant one.
+  auto Changed = [&](StringRef Imports) {
+    BLAKE3 Slot;
+    frame(Slot, "ohm-trait-import-hint-v1");
+    frame(Slot, M.getModuleIdentifier());
+    auto Path = joinPath(I.Entries, "llvmcache-" + toHex(Slot.final(), true));
+    BLAKE3 Roster;
+    Roster.update(Imports);
+    auto Digest = toHex(Roster.final(), true);
+    if (auto Last = readPrivate(Path, Digest.size()))
+      if (Last->getBuffer() == Digest)
+        return false;
+    writeAtomic(Path, {Digest});
+    return true;
+  };
+  if (!ohm::writeTraitImportSignature(M, Input, Trait->Manifest, Changed) ||
+      Trait->Manifest.size() >= MaxOrigin)
+    return false;
+  frame(H, StringRef(Input.data(), Input.size()));
+  auto Key = toHex(H.final(), true);
+  StringRef Current(Trait->Manifest.data(), Trait->Manifest.size());
+  auto Saved = readPrivate(joinPath(I.Entries, "llvmcache-" + Key), MaxOrigin);
+  StringRef ObjectBytes, Manifest;
+  if (Saved &&
+      splitTraitRecord(exactObjectPayload(Saved->getBuffer(), Key, TraitMagic),
+                       ObjectBytes, Manifest)) {
+    if (Current == Manifest)
+      return false;
+    SmallVector<char, 0> Object;
+    if (ohm::rebindTraitImports(ObjectBytes, Manifest, Current, Object) &&
+        I.imagesUnchanged() &&
+        writeAtomic(Output, {StringRef(Object.data(), Object.size())}, 0666)) {
+      event(M.getModuleIdentifier(), "trait-import-hit");
+      return true;
+    }
+  }
+  Trait->Key = std::move(Key);
+  auto Origin = std::make_shared<EarlyOrigin>(M, std::string());
+  Origin->Trait = std::move(Trait);
+  PendingEarly = Origin;
+  *Ticket = new std::shared_ptr<EarlyOrigin>(std::move(Origin));
+  return false;
+}
 
 // Check the binding to this exact object before adjusting any leaf.
 std::string loadLeafObject(StringRef Path, StringRef Proof) {
@@ -657,6 +759,14 @@ void startLeafObject(Module &M, TargetMachine &TM, const Invocation &I,
   frame(H, machineTarget(M, TM));
   frame(H, M.getModuleIdentifier());
   auto Key = toHex(H.final(), true);
+  if (*Ticket) {
+    // Both caches can enroll the object emitted for this module. Share
+    // its diagnostic observation and retain their independent keys.
+    auto &Origin = *static_cast<std::shared_ptr<EarlyOrigin> *>(*Ticket);
+    Origin->Key = std::move(Key);
+    Origin->Leaf = LeafOrigin{&TM, {}, {}};
+    return;
+  }
   auto Origin = std::make_shared<EarlyOrigin>(M, std::move(Key));
   Origin->Leaf = LeafOrigin{&TM, {}, {}};
   PendingEarly = Origin;
@@ -701,13 +811,6 @@ bool runExactObjectCache(Module &M, const Invocation &I, StringRef Target,
   if (Key.empty())
     return Emit();
   std::string Path = joinPath(I.Entries, "llvmcache-" + Key);
-  constexpr StringLiteral Header("OHMOBJ01");
-  auto Checksum = [&](StringRef Object) {
-    BLAKE3 Digest;
-    frame(Digest, Key);
-    frame(Digest, Object);
-    return toHex(Digest.final(), true);
-  };
   if (auto Saved = readPrivate(Path, MaxOrigin)) {
     StringRef Object = exactObjectPayload(Saved->getBuffer(), Key);
     if (!Object.empty() && I.imagesUnchanged()) {
@@ -725,14 +828,9 @@ bool runExactObjectCache(Module &M, const Invocation &I, StringRef Target,
     event(M.getModuleIdentifier(), "bypass", "machine diagnostics");
     return Changed;
   }
-  if (Object.starts_with("\x7f"
-                         "ELF") &&
-      Object.size() <= MaxOrigin - Header.size() - 64 && I.imagesUnchanged()) {
-    std::string Sum = Checksum(Object);
-    if (writeAtomic(Path, {Header, Sum, Object})) {
-      observedMachineObject(M, Key);
-      event(M.getModuleIdentifier(), "committed", "exact machine input");
-    }
+  if (I.imagesUnchanged() && saveCheckedObject(Path, Key, Object)) {
+    observedMachineObject(M, Key);
+    event(M.getModuleIdentifier(), "committed", "exact machine input");
   }
   return Changed;
 }
@@ -778,7 +876,7 @@ bool llvm::ohm::runLeafObjectCache(Module &M, CodeGenTargetMachineImpl &TM,
   Leaf.Proof = ohm_leaf::prepare(M, Origin->Key);
   if (Leaf.Proof.empty())
     return Emit();
-  const auto &I = invocation(/*Leaf=*/true);
+  const auto &I = invocation(/*ForLineObjects=*/true);
   auto Path = joinPath(I.Entries, "llvmcache-" + Origin->Key);
   auto Object = loadLeafObject(Path, Leaf.Proof);
   if (!Object.empty() && I.imagesUnchanged()) {
@@ -799,6 +897,21 @@ bool llvm::ohm::runDebugObjectCache(Module &M, CodeGenTargetMachineImpl &TM,
                                     raw_svector_ostream &Out,
                                     function_ref<bool()> Emit) {
 #if defined(__linux__) && defined(__x86_64__)
+  // Bind the donor to the bytes produced for this live module, before the
+  // caller writes its object file. Finish the record only on rustc success.
+  auto Pending = PendingEarly.lock();
+  TraitOrigin *Trait = nullptr;
+  if (Pending && Pending->Input == &M && Pending->Trait &&
+      Pending->Trait->TM == &TM && Out.str().empty()) {
+    Trait = Pending->Trait.get();
+    if (!Pending->Leaf)
+      PendingEarly.reset();
+  }
+  auto Capture = scope_exit([&] {
+    if (Trait && Out.str().size() <= MaxOrigin - Trait->Manifest.size())
+      Trait->Object = Out.str().str();
+  });
+
   // This precedes all cache filesystem activity, including toolchain identity
   // reads and the creation of source or object directories.
   if (!Out.str().empty() ||
@@ -994,15 +1107,16 @@ extern "C" int ohm_early_object_begin_v1(LLVMModuleRef Ref,
       !sys::path::is_absolute(StringRef(Output, Length)) ||
       std::getenv("OHM_DISABLE_EARLY_OBJECT_CACHE"))
     return 0;
-  bool WithoutDebug = !M.getNamedMetadata("llvm.dbg.cu");
   // Rust probes this cache before the line-table cache on regular
   // incremental units. Prepare the module before taking either key.
-  if (!WithoutDebug && invocation().PrepareComparisons)
+  if (M.getNamedMetadata("llvm.dbg.cu") && invocation().PrepareComparisons)
     ohm::prepareLocalTraitComparisons(M);
-  if (WithoutDebug ? !ohm::isLargeDebugObjectInput(M, true)
-                   : !ohm_leaf::candidate(M))
+  const bool WithoutDebug = !M.getNamedMetadata("llvm.dbg.cu");
+  const bool Large = ohm::isLargeDebugObjectInput(M, true);
+  const bool Leaf = !WithoutDebug && ohm_leaf::candidate(M);
+  if (!Large && !Leaf)
     return 0;
-  const auto &I = invocation(/*Leaf=*/!WithoutDebug);
+  const auto &I = invocation(/*ForLineObjects=*/!WithoutDebug);
   if (I.Root.empty() || I.WithoutDebug != WithoutDebug || !I.imagesUnchanged() ||
       !ordinaryModule(M, I.WithoutDebug))
     return 0;
@@ -1014,7 +1128,11 @@ extern "C" int ohm_early_object_begin_v1(LLVMModuleRef Ref,
   if (!WithoutDebug) {
     if (!ohm::canUseDebugObjectCache())
       return 0;
-    startLeafObject(M, *reinterpret_cast<TargetMachine *>(TM), I, Ticket);
+    auto &Machine = *reinterpret_cast<TargetMachine *>(TM);
+    if (Large && tryTraitObject(M, Machine, I, StringRef(Output, Length), Ticket))
+      return 1;
+    if (Leaf)
+      startLeafObject(M, Machine, I, Ticket);
     return 0;
   }
   SmallVector<char, 128> State;
@@ -1066,11 +1184,26 @@ extern "C" void ohm_early_object_end_v1(void *Ticket, int Completed) {
   if (!Holder || !Completed)
     return;
   const auto &Entry = **Holder;
-  const auto &I = invocation(Entry.Leaf.has_value());
+  const auto &I = invocation(Entry.Trait || Entry.Leaf);
   if (Entry.Diagnostics.hasDiagnostics() || !I.imagesUnchanged())
     return;
   if (Entry.Leaf)
-    return storeLeafObject(joinPath(I.Entries, "llvmcache-" + Entry.Key), Entry);
+    storeLeafObject(joinPath(I.Entries, "llvmcache-" + Entry.Key), Entry);
+  if (Entry.Trait) {
+    auto &R = *Entry.Trait;
+    if (R.Object.empty())
+      return;
+    R.Object.append(R.Manifest.data(), R.Manifest.size());
+    char Size[8];
+    support::endian::write64le(Size, R.Manifest.size());
+    R.Object.append(Size, sizeof(Size));
+    if (saveCheckedObject(joinPath(I.Entries, "llvmcache-" + R.Key),
+                          R.Key, R.Object, TraitMagic))
+      event(Entry.Input->getModuleIdentifier(), "trait-import-committed");
+    return;
+  }
+  if (Entry.Leaf)
+    return;
   if (Entry.MachineKey.empty())
     return;
   auto Sum = earlyIndexChecksum(Entry.Key, Entry.MachineKey);
