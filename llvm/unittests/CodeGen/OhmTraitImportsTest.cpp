@@ -84,6 +84,31 @@ static bool signature(StringRef IR, Bytes &Input) {
   return M && ohm::writeTraitImportSignature(*M, Input, Names);
 }
 
+TEST(OhmTraitImports, EmptyImportRosterHasCompleteProof) {
+  auto Capture = [](StringRef IR, Bytes &Key, Bytes &Manifest) {
+    LLVMContext C;
+    auto M = read(C, IR);
+    return M && ohm::writeTraitImportSignature(
+                    *M, Key, Manifest, [](StringRef Names) {
+                      return Names.empty();
+                    });
+  };
+  auto Baseline = withLines("ordinary", 80, 'a');
+  Bytes Key, Manifest, ChangedKey, ChangedManifest, SameKey, SameManifest;
+  ASSERT_TRUE(Capture(Baseline, Key, Manifest));
+  ASSERT_TRUE(Capture(withLines("other", 80, 'a'), ChangedKey, ChangedManifest));
+  EXPECT_NE(Key, ChangedKey);
+  EXPECT_NE(Manifest, ChangedManifest);
+  ASSERT_TRUE(Capture(Baseline, SameKey, SameManifest));
+  EXPECT_EQ(Key, SameKey);
+  EXPECT_EQ(Manifest, SameManifest);
+
+  Bytes MovedKey, MovedManifest;
+  ASSERT_TRUE(Capture(withLines("ordinary", 82, 'b'), MovedKey, MovedManifest));
+  EXPECT_EQ(Key, MovedKey);
+  EXPECT_NE(Manifest, MovedManifest);
+}
+
 TEST(OhmTraitImports, KeepsLiteralAndMethodInKey) {
   LLVMContext C;
   auto M = read(C, source(Name));

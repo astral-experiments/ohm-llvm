@@ -204,8 +204,8 @@ bool ohm::writeTraitImportSignature(const Module &M, SmallVectorImpl<char> &Key,
     Imports.append(F.getName().begin(), F.getName().end());
     Imports.push_back('\0');
   }
-  if (Paths.empty() ||
-      (ShouldProbe && !ShouldProbe(StringRef(Imports.data(), Imports.size()))))
+  StringRef Roster(Imports.data(), Imports.size());
+  if (ShouldProbe ? !ShouldProbe(Roster) : Roster.empty())
     return false;
 
   // Assembly can reference spelling-dependent symbols outside IR use lists.
