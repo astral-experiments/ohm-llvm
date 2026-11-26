@@ -247,6 +247,9 @@ struct InlineParams {
 LLVM_ABI std::optional<int> getStringFnAttrAsInt(CallBase &CB,
                                                  StringRef AttrKind);
 
+/// Whether a command-line option overrides an inline cost threshold.
+LLVM_ABI bool hasInlineThresholdOverride();
+
 /// Generate the parameters to tune the inline cost analysis based only on the
 /// commandline options.
 LLVM_ABI InlineParams getInlineParams();

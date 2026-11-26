@@ -3364,6 +3364,14 @@ InlineResult llvm::isInlineViable(Function &F) {
 // APIs to create InlineParams based on command line flags and/or other
 // parameters.
 
+bool llvm::hasInlineThresholdOverride() {
+  return InlineThreshold.getNumOccurrences() ||
+         HintThreshold.getNumOccurrences() || ColdThreshold.getNumOccurrences() ||
+         ColdCallSiteThreshold.getNumOccurrences() ||
+         HotCallSiteThreshold.getNumOccurrences() ||
+         LocallyHotCallSiteThreshold.getNumOccurrences();
+}
+
 InlineParams llvm::getInlineParams(int Threshold) {
   InlineParams Params;
 
