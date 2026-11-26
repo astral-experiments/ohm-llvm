@@ -8,6 +8,7 @@ add_llvm_component_library(LLVMCore
   BuiltinGCs.cpp
   BundleAttributes.cpp
   Comdat.cpp
+  ClosedOptimizerContext.cpp
   ConstantFold.cpp
   ConstantFPRange.cpp
   ConstantRange.cpp
