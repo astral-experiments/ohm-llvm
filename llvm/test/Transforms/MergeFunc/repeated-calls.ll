@@ -1,5 +1,5 @@
 ; RUN: opt -passes=merge-repeated-calls -verify-each -S %s | FileCheck %s
-; RUN: opt -passes='default<O1>' -verify-each -S %s | FileCheck %s --check-prefix=LINK --implicit-check-not='call void @unresolved'
+; RUN: opt -passes='default<O1>' -verify-each -S %s | FileCheck %s --check-prefix=LINK --implicit-check-not='call void @unresolved' --implicit-check-not='@_Rdiscarded'
 ; RUN: sed '/^!llvm.ident/d' %s | opt -passes=merge-repeated-calls -S | FileCheck %s --check-prefix=OTHER
 ; RUN: sed 's/^; COLLISION: //' %s | opt -passes=merge-repeated-calls -S | FileCheck %s --check-prefix=OTHER
 ; REQUIRES: x86-registered-target
@@ -232,6 +232,49 @@ recurse:
   call void @_Rrecursive(i32 %nn)
   call void @_Rdone(i32 %n)
   ret void
+}
+
+; Float2Int proves the comparison false after the first dead argument
+; elimination pass. Discard the now-unused target in the forwarding calls.
+declare void @_RdiscardedA()
+declare void @_RdiscardedB()
+
+define i8 @_RfloatA(i8 %x) {
+  %f = uitofp i8 %x to double
+  %v = fsub double %f, 2.0
+  %bad = fcmp olt double %v, -3.0
+  br i1 %bad, label %fail, label %end
+
+fail:
+  call void @_RdiscardedA()
+  br label %end
+
+end:
+  %p = mul i8 %x, %x
+  %a = shl i8 %x, 3
+  %b = xor i8 %p, %a
+  %c = lshr i8 %x, 2
+  %d = add i8 %b, %c
+  ret i8 %d
+}
+
+define i8 @_RfloatB(i8 %x) {
+  %f = uitofp i8 %x to double
+  %v = fsub double %f, 2.0
+  %bad = fcmp olt double %v, -3.0
+  br i1 %bad, label %fail, label %end
+
+fail:
+  call void @_RdiscardedB()
+  br label %end
+
+end:
+  %p = mul i8 %x, %x
+  %a = shl i8 %x, 3
+  %b = xor i8 %p, %a
+  %c = lshr i8 %x, 2
+  %d = add i8 %b, %c
+  ret i8 %d
 }
 
 !llvm.ident = !{!0}
