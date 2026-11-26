@@ -53,6 +53,10 @@ struct OrderMap {
   DenseMap<const Value *, std::pair<unsigned, bool>> IDs;
   unsigned LastGlobalValueID = 0;
 
+  // Only the machine use manifest records absolute IDs. Shuffle predictions
+  // depend on relative order and can omit ConstantData (which has no users
+  // or operands to visit).
+  bool NeedAbsoluteIDs = false;
   OrderMap() = default;
 
   bool isGlobalValue(unsigned ID) const {
@@ -76,7 +80,7 @@ struct OrderMap {
 } // end anonymous namespace
 
 static void orderValue(const Value *V, OrderMap &OM) {
-  if (OM.lookup(V).first)
+  if ((!OM.NeedAbsoluteIDs && isa<ConstantData>(V)) || OM.lookup(V).first)
     return;
 
   if (const Constant *C = dyn_cast<Constant>(V)) {
@@ -95,10 +99,13 @@ static void orderValue(const Value *V, OrderMap &OM) {
   OM.index(V);
 }
 
-static OrderMap orderModule(const Module &M) {
+static OrderMap orderModule(const Module &M, ValueEnumerationHints Hints,
+                            bool NeedAbsoluteIDs) {
   // This needs to match the order used by ValueEnumerator::ValueEnumerator()
   // and ValueEnumerator::incorporateFunction().
   OrderMap OM;
+  OM.IDs.reserve(Hints.InstructionCount);
+  OM.NeedAbsoluteIDs = NeedAbsoluteIDs;
 
   // Initializers of GlobalValues are processed in
   // BitcodeReader::ResolveGlobalAndAliasInits().  Match the order there rather
@@ -130,35 +137,37 @@ static OrderMap orderModule(const Module &M) {
     // and WriteFunction().  Basic blocks are implicitly declared before
     // anything else (by declaring their size).
     for (const BasicBlock &BB : F)
-      orderValue(&BB, OM);
+      OM.index(&BB);
 
     // Metadata used by instructions is decoded before the actual instructions,
     // so visit any constants used by it beforehand.
-    for (const BasicBlock &BB : F)
-      for (const Instruction &I : BB) {
-        auto OrderConstantFromMetadata = [&](Metadata *MD) {
-          if (const auto *VAM = dyn_cast<ValueAsMetadata>(MD)) {
-            orderConstantValue(VAM->getValue());
-          } else if (const auto *AL = dyn_cast<DIArgList>(MD)) {
-            for (const auto *VAM : AL->getArgs())
+    if (Hints.MayHaveMetadataOperands) {
+      for (const BasicBlock &BB : F)
+        for (const Instruction &I : BB) {
+          auto OrderConstantFromMetadata = [&](Metadata *MD) {
+            if (const auto *VAM = dyn_cast<ValueAsMetadata>(MD)) {
               orderConstantValue(VAM->getValue());
+            } else if (const auto *AL = dyn_cast<DIArgList>(MD)) {
+              for (const auto *VAM : AL->getArgs())
+                orderConstantValue(VAM->getValue());
+            }
+          };
+
+          for (DbgVariableRecord &DVR : filterDbgVars(I.getDbgRecordRange())) {
+            OrderConstantFromMetadata(DVR.getRawLocation());
+            if (DVR.isDbgAssign())
+              OrderConstantFromMetadata(DVR.getRawAddress());
           }
-        };
 
-        for (DbgVariableRecord &DVR : filterDbgVars(I.getDbgRecordRange())) {
-          OrderConstantFromMetadata(DVR.getRawLocation());
-          if (DVR.isDbgAssign())
-            OrderConstantFromMetadata(DVR.getRawAddress());
+          for (const Value *V : I.operands()) {
+            if (const auto *MAV = dyn_cast<MetadataAsValue>(V))
+              OrderConstantFromMetadata(MAV->getMetadata());
+          }
         }
-
-        for (const Value *V : I.operands()) {
-          if (const auto *MAV = dyn_cast<MetadataAsValue>(V))
-            OrderConstantFromMetadata(MAV->getMetadata());
-        }
-      }
+    }
 
     for (const Argument &A : F.args())
-      orderValue(&A, OM);
+      OM.index(&A);
     for (const BasicBlock &BB : F)
       for (const Instruction &I : BB) {
         for (const Value *Op : I.operands())
@@ -169,7 +178,7 @@ static OrderMap orderModule(const Module &M) {
           for (const auto &Case : SI->cases())
             orderValue(Case.getCaseValue(), OM);
         }
-        orderValue(&I, OM);
+        OM.index(&I);
       }
   }
   return OM;
@@ -178,53 +187,30 @@ static OrderMap orderModule(const Module &M) {
 static void predictValueUseListOrderImpl(const Value *V, const Function *F,
                                          unsigned ID, const OrderMap &OM,
                                          UseListOrderStack &Stack) {
-  // Predict use-list order for this one.
-  using Entry = std::pair<const Use *, unsigned>;
-  SmallVector<Entry, 64> List;
-  for (const Use &U : V->uses())
-    // Check if this user will be serialized.
-    if (OM.lookup(U.getUser()).first)
-      List.push_back(std::make_pair(&U, List.size()));
-
-  if (List.size() < 2)
-    // We may have lost some users.
-    return;
-
-  bool IsGlobalValue = OM.isGlobalValue(ID);
-  llvm::sort(List, [&](const Entry &L, const Entry &R) {
-    const Use *LU = L.first;
-    const Use *RU = R.first;
-    if (LU == RU)
-      return false;
-
-    auto LID = OM.lookup(LU->getUser()).first;
-    auto RID = OM.lookup(RU->getUser()).first;
-
-    // If ID is 4, then expect: 7 6 5 1 2 3.
-    if (LID < RID) {
-      if (RID <= ID)
-        if (!IsGlobalValue) // GlobalValue uses don't get reversed.
-          return true;
-      return false;
+  // The reader prepends uses, except for forward references to non-globals
+  // which it resolves together. For ID 4 the order of user IDs would be
+  // 7, 6, 5, 1, 2, 3. Compute the sort key once per use before sorting.
+  using Entry = std::pair<uint64_t, unsigned>;
+  SmallVector<Entry, 16> List;
+  uint32_t Pivot = OM.isGlobalValue(ID) ? 0 : ID;
+  for (const Use &U : V->uses()) {
+    uint32_t UserID = OM.lookup(U.getUser()).first;
+    if (!UserID)
+      continue;
+    uint32_t Operand = U.getOperandNo();
+    uint64_t Key;
+    if (UserID > Pivot) {
+      // Later users come first, with descending user ID and operand index.
+      Key = ~((uint64_t(UserID) << 32) | Operand);
+    } else {
+      // Rank forward references after all later users, in ascending order.
+      Key = (uint64_t(UINT32_MAX - Pivot + UserID) << 32) | Operand;
     }
-    if (RID < LID) {
-      if (LID <= ID)
-        if (!IsGlobalValue) // GlobalValue uses don't get reversed.
-          return false;
-      return true;
-    }
-
-    // LID and RID are equal, so we have different operands of the same user.
-    // Assume operands are added in order for all instructions.
-    if (LID <= ID)
-      if (!IsGlobalValue) // GlobalValue uses don't get reversed.
-        return LU->getOperandNo() < RU->getOperandNo();
-    return LU->getOperandNo() > RU->getOperandNo();
-  });
-
-  if (llvm::is_sorted(List, llvm::less_second()))
-    // Order is already correct.
+    List.emplace_back(Key, List.size());
+  }
+  if (llvm::is_sorted(List))
     return;
+  llvm::sort(List);
 
   // Store the shuffle.
   Stack.emplace_back(V, F, List.size());
@@ -238,6 +224,10 @@ static void predictValueUseListOrder(const Value *V, const Function *F,
   if (!V->hasUseList())
     return;
 
+  bool MultipleUses = !V->use_empty() && !V->hasOneUse();
+  if (!MultipleUses && !isa<Constant>(V))
+    return;
+
   auto &IDPair = OM[V];
   assert(IDPair.first && "Unmapped value");
   if (IDPair.second)
@@ -246,7 +236,7 @@ static void predictValueUseListOrder(const Value *V, const Function *F,
 
   // Do the actual prediction.
   IDPair.second = true;
-  if (!V->use_empty() && std::next(V->use_begin()) != V->use_end())
+  if (MultipleUses)
     predictValueUseListOrderImpl(V, F, IDPair.first, OM, Stack);
 
   // Recursive descent into constants.
@@ -523,8 +513,9 @@ static bool hasCompleteMachineUses(const Module &M, const OrderMap &OM,
 }
 
 static UseListOrderStack predictUseListOrder(const Module &M,
-                                             MachineUseState *Uses) {
-  OrderMap OM = orderModule(M);
+                                             MachineUseState *Uses,
+                                             ValueEnumerationHints Hints) {
+  OrderMap OM = orderModule(M, Hints, Uses != nullptr);
 
   // Use-list orders need to be serialized after all the users have been added
   // to a value, or else the shuffles will be incomplete.  Store them per
@@ -605,10 +596,13 @@ static bool isIntOrIntVectorValue(const std::pair<const Value*, unsigned> &V) {
 
 ValueEnumerator::ValueEnumerator(const Module &M,
                                  bool ShouldPreserveUseListOrder,
-                                 MachineUseState *Uses)
+                                 MachineUseState *Uses,
+                                 ValueEnumerationHints Hints)
     : ShouldPreserveUseListOrder(ShouldPreserveUseListOrder) {
   if (ShouldPreserveUseListOrder)
-    UseListOrders = predictUseListOrder(M, Uses);
+    UseListOrders = predictUseListOrder(M, Uses, Hints);
+  MetadataMap.reserve(Hints.InstructionCount / 2);
+  ValueMap.reserve(Hints.InstructionCount / 4);
 
   // Enumerate the global variables.
   for (const GlobalVariable &GV : M.globals()) {
@@ -777,20 +771,10 @@ ValueEnumerator::ValueEnumerator(const Module &M,
   organizeMetadata();
 }
 
-unsigned ValueEnumerator::getInstructionID(const Instruction *Inst) const {
-  InstructionMapType::const_iterator I = InstructionMap.find(Inst);
-  assert(I != InstructionMap.end() && "Instruction is not mapped!");
-  return I->second;
-}
-
 unsigned ValueEnumerator::getComdatID(const Comdat *C) const {
   unsigned ComdatID = Comdats.idFor(C);
   assert(ComdatID && "Comdat not found!");
   return ComdatID;
-}
-
-void ValueEnumerator::setInstructionID(const Instruction *I) {
-  InstructionMap[I] = InstructionCount++;
 }
 
 unsigned ValueEnumerator::getAggregateOperandID(const Constant *C,
@@ -1120,23 +1104,49 @@ void ValueEnumerator::organizeMetadata() {
   if (MDs.empty())
     return;
 
-  // Copy out the index information from MetadataMap in order to choose a new
-  // order.
+  // Group by function ID and metadata kind, preserving the original ID
+  // order within each group. MDs was populated in increasing ID order.
   SmallVector<MDIndex, 64> Order;
-  Order.reserve(MetadataMap.size());
-  for (const Metadata *MD : MDs)
-    Order.push_back(MetadataMap.lookup(MD));
+  SmallVector<uint64_t, 64> Groups;
+  Groups.reserve(MDs.size());
+  uint64_t Largest = 0;
+  for (const Metadata *MD : MDs) {
+    uint64_t FunctionID = MetadataMap.lookup(MD).F;
+    uint64_t Group = 4 * FunctionID + getMetadataTypeOrder(MD);
+    Groups.push_back(Group);
+    Largest = std::max(Largest, Group);
+  }
 
-  // Partition:
-  //   - by function, then
-  //   - by isa<MDString>
-  // and then sort by the original/current ID.  Since the IDs are guaranteed to
-  // be unique, the result of llvm::sort will be deterministic.  There's no need
-  // for std::stable_sort.
-  llvm::sort(Order, [this](MDIndex LHS, MDIndex RHS) {
-    return std::make_tuple(LHS.F, getMetadataTypeOrder(LHS.get(MDs)), LHS.ID) <
-           std::make_tuple(RHS.F, getMetadataTypeOrder(RHS.get(MDs)), RHS.ID);
-  });
+  // Function IDs come from the value table, so they can be sparse in a
+  // module with many globals. Bound both time and memory for counting by
+  // the metadata population, falling back to sorting for sparse IDs.
+  Order.resize(MDs.size());
+  if (Largest / 4 < MDs.size() && Largest < UINT32_MAX) {
+    SmallVector<unsigned, 64> Offsets(Largest + 1);
+    for (uint64_t Group : Groups)
+      ++Offsets[Group];
+    unsigned Start = 0;
+    for (unsigned &Offset : Offsets) {
+      unsigned Count = Offset;
+      Offset = Start;
+      Start += Count;
+    }
+    for (unsigned I = 0; I < Groups.size(); ++I) {
+      uint64_t Group = Groups[I];
+      MDIndex &Entry = Order[Offsets[Group]++];
+      Entry.F = Group / 4;
+      Entry.ID = I + 1;
+    }
+  } else {
+    for (unsigned I = 0; I < Groups.size(); ++I) {
+      Order[I].F = Groups[I] / 4;
+      Order[I].ID = I + 1;
+    }
+    llvm::sort(Order, [&Groups](MDIndex L, MDIndex R) {
+      return std::tie(Groups[L.ID - 1], L.ID) <
+             std::tie(Groups[R.ID - 1], R.ID);
+    });
+  }
 
   // Rebuild MDs, index the metadata ranges for each function in FunctionMDs,
   // and fix up MetadataMap.
@@ -1348,7 +1358,6 @@ void ValueEnumerator::EnumerateAttributes(AttributeList PAL) {
 }
 
 void ValueEnumerator::incorporateFunction(const Function &F) {
-  InstructionCount = 0;
   NumModuleValues = Values.size();
 
   // Add global metadata to the function block.  This doesn't include

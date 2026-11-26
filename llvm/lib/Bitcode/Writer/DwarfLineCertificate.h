@@ -9,9 +9,10 @@
 #ifndef LLVM_LIB_BITCODE_WRITER_DWARFLINECERTIFICATE_H
 #define LLVM_LIB_BITCODE_WRITER_DWARFLINECERTIFICATE_H
 
+#include "ValueEnumerator.h"
 #include "llvm/ADT/DenseMap.h"
-#include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Module.h"
@@ -94,7 +95,11 @@ class DwarfLineCertificate {
     }
   }
 
+  llvm::ValueEnumerationHints Hints{0, false};
+
 public:
+  llvm::ValueEnumerationHints enumerationHints() const { return Hints; }
+
   bool prepare(const llvm::Module &M) {
     unsigned Units = 0;
     for (const auto *CU : M.debug_compile_units()) {
@@ -130,11 +135,16 @@ public:
         for (const auto &I : BB) {
           if (I.hasDbgRecords() || llvm::isa<llvm::DbgInfoIntrinsic>(I))
             return false;
-          VisitAttachments(I);
+          ++Hints.InstructionCount;
+          if (I.hasMetadataOtherThanDebugLoc())
+            VisitAttachments(I);
+          else if (I.getDebugLoc())
+            visit(I.getDebugLoc().get());
           for (const auto &Op : I.operands()) {
             auto *MV = llvm::dyn_cast_or_null<llvm::MetadataAsValue>(Op.get());
             if (!MV)
               continue;
+            Hints.MayHaveMetadataOperands = true;
             if (auto *S = llvm::dyn_cast<MDString>(MV->getMetadata()))
               OtherStrings.insert(S);
             else
@@ -143,6 +153,7 @@ public:
         }
       }
     }
+    LineRanks.reserve(Visited.size() / 4);
     return Valid;
   }
 

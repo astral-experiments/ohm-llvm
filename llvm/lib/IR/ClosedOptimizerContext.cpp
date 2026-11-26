@@ -136,24 +136,32 @@ bool llvm::getClosedOptimizerContextV1(const Module &Input,
     for (auto *MD : N.operands())
       AddNode(MD);
   for (auto &G : M.global_values()) {
-    AddValue(&G);
-    if (auto *O = dyn_cast<GlobalObject>(&G))
+    Values.push_back(&G);
+    if (auto *O = dyn_cast<GlobalObject>(&G); O && O->hasMetadata())
       Attachments(*O);
     if (auto *F = dyn_cast<Function>(&G)) {
       for (auto &A : F->args())
-        AddValue(&A);
+        Values.push_back(&A);
       for (auto &BB : *F) {
-        AddValue(&BB);
+        Values.push_back(&BB);
         for (auto &Inst : BB) {
           if (Inst.hasDbgRecords())
             return false;
-          AddValue(&Inst);
-          if (Inst.hasMetadata())
+          Values.push_back(&Inst);
+          if (Inst.hasMetadataOtherThanDebugLoc())
             Attachments(Inst);
+          else if (Inst.getDebugLoc())
+            AddNode(Inst.getDebugLoc().get());
         }
       }
     }
   }
+  // The root walk visits each definition exactly once. Populate the map
+  // now that its minimum size is known, before following operand edges.
+  ValueIDs.reserve(Values.size() + Values.size() / 2);
+  for (unsigned J = 0; J != Values.size(); ++J)
+    ValueIDs.try_emplace(Values[J], J + 1);
+  Seen.reserve(Nodes.size() * 2);
   size_t VI = 0, MI = 0;
   while (VI != Values.size() || MI != Nodes.size()) {
     while (MI != Nodes.size()) {
@@ -226,14 +234,17 @@ bool llvm::getClosedOptimizerContextV1(const Module &Input,
   // Unlike ordinary bitcode, include the complete live use order, including
   // metadata operands with no bitcode value number and the side link that
   // makes a BasicBlock address-taken. Numbers follow the stable root walk.
-  SmallVector<uint8_t, 256> Buffer;
+  std::array<uint8_t, 4096> Buffer;
+  unsigned Used = 0;
   BLAKE3 Hash;
-  auto Flush = [&] { Hash.update(Buffer); Buffer.clear(); };
+  auto Flush = [&] {
+    Hash.update(ArrayRef(Buffer.data(), Used));
+    Used = 0;
+  };
   auto Word = [&](uint32_t W) {
-    size_t N = Buffer.size();
-    Buffer.resize_for_overwrite(N + 4);
-    support::endian::write32le(Buffer.data() + N, W);
-    if (Buffer.size() >= 4096)
+    support::endian::write32le(Buffer.data() + Used, W);
+    Used += 4;
+    if (Used == Buffer.size())
       Flush();
   };
   auto Text = [&](StringRef S) {
@@ -288,7 +299,8 @@ bool llvm::getClosedOptimizerContextV1(const Module &Input,
       Word(static_cast<uint32_t>(Owner));
       Word(static_cast<uint32_t>(Owner >> 32));
     }
-    auto *V = MetadataAsValue::getIfExists(C, MD);
+    auto *V = I.MetadataAsValues.empty() ? nullptr
+                                         : MetadataAsValue::getIfExists(C, MD);
     if (V && !ValueIDs.contains(V) && (!V->use_empty() || V->isUsedByMetadata()))
       return false;
     Word(V != nullptr);
