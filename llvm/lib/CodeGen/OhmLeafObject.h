@@ -28,6 +28,12 @@ LLVM_ABI_FOR_TEST bool candidate(const Module &M);
 /// the compiler, target and options.
 LLVM_ABI_FOR_TEST std::string prepare(Module &M, StringRef Configuration);
 
+/// Fingerprint closed optimizer input before ordinary O1 compilation. On
+/// success the compiler consumes the widened ranges and private metadata
+/// roots in M. The proof binds the original isolated literals and the
+/// caller's target and options.
+LLVM_ABI_FOR_TEST std::string prepareEarly(Module &M, StringRef Configuration);
+
 /// Bind the proof to the actual object from that compilation. The caller
 /// must ensure compilation succeeded with no diagnostics and store the two
 /// together in the same trusted object cache.
