@@ -11,6 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/CodeGen/AsmPrinter.h"
+#include "llvm/CodeGen/OhmEmittedGlobals.h"
 #include "CodeViewDebug.h"
 #include "DwarfDebug.h"
 #include "DwarfException.h"
@@ -2881,6 +2882,27 @@ static void removeMemtagFromGlobal(GlobalVariable &G) {
   G.setSanitizerMetadata(Meta);
 }
 
+thread_local ohm::ScopedEmittedGlobals *ohm::ScopedEmittedGlobals::Current =
+    nullptr;
+
+ohm::ScopedEmittedGlobals::ScopedEmittedGlobals(const Module &Expected,
+                                                 Callback Observe, void *Context)
+    : Expected(Expected), Observe(Observe), Context(Context) {
+  if (!Current)
+    Current = this;
+}
+
+ohm::ScopedEmittedGlobals::~ScopedEmittedGlobals() {
+  if (Current == this)
+    Current = nullptr;
+}
+
+void ohm::ScopedEmittedGlobals::notify(const AsmPrinter &Printer,
+                                       const Module &M) {
+  if (Current && &Current->Expected == &M)
+    Current->Observe(Current->Context, Printer, M);
+}
+
 bool AsmPrinter::doFinalization(Module &M) {
   // Set the MachineFunction to nullptr so that we can catch attempted
   // accesses to MF specific features at the module level and so that
@@ -2912,6 +2934,8 @@ bool AsmPrinter::doFinalization(Module &M) {
   // Emit global variables.
   for (const auto &G : M.globals())
     emitGlobalVariable(&G);
+
+  ohm::ScopedEmittedGlobals::notify(*this, M);
 
   // Emit remaining GOT equivalent globals.
   emitGlobalGOTEquivs();

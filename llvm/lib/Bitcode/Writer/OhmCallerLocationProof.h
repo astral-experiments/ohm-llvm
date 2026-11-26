@@ -91,24 +91,45 @@ inline bool pointerAttributes(AttributeSet Attrs) {
   return true;
 }
 
+inline bool passedToCallee(const Use &U, const Function *&F, unsigned &I) {
+  const auto *C = dyn_cast<CallBase>(U.getUser());
+  if (!C || (!isa<CallInst>(C) && !isa<InvokeInst>(C)) ||
+      C->hasOperandBundles() || !C->isArgOperand(&U) ||
+      C->getCallingConv() != CallingConv::C)
+    return false;
+  F = C->getCalledFunction();
+  if (!F || F->isIntrinsic() || !F->getName().starts_with("_R") ||
+      F->isVarArg() || F->getCallingConv() != CallingConv::C)
+    return false;
+  I = C->getArgOperandNo(&U);
+  return I < F->arg_size() &&
+         F->getFunctionType()->getParamType(I)->isPointerTy() &&
+         pointerAttributes(C->getAttributes().getParamAttrs(I)) &&
+         pointerAttributes(F->getAttributes().getParamAttrs(I));
+}
+
+inline bool opaqueCall(const Use &U) {
+  const Function *F = nullptr;
+  unsigned I;
+  return passedToCallee(U, F, I) && F->isDeclaration();
+}
+
+// The local callee can forward the pointer only to the existing opaque call.
+// Any extra use of its formal can inspect or escape the initializer.
 inline bool addressOnly(const GlobalVariable &G) {
-  if (G.use_empty())
+  if (G.use_empty() || G.isUsedByMetadata())
     return false;
   for (const Use &U : G.uses()) {
-    auto *C = dyn_cast<CallBase>(U.getUser());
-    if (!C || (!isa<CallInst>(C) && !isa<InvokeInst>(C)) ||
-        C->hasOperandBundles() || !C->isArgOperand(&U) ||
-        C->getCallingConv() != CallingConv::C)
+    if (opaqueCall(U))
+      continue;
+    const Function *F = nullptr;
+    unsigned I;
+    if (!passedToCallee(U, F, I) || F->isDeclaration() ||
+        !F->hasLocalLinkage())
       return false;
-    auto *F = C->getCalledFunction();
-    if (!F || !F->isDeclaration() || F->isIntrinsic() ||
-        !F->getName().starts_with("_R") || F->isVarArg() ||
-        F->getCallingConv() != CallingConv::C)
-      return false;
-    unsigned I = C->getArgOperandNo(&U);
-    if (I >= F->arg_size() || !F->getFunctionType()->getParamType(I)->isPointerTy() ||
-        !pointerAttributes(C->getAttributes().getParamAttrs(I)) ||
-        !pointerAttributes(F->getAttributes().getParamAttrs(I)))
+    const Argument *Formal = F->getArg(I);
+    if (Formal->isUsedByMetadata() || !Formal->hasOneUse() ||
+        !opaqueCall(*Formal->use_begin()))
       return false;
   }
   return true;
