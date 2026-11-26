@@ -3008,8 +3008,9 @@ void ModuleBitcodeWriter::writeConstants(unsigned FirstVal, unsigned LastVal,
       }
       bool isCStr7 = Code == bitc::CST_CODE_CSTRING;
       bool isCStrChar6 = Code == bitc::CST_CODE_CSTRING;
+      StringRef Data = VE.callerTail(Str);
       for (uint64_t i = 0; i != NumElts; ++i) {
-        unsigned char V = Str->getElementAsInteger(i);
+        unsigned char V = Data[i];
         Record.push_back(V);
         isCStr7 &= (V & 128) == 0;
         if (isCStrChar6)
@@ -3034,8 +3035,8 @@ void ModuleBitcodeWriter::writeConstants(unsigned FirstVal, unsigned LastVal,
       }
     } else if (isa<ConstantAggregate>(C)) {
       Code = bitc::CST_CODE_AGGREGATE;
-      for (const Value *Op : C->operands())
-        Record.push_back(VE.getValueID(Op));
+      for (unsigned Op = 0; Op != C->getNumOperands(); ++Op)
+        Record.push_back(VE.getAggregateOperandID(C, Op));
       AbbrevToUse = AggregateAbbrev;
     } else if (const ConstantExpr *CE = dyn_cast<ConstantExpr>(C)) {
       switch (CE->getOpcode()) {

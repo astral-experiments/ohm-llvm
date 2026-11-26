@@ -5,11 +5,14 @@
 #include "llvm/Bitcode/OhmDebugObjectSignature.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/AsmParser/Parser.h"
+#include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Module.h"
+#include "llvm/Support/Endian.h"
 #include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/SHA256.h"
 #include "llvm/Support/SourceMgr.h"
 #include "gtest/gtest.h"
+#include <array>
 
 using namespace llvm;
 
@@ -66,6 +69,48 @@ protected:
     return M;
   }
 
+  void train(Module &M) {
+    ASSERT_EQ(ohm_bc_save_v1(wrap(&M), &Origin, &OriginSize), 1);
+  }
+
+  void location(Module &M, unsigned Line, bool SharedTail = false) {
+    LLVMContext &C = M.getContext();
+    auto Global = [&](StringRef Name, Constant *Initializer, Align Alignment) {
+      auto *G = new GlobalVariable(M, Initializer->getType(), true,
+                                   GlobalValue::PrivateLinkage, Initializer, Name);
+      G->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+      G->setAlignment(Alignment);
+      return G;
+    };
+    auto *File = Global("file", ConstantDataArray::getString(C, "f.c"), Align(1));
+    std::array<uint8_t, 16> Data{};
+    support::endian::write64le(Data.data(), 3);
+    support::endian::write32le(Data.data() + 8, Line);
+    support::endian::write32le(Data.data() + 12, 1);
+    auto *Tail = ConstantDataArray::get(C, ArrayRef<uint8_t>(Data));
+    auto *Rec = Global("location", ConstantStruct::getAnon({File, Tail}, true), Align(8));
+    if (SharedTail)
+      Global("unrelated", Tail, Align(1));
+    IRBuilder<> B(&*M.getFunction("f")->getEntryBlock().getFirstInsertionPt());
+    auto Callee = M.getOrInsertFunction("_Ropaque", B.getVoidTy(), B.getPtrTy());
+    B.CreateCall(Callee, {Rec});
+  }
+
+  static int accept(void *Context, const char *Records, size_t Size) {
+    *static_cast<std::string *>(Context) = StringRef(Records, Size).str();
+    return 1;
+  }
+
+  static int decline(void *Context, const char *Records, size_t Size) {
+    return 0;
+  }
+
+  int relocatable(Module &M, OhmCheckRuntimeLocations Check, void *Data) {
+    return ohm_bc_match_relocatable_v1(
+        wrap(&M), Origin, OriginSize, Mapping.data(), Mapping.size(),
+        Proof.data(), Proof.size(), Check, Data);
+  }
+
   bool matches(Module &M) {
     return ohm_bc_match_v1(wrap(&M), Origin, OriginSize, Mapping.data(),
                            Mapping.size(), Proof.data(), Proof.size());
@@ -93,4 +138,45 @@ TEST_F(DebugObjectSignatureTest, RejectsChecksumAlsoUsedAsOrdinaryMetadata) {
   ASSERT_TRUE(ohm_bc_save_v1(wrap(Old.get()), &Origin, &OriginSize));
   EXPECT_FALSE(matches(*Moved));
 }
+TEST_F(DebugObjectSignatureTest, ChecksRuntimeLocationAgainstOriginalObject) {
+  LLVMContext C1, C2;
+  auto A = module(C1, OldSum, 3, "payload");
+  auto B = module(C2, NewSum, 4, "payload");
+  ASSERT_TRUE(A && B);
+  location(*A, 3);
+  location(*B, 4);
+  train(*A);
+  EXPECT_FALSE(matches(*B));
+  std::string Records;
+  EXPECT_EQ(relocatable(*B, accept, &Records), 2);
+  EXPECT_NE(Records.find("\"old_line\":3"), std::string::npos);
+  EXPECT_NE(Records.find("\"new_line\":4"), std::string::npos);
+  EXPECT_EQ(relocatable(*B, decline, nullptr), 0);
+}
+
+TEST_F(DebugObjectSignatureTest, PreservesAnUnchangedRuntimeWord) {
+  LLVMContext C1, C2;
+  auto A = module(C1, OldSum, 3, "payload");
+  auto B = module(C2, NewSum, 4, "payload");
+  ASSERT_TRUE(A && B);
+  // The literal already has value four in the origin and in the current IR.
+  // Its old ELF cannot confirm the proposed 3 -> 4 update.
+  location(*A, 4);
+  location(*B, 4);
+  train(*A);
+  EXPECT_EQ(relocatable(*B, decline, nullptr), 1);
+}
+
+TEST_F(DebugObjectSignatureTest, RejectsAnUnrelatedSharedRuntimeWord) {
+  LLVMContext C1, C2;
+  auto A = module(C1, OldSum, 3, "payload");
+  auto B = module(C2, NewSum, 4, "payload");
+  ASSERT_TRUE(A && B);
+  location(*A, 3, true);
+  location(*B, 4, true);
+  train(*A);
+  std::string Records;
+  EXPECT_EQ(relocatable(*B, accept, &Records), 0);
+}
+
 } // namespace

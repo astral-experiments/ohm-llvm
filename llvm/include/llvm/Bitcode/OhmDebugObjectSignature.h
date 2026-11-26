@@ -20,6 +20,15 @@ LLVM_ABI int ohm_bc_match_v1(LLVMModuleRef, const char *origin,
                              size_t origin_length, const char *mapping,
                              size_t mapping_length, const char *proof,
                              size_t proof_length);
+// The caller checks the proposed named records against its authenticated old
+// object. Return two only after a checked runtime projection matches the full
+// bitcode, one for an ordinary debug-only match, or zero on any mismatch.
+typedef int (*OhmCheckRuntimeLocations)(void *context, const char *records,
+                                        size_t records_length);
+LLVM_ABI int ohm_bc_match_relocatable_v1(
+    LLVMModuleRef, const char *origin, size_t origin_length,
+    const char *mapping, size_t mapping_length, const char *proof,
+    size_t proof_length, OhmCheckRuntimeLocations check, void *context);
 LLVM_ABI void ohm_bc_free_v1(void *);
 #ifdef __cplusplus
 }
