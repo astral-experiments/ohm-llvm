@@ -28,6 +28,15 @@ struct DebugObjectSourceMap {
   llvm::StringMap<std::string> Strings;
   llvm::DenseMap<const llvm::ConstantDataSequential *, std::string> CallerTails;
   llvm::SmallPtrSet<const llvm::Constant *, 32> CallerInitializers;
+  // Set only after an authenticated caller-location rewrite of a DWARF4
+  // object. Offsets refer to string payloads in the ordered bitcode.
+  StringRef Dwarf4Origin;
+  struct StringDifference {
+    size_t Offset;
+    const MDString *String;
+  };
+  SmallVector<StringDifference, 0> ChecksumCandidates;
+  bool matchesWithDwarf4Checksums(const Module &M, StringRef Bytes) const;
   bool Valid = true;
 
   void prepare();
