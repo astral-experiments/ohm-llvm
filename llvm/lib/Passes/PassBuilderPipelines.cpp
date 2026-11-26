@@ -1001,7 +1001,8 @@ PreservedAnalyses RustJumpThreadingPass::run(Function &F,
 
 PreservedAnalyses InlineSmallRustFunctionsPass::run(Module &M,
                                                     ModuleAnalysisManager &AM) {
-  if (!isRustModule(M))
+  // Let a registered advisor decide which calls fit its inlining budget.
+  if (!isRustModule(M) || AM.isPassRegistered<PluginInlineAdvisorAnalysis>())
     return PreservedAnalyses::all();
 
   return AlwaysInlinerPass().runWithSmallCallees(M, AM, /*MaxInstructions=*/16);
