@@ -604,7 +604,10 @@ class Rewriter {
     if (It == M->end() || It->second == *V)
       return true;
     uint64_t New = It->second;
-    if ((Width < 8 && Width && New >= (uint64_t(1) << (8 * Width))) ||
+    // LLVM emits the narrowest fixed-width form for a source line. Shrinking
+    // the form would change the abbreviation and the offsets of later DIEs.
+    unsigned NewWidth = New <= UINT8_MAX ? 1 : New <= UINT16_MAX ? 2 : 4;
+    if ((Width && Width != NewWidth) ||
         (!Width && getULEB128Size(New) != Length))
       return fail("DIE source line would change encoded width");
     auto *Dst =
