@@ -22,6 +22,7 @@
 #include "llvm/Support/BLAKE3.h"
 #include "llvm/Support/CachePruning.h"
 #include "llvm/Support/Endian.h"
+#include "llvm/Support/Error.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
@@ -380,11 +381,12 @@ struct Invocation {
       return;
     // Source blobs can be pruned independently: a missing origin source is a
     // checked miss. The content keys also cover entries from older toolchains.
+    // Cache access can continue if pruning cannot query the available space.
     CachePruningPolicy Policy;
     Policy.MaxSizeBytes = 4ULL << 30;
-    pruneCache(Entries, Policy);
+    consumeError(pruneCache(Entries, Policy).takeError());
     Policy.MaxSizeBytes = 1ULL << 30;
-    pruneCache(Blobs, Policy);
+    consumeError(pruneCache(Blobs, Policy).takeError());
     Root = std::move(Base);
   }
 };
