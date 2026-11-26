@@ -706,6 +706,70 @@ TEST_F(DebugObjectSignatureTest, ForwardsTheOpaqueLocationThroughALocalCall) {
   }
 }
 
+TEST_F(DebugObjectSignatureTest, OnlyTwoLocalCallsMayForwardTheLocation) {
+  for (unsigned Depth : {2, 3}) {
+    for (bool InspectMemory : {false, true}) {
+      SCOPED_TRACE(Depth);
+      SCOPED_TRACE(InspectMemory);
+      LLVMContext Before, After;
+      auto A = module(Before, OldSum, 3, "payload");
+      auto B = module(After, NewSum, 4, "payload");
+      ASSERT_TRUE(A && B);
+      location(*A, 3);
+      location(*B, 4);
+      for (auto *M : {A.get(), B.get()}) {
+        Function *Sink = M->getFunction("_Ropaque");
+        auto *Call = cast<CallInst>(*Sink->user_begin());
+        for (unsigned I = 0; I < Depth; ++I) {
+          auto *Local =
+              Function::Create(Sink->getFunctionType(),
+                               GlobalValue::InternalLinkage, "_Rlocal", M);
+          IRBuilder<> Builder(
+              BasicBlock::Create(M->getContext(), "entry", Local));
+          if (InspectMemory && I == 0)
+            Builder.CreateLoad(Builder.getInt8Ty(), Local->getArg(0), true);
+          Builder.CreateCall(Sink, {Local->getArg(0)});
+          Builder.CreateRetVoid();
+          Sink = Local;
+        }
+        Call->setCalledFunction(Sink);
+      }
+      train(*A);
+      std::string Records;
+      EXPECT_EQ(relocatable(*B, accept, &Records),
+                Depth == 2 && !InspectMemory ? 2 : 0);
+      ohm_bc_free_v1(Origin);
+      Origin = nullptr;
+    }
+  }
+}
+
+TEST_F(DebugObjectSignatureTest, ChecksRecordedMD5WithoutOtherDigests) {
+  LLVMContext Before, After;
+  auto A = module(Before, OldSum, 3, "payload");
+  auto B = module(After, NewSum, 4, "payload");
+  ASSERT_TRUE(A && B);
+  location(*A, 3);
+  location(*B, 4);
+  train(*A);
+  partialMap("[[1,1],[3,4]]", 3, 4);
+  auto Digest = toHex(SHA256::hash(arrayRefFromStringRef(Mapping)), true);
+  auto Recorded = [&](unsigned Version, StringRef MD5, StringRef Extra) {
+    Proof =
+        formatv(
+            R"({{"version":{0},"map_sha256":"{1}","files":[{{"directory":"/src","filename":"f.c","old_lines":3,"new_lines":4,"old":{{"md5":"{2}"},"new":{{"md5":"{3}"{4}}}]})",
+            Version, Digest, OldSum, MD5, Extra)
+            .str();
+    std::string Records;
+    return relocatable(*B, accept, &Records);
+  };
+  EXPECT_EQ(Recorded(3, NewSum, ""), 2);
+  EXPECT_EQ(Recorded(2, NewSum, ""), 0);
+  EXPECT_EQ(Recorded(3, OldSum, ""), 0);
+  EXPECT_EQ(Recorded(3, "", ""), 0);
+  EXPECT_EQ(Recorded(3, NewSum, ",\"sha1\":null"), 0);
+}
+
 TEST_F(DebugObjectSignatureTest, PreservesAnUnchangedRuntimeWord) {
   LLVMContext C1, C2;
   auto A = module(C1, OldSum, 3, "payload");

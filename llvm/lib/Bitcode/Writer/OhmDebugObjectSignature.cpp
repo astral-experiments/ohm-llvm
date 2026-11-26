@@ -41,9 +41,9 @@ std::optional<DebugObjectSourceMap> inverseMap(StringRef Input,
       !Map->getArray("files") || !Record->getArray("files"))
     return std::nullopt;
   auto Version = Record->getInteger("version");
-  if (Version != 1 && Version != 2)
+  if (Version != 1 && Version != 2 && Version != 3)
     return std::nullopt;
-  bool Explicit = Version == 2;
+  bool Explicit = Version != 1;
   auto Digest = Record->getString("map_sha256");
   if (!Digest ||
       *Digest != toHex(SHA256::hash(arrayRefFromStringRef(Input)), true))
@@ -107,6 +107,12 @@ std::optional<DebugObjectSourceMap> inverseMap(StringRef Input,
     for (const auto &[Name, Size] : {std::pair<StringRef, size_t>{"md5", 32},
                                      {"sha1", 40},
                                      {"sha256", 64}}) {
+      // Version 3 can carry an imported file's recorded MD5 alone.
+      // Missing algorithms supply no checksum substitution. Keep malformed
+      // values and one-sided omissions invalid.
+      if (Version == 3 && Name != "md5" && !OldSource->get(Name) &&
+          !NewSource->get(Name))
+        continue;
       auto Old = OldSource->getString(Name), New = NewSource->getString(Name);
       if (!Old || !New || Old->size() != Size || New->size() != Size ||
           !llvm::all_of(*Old, isHexDigit) || !llvm::all_of(*New, isHexDigit))
