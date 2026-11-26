@@ -100,6 +100,7 @@ public:
 private:
   using TypeMapType = DenseMap<Type *, unsigned>;
   TypeMapType TypeMap;
+  Type *RecentTypes[32] = {};
   TypeList Types;
 
   using ValueMapType = DenseMap<const Value *, unsigned>;
@@ -335,7 +336,17 @@ private:
   void EnumerateFunctionLocalListMetadata(unsigned F, const DIArgList *Arglist);
   void EnumerateNamedMDNode(const NamedMDNode *NMD);
   void EnumerateValue(const Value *V);
-  void EnumerateType(Type *T);
+  // Types are never removed from TypeMap. Avoid repeatedly looking up the
+  // small set of scalar and pointer types common in instruction operands.
+  void EnumerateType(Type *T) {
+    Type *&Recent = RecentTypes[(reinterpret_cast<uintptr_t>(T) >> 4) %
+                                std::size(RecentTypes)];
+    if (Recent == T)
+      return;
+    EnumerateTypeImpl(T);
+    Recent = T;
+  }
+  void EnumerateTypeImpl(Type *T);
   void EnumerateOperandType(const Value *V);
   void EnumerateAttributes(AttributeList PAL);
 

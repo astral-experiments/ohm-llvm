@@ -8,10 +8,12 @@
 
 #include "llvm/IR/Module.h"
 #include "llvm/AsmParser/Parser.h"
+#include "llvm/IR/ClosedOptimizerContext.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/ModuleSummaryIndex.h"
 #include "llvm/Pass.h"
+#include "llvm/Support/BLAKE3.h"
 #include "llvm/Support/RandomNumberGenerator.h"
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/raw_ostream.h"
@@ -22,6 +24,60 @@
 using namespace llvm;
 
 namespace {
+
+TEST(ModuleTest, ClosedContextHashPreservesUnalignedRecords) {
+  // This module has two values, one use and no metadata nodes. Serialize
+  // independently, shifting the use record across every byte of a boundary.
+  size_t Padding = 0;
+  for (unsigned I = 0; I != 14; ++I) {
+    LLVMContext C;
+    SMDiagnostic Err;
+    auto M = parseAssemblyString("@g = external global i32\n"
+                                 "@p = global ptr @g\n", Err, C);
+    ASSERT_TRUE(M);
+    C.getMDKindID("long.name." + std::string(Padding, 'x'));
+
+    SmallVector<uint8_t> Bytes;
+    auto Word = [&](uint32_t N) {
+      for (unsigned J = 0; J < 32; J += 8)
+        Bytes.push_back(N >> J);
+    };
+    auto Text = [&](StringRef S) {
+      Word(S.size());
+      Bytes.append(S.begin(), S.end());
+    };
+    Text("LLVM closed optimizer context v1");
+    Text("");
+    Text("");
+    Word(0);
+    Word(1);
+    Word(0);
+    SmallVector<StringRef> Names;
+    auto WriteNames = [&] {
+      Word(Names.size());
+      for (StringRef Name : Names)
+        Text(Name);
+      Names.clear();
+    };
+    C.getMDKindNames(Names);
+    WriteNames();
+    C.getOperandBundleTags(Names);
+    WriteNames();
+    C.getSyncScopeNames(Names);
+    WriteNames();
+    Word(2);
+    if (!I)
+      Padding = 3 * 4096 - 12 - Bytes.size() % 4096;
+    else
+      ++Padding;
+    for (unsigned N : {1, 2, 0, 0, 0, 0})
+      Word(N);
+
+    BLAKE3Result<> Digest;
+    ASSERT_TRUE(getClosedOptimizerContextV1(*M, Digest));
+    EXPECT_EQ(BLAKE3::hash(Bytes), Digest);
+  }
+}
 
 bool sortByName(const GlobalVariable &L, const GlobalVariable &R) {
   return L.getName() < R.getName();

@@ -282,20 +282,17 @@ public:
   void Emit(uint32_t Val, unsigned NumBits) {
     assert(NumBits && NumBits <= 32 && "Invalid value size!");
     assert((Val & ~(~0U >> (32-NumBits))) == 0 && "High bits set!");
-    CurValue |= Val << CurBit;
-    if (CurBit + NumBits < 32) {
-      CurBit += NumBits;
-      return;
+    // At most 31 buffered bits and 32 new bits fit in a single
+    // accumulator. Its high word is the carry even at an exact boundary.
+    uint64_t Bits = CurValue | (uint64_t(Val) << CurBit);
+    unsigned Size = CurBit + NumBits;
+    if (Size >= 32) {
+      WriteWord(uint32_t(Bits));
+      Bits >>= 32;
+      Size -= 32;
     }
-
-    // Add the current word.
-    WriteWord(CurValue);
-
-    if (CurBit)
-      CurValue = Val >> (32-CurBit);
-    else
-      CurValue = 0;
-    CurBit = (CurBit+NumBits) & 31;
+    CurValue = uint32_t(Bits);
+    CurBit = Size;
   }
 
   void FlushToWord() {
@@ -338,6 +335,23 @@ public:
     Emit((uint32_t)Val, NumBits);
   }
 
+private:
+  // Unabbreviated fields always use six-bit groups. Pack small values
+  // directly so a two- or three-group field only updates the cursor once.
+  void emitVBR6(uint64_t Val) {
+    if (Val < (1u << 5))
+      Emit(Val, 6);
+    else if (Val < (1u << 10))
+      Emit((Val & 31) | 32 | ((Val >> 5) << 6), 12);
+    else if (Val < (1u << 15))
+      Emit((Val & 31) | 32 | (((Val >> 5) & 31) << 6) | (32 << 6) |
+               ((Val >> 10) << 12),
+           18);
+    else
+      EmitVBR64(Val, 6);
+  }
+
+public:
   /// EmitCode - Emit the specified code.
   void EmitCode(unsigned Val) {
     Emit(Val, CurCodeSize);
@@ -573,11 +587,27 @@ public:
       // If we don't have an abbrev to use, emit this in its fully unabbreviated
       // form.
       auto Count = static_cast<uint32_t>(std::size(Vals));
-      EmitCode(bitc::UNABBREV_RECORD);
-      EmitVBR(Code, 6);
-      EmitVBR(Count, 6);
+      // Most instruction records use one or two VBR6 groups for the
+      // code and one for the field count. Emit the whole header together
+      // when it fits in a word.
+      if (Code < 1024 && Count < 32 && CurCodeSize <= 14) {
+        assert(CurCodeSize && "Invalid value size!");
+        assert(CurCodeSize >= 2 && "High bits set!");
+        unsigned Header = Code | (Count << 6);
+        unsigned Width = 12;
+        if (Code >= 32) {
+          Header = (Code & 31) | 32 | ((Code >> 5) << 6) | (Count << 12);
+          Width = 18;
+        }
+        Emit(bitc::UNABBREV_RECORD | (Header << CurCodeSize),
+             CurCodeSize + Width);
+      } else {
+        EmitCode(bitc::UNABBREV_RECORD);
+        emitVBR6(Code);
+        emitVBR6(Count);
+      }
       for (unsigned i = 0, e = Count; i != e; ++i)
-        EmitVBR64(Vals[i], 6);
+        emitVBR6(Vals[i]);
       return;
     }
 

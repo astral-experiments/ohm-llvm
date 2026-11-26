@@ -21,11 +21,64 @@ using namespace llvm;
 
 namespace {
 
+TEST(BitstreamWriterTest, PacksUnabbreviatedFields) {
+  uint64_t Fields[] = {0,    31,   32,    33,    1023,       1024,
+                       1025, 32767, 32768, 32769, UINT32_MAX, UINT64_MAX};
+  for (unsigned Offset = 0; Offset < 32; ++Offset) {
+    SmallString<128> Actual, Expected;
+    {
+      BitstreamWriter W(Actual);
+      if (Offset)
+        W.Emit(1, Offset);
+      W.EmitRecord(32, ArrayRef(Fields));
+    }
+    {
+      BitstreamWriter W(Expected);
+      if (Offset)
+        W.Emit(1, Offset);
+      W.EmitCode(bitc::UNABBREV_RECORD);
+      W.EmitVBR(32, 6);
+      W.EmitVBR(std::size(Fields), 6);
+      for (uint64_t Field : Fields)
+        W.EmitVBR64(Field, 6);
+    }
+    EXPECT_EQ(Expected.str(), Actual.str());
+  }
+}
+
 TEST(BitstreamWriterTest, emitBlob) {
   SmallString<64> Buffer;
   BitstreamWriter W(Buffer);
   W.emitBlob("str", /* ShouldEmitSize */ false);
   EXPECT_EQ(StringRef("str\0", 4), Buffer);
+}
+
+TEST(BitstreamWriterTest, PacksUnabbreviatedHeaders) {
+  for (unsigned CodeSize : {2U, 14U, 15U, 32U}) {
+    for (unsigned Code : {0U, 31U, 32U, 1023U, 1024U, UINT32_MAX}) {
+      for (unsigned Count : {0U, 1U, 31U, 32U}) {
+        SmallVector<unsigned, 32> Fields(Count, 42);
+        SmallString<128> Expected, Actual;
+        {
+          BitstreamWriter W(Expected);
+          W.EnterSubblock(42, CodeSize);
+          W.EmitCode(bitc::UNABBREV_RECORD);
+          W.EmitVBR(Code, 6);
+          W.EmitVBR(Count, 6);
+          for (unsigned Field : Fields)
+            W.EmitVBR(Field, 6);
+          W.ExitBlock();
+        }
+        {
+          BitstreamWriter W(Actual);
+          W.EnterSubblock(42, CodeSize);
+          W.EmitRecord(Code, Fields);
+          W.ExitBlock();
+        }
+        EXPECT_EQ(Expected.str(), Actual.str());
+      }
+    }
+  }
 }
 
 TEST(BitstreamWriterTest, emitBlobWithSize) {
@@ -52,6 +105,27 @@ TEST(BitstreamWriterTest, emitBlobEmpty) {
   BitstreamWriter W(Buffer);
   W.emitBlob("", /* ShouldEmitSize */ false);
   EXPECT_EQ(StringRef(""), Buffer);
+}
+
+TEST(BitstreamWriterTest, CarriesAcrossEveryWordBoundary) {
+  for (unsigned Offset = 0; Offset < 32; ++Offset) {
+    for (unsigned Width = 1; Width <= 32; ++Width) {
+      SmallString<8> Bytes;
+      uint32_t Value = 0xabcdef01U >> (32 - Width);
+      {
+        BitstreamWriter W(Bytes);
+        if (Offset)
+          W.Emit(1, Offset);
+        W.Emit(Value, Width);
+        W.Emit(1, 1);
+      }
+      uint64_t Expected = (Offset != 0) | (uint64_t(Value) << Offset) |
+                          (uint64_t(1) << (Offset + Width));
+      ASSERT_EQ(Bytes.size(), Offset + Width < 32 ? 4U : 8U);
+      for (unsigned I = 0; I < Bytes.size(); ++I)
+        EXPECT_EQ(uint8_t(Bytes[I]), uint8_t(Expected >> (I * 8)));
+    }
+  }
 }
 
 TEST(BitstreamWriterTest, emitBlob4ByteAligned) {

@@ -96,6 +96,63 @@ static bool isTerminalSlice(User *U, Value *Address) {
          E->getOperand(0)->getType()->isIntegerTy(64);
 }
 
+namespace {
+// Keep the original byte stream, but feed BLAKE3 whole chunks even when a
+// length-prefixed string or use record straddles a block boundary.
+class ContextHasher {
+  static constexpr size_t BlockSize = 4096;
+  // Room for a three-word use record starting at the last byte.
+  std::array<uint8_t, BlockSize + 11> Buffer;
+  size_t Used = 0;
+  BLAKE3 Hash;
+
+  LLVM_ATTRIBUTE_NOINLINE void flushBlock() {
+    Hash.update(ArrayRef(Buffer.data(), BlockSize));
+    Used -= BlockSize;
+    memcpy(Buffer.data(), Buffer.data() + BlockSize, Used);
+  }
+
+  void advance(size_t Bytes) {
+    Used += Bytes;
+    if (LLVM_UNLIKELY(Used >= BlockSize))
+      flushBlock();
+  }
+
+public:
+  void word(uint32_t W) {
+    support::endian::write32le(Buffer.data() + Used, W);
+    advance(4);
+  }
+
+  void text(StringRef S) {
+    word(S.size());
+    while (!S.empty()) {
+      size_t Bytes = std::min(BlockSize - Used, S.size());
+      memcpy(Buffer.data() + Used, S.data(), Bytes);
+      advance(Bytes);
+      S = S.drop_front(Bytes);
+    }
+  }
+
+  void use(unsigned ID, unsigned OperandNo) {
+    support::endian::write32le(Buffer.data() + Used, 1);
+    support::endian::write32le(Buffer.data() + Used + 4, ID);
+    support::endian::write32le(Buffer.data() + Used + 8, OperandNo);
+    advance(12);
+  }
+
+  void owner(uint64_t Owner) {
+    support::endian::write64le(Buffer.data() + Used, Owner);
+    advance(8);
+  }
+
+  BLAKE3Result<> final() {
+    Hash.update(ArrayRef(Buffer.data(), Used));
+    return Hash.final();
+  }
+};
+} // namespace
+
 bool llvm::getClosedOptimizerContextV1(const Module &Input,
                                        std::array<uint8_t, 32> &Digest) {
   // LLVM's context metadata accessors take mutable pointers. This walk does
@@ -234,35 +291,18 @@ bool llvm::getClosedOptimizerContextV1(const Module &Input,
   // Unlike ordinary bitcode, include the complete live use order, including
   // metadata operands with no bitcode value number and the side link that
   // makes a BasicBlock address-taken. Numbers follow the stable root walk.
-  std::array<uint8_t, 4096> Buffer;
-  unsigned Used = 0;
-  BLAKE3 Hash;
-  auto Flush = [&] {
-    Hash.update(ArrayRef(Buffer.data(), Used));
-    Used = 0;
-  };
-  auto Word = [&](uint32_t W) {
-    support::endian::write32le(Buffer.data() + Used, W);
-    Used += 4;
-    if (Used == Buffer.size())
-      Flush();
-  };
-  auto Text = [&](StringRef S) {
-    Word(S.size());
-    Flush();
-    Hash.update(S);
-  };
-  Text("LLVM closed optimizer context v1");
-  Text(I.DefaultTargetCPU);
-  Text(I.DefaultTargetFeatures);
-  Word(C.shouldDiscardValueNames());
-  Word(static_cast<uint32_t>(I.NextAtomGroup));
-  Word(static_cast<uint32_t>(I.NextAtomGroup >> 32));
+  ContextHasher Hash;
+  Hash.text("LLVM closed optimizer context v1");
+  Hash.text(I.DefaultTargetCPU);
+  Hash.text(I.DefaultTargetFeatures);
+  Hash.word(C.shouldDiscardValueNames());
+  Hash.word(static_cast<uint32_t>(I.NextAtomGroup));
+  Hash.word(static_cast<uint32_t>(I.NextAtomGroup >> 32));
   SmallVector<StringRef> Names;
   auto NamesInOrder = [&] {
-    Word(Names.size());
+    Hash.word(Names.size());
     for (StringRef N : Names)
-      Text(N);
+      Hash.text(N);
     Names.clear();
   };
   C.getMDKindNames(Names);
@@ -271,7 +311,7 @@ bool llvm::getClosedOptimizerContextV1(const Module &Input,
   NamesInOrder();
   C.getSyncScopeNames(Names);
   NamesInOrder();
-  Word(Values.size());
+  Hash.word(Values.size());
   for (auto *V : Values) {
     if (V->isUsedByMetadata() && !Seen.contains(ValueAsMetadata::getIfExists(V)))
       return false;
@@ -283,29 +323,24 @@ bool llvm::getClosedOptimizerContextV1(const Module &Input,
         unsigned ID = ValueIDs.lookup(U.getUser());
         if (!ID && !isTerminalSlice(U.getUser(), V))
           return false;
-        Word(1);
-        Word(ID);
-        Word(U.getOperandNo());
+        Hash.use(ID, U.getOperandNo());
       }
     }
-    Word(0);
+    Hash.word(0);
   }
-  Word(Nodes.size());
+  Hash.word(Nodes.size());
   for (auto *MD : Nodes) {
     if (!ReplaceableMetadataImpl::getRepresentedUserOrder(*MD, ValueIDs, Seen, Owners))
       return false;
-    Word(Owners.size());
-    for (uint64_t Owner : Owners) {
-      Word(static_cast<uint32_t>(Owner));
-      Word(static_cast<uint32_t>(Owner >> 32));
-    }
+    Hash.word(Owners.size());
+    for (uint64_t Owner : Owners)
+      Hash.owner(Owner);
     auto *V = I.MetadataAsValues.empty() ? nullptr
                                          : MetadataAsValue::getIfExists(C, MD);
     if (V && !ValueIDs.contains(V) && (!V->use_empty() || V->isUsedByMetadata()))
       return false;
-    Word(V != nullptr);
+    Hash.word(V != nullptr);
   }
-  Flush();
   Digest = Hash.final();
   return true;
 }

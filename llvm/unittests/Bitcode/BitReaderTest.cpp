@@ -67,6 +67,27 @@ static std::unique_ptr<Module> getLazyModuleFromAssembly(LLVMContext &Context,
   return std::move(ModuleOrErr.get());
 }
 
+TEST(BitReaderTest, RepeatedTypesAfterEnumerationCacheEviction) {
+  LLVMContext Context;
+  std::string Assembly;
+  raw_string_ostream IR(Assembly);
+  IR << "define void @types() {\n";
+  for (unsigned Pass = 0; Pass != 2; ++Pass)
+    for (unsigned Width = 1; Width != 97; ++Width)
+      IR << "  add i" << Width << " 0, 1\n";
+  IR << "  ret void\n}\n";
+
+  SmallString<1024> Mem;
+  writeModuleToBuffer(parseAssembly(Context, Assembly.c_str()), Mem);
+  auto M = cantFail(parseBitcodeFile(MemoryBufferRef(Mem.str(), "test"),
+                                     Context));
+  auto It = M->getFunction("types")->getEntryBlock().begin();
+  for (unsigned Pass = 0; Pass != 2; ++Pass)
+    for (unsigned Width = 1; Width != 97; ++Width)
+      EXPECT_TRUE((It++)->getType()->isIntegerTy(Width));
+  EXPECT_FALSE(verifyModule(*M));
+}
+
 // Tests that lazy evaluation can parse functions out of order.
 TEST(BitReaderTest, MaterializeFunctionsOutOfOrder) {
   SmallString<1024> Mem;
