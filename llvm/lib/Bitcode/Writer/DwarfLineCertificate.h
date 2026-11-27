@@ -35,8 +35,17 @@ class DwarfLineCertificate {
   std::vector<uint32_t> NextRank;
   std::vector<std::pair<uint32_t, uint32_t>> Lines;
   std::vector<uint8_t> MaskedStrings;
+  llvm::SmallVector<uint32_t, 0> Records;
+  llvm::BLAKE3 RecordHash;
   llvm::StringRef CompilationDirectory;
   bool Valid = true;
+
+  void flushRecords() {
+    RecordHash.update(llvm::ArrayRef(
+        reinterpret_cast<const uint8_t *>(Records.data()),
+        Records.size() * sizeof(Records[0])));
+    Records.clear();
+  }
 
   // DILocation::getMergedLocation may unwrap a lexical block file when it
   // combines instructions. A line originating in a different file can then
@@ -95,7 +104,10 @@ class DwarfLineCertificate {
     }
   }
 
-  llvm::ValueEnumerationHints Hints{0, false};
+  // The certificate includes the closed optimizer context, which already
+  // identifies every live use in order. It never reconstructs IR from the
+  // bitcode, so the reader's use-list shuffles would duplicate that proof.
+  llvm::ValueEnumerationHints Hints{0, false, /*HasClosedUseOrder=*/true};
 
 public:
   void omitAsmLocations(const llvm::LLVMContext &C) {
@@ -205,12 +217,23 @@ public:
     return Mask;
   }
 
+  // A function-block record with code zero marks the position of each tuple.
+  // The record type, abbreviation and all values stay in their original order.
+  void appendRecord(unsigned Code, unsigned Abbrev, llvm::ArrayRef<unsigned> V) {
+    Records.push_back(Code);
+    Records.push_back(Abbrev);
+    Records.push_back(V.size());
+    Records.append(V.begin(), V.end());
+    if (Records.size() >= 4096)
+      flushRecords();
+  }
+
   bool write(llvm::StringRef Bitcode, llvm::StringRef ModuleIdentifier,
-             llvm::raw_ostream &Out) const {
+             llvm::raw_ostream &Out) {
     if (!Valid)
       return false;
     llvm::BLAKE3 Hash;
-    Hash.update(llvm::arrayRefFromStringRef("ohm-line-certificate-v3"));
+    Hash.update(llvm::arrayRefFromStringRef("ohm-line-record-certificate-v1"));
     auto HashField = [&](llvm::ArrayRef<uint8_t> Bytes) {
       uint64_t Size = Bytes.size();
       std::array<uint8_t, 8> Length;
@@ -221,6 +244,8 @@ public:
     };
     HashField(llvm::arrayRefFromStringRef(Bitcode));
     HashField(MaskedStrings);
+    flushRecords();
+    HashField(RecordHash.final());
     // Bitcode readers assign the identifier, and native emitters can use it.
     HashField(llvm::arrayRefFromStringRef(ModuleIdentifier));
     auto Digest = Hash.final();

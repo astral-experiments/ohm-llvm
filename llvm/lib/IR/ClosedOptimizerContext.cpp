@@ -252,7 +252,9 @@ bool llvm::getClosedOptimizerContextV1(const Module &Input,
     Flush();
     Hash.update(S);
   };
-  Text("LLVM closed optimizer context v1");
+  // Predecessors from the line-number-only is_stmt emitter can have
+  // different statement markers even when the module matches exactly.
+  Text("LLVM closed optimizer context v2");
   Text(I.DefaultTargetCPU);
   Text(I.DefaultTargetFeatures);
   Word(C.shouldDiscardValueNames());

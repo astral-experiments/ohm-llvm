@@ -14,6 +14,7 @@
 #include "llvm/BinaryFormat/ELF.h"
 #include "llvm/DebugInfo/DWARF/DWARFContext.h"
 #include "llvm/DebugInfo/DWARF/DWARFDie.h"
+#include "llvm/MC/MCDwarf.h"
 #include "llvm/Object/ELFObjectFile.h"
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/LEB128.h"
@@ -390,6 +391,7 @@ class Rewriter {
     uint64_t File = 1;
     int64_t Before = 1, After = 1;
     std::optional<Advance> Last;
+    std::optional<size_t> RowStart;
     bool RepeatedAdvance = false;
     uint64_t Address = 0;
     bool NonScaledAddress = false;
@@ -403,6 +405,11 @@ class Rewriter {
     while (Ops.At < End && Ops.good()) {
       size_t Start = Ops.At;
       unsigned Op = Ops.fixed(1);
+      if (!RowStart && (Op == dwarf::DW_LNS_advance_line ||
+                        Op == dwarf::DW_LNS_advance_pc ||
+                        Op == dwarf::DW_LNS_const_add_pc ||
+                        Op == dwarf::DW_LNS_fixed_advance_pc))
+        RowStart = Start;
       bool Row = false, EndSequence = false;
       Ended = false;
       if (Op == 0) {
@@ -499,10 +506,25 @@ class Rewriter {
           return fail("unsupported line program advance");
         auto BeforeForm = lineForm(OldDelta, Address, LineBase, Range, OpBase);
         auto AfterForm = lineForm(NewDelta, Address, LineBase, Range, OpBase);
-        if (BeforeForm != AfterForm ||
-            (Last && (BeforeForm != LineForm::AdvanceLine || RowDelta)))
-          return fail("row would change the native MC line opcode form");
-        if (Last) {
+        if (Last && (BeforeForm != LineForm::AdvanceLine || RowDelta))
+          return fail("noncanonical MC advance_line row");
+        if (BeforeForm != AfterForm) {
+          // Replace only a complete canonical MC row. Interleaved state
+          // changes and unsupported address encodings fail the byte check.
+          MCDwarfLineTableParams Params;
+          if (EndSequence || Min != 1 || LineBase != Params.DWARF2LineBase ||
+              Range != Params.DWARF2LineRange ||
+              OpBase != Params.DWARF2LineOpcodeBase)
+            return fail("unsupported row transition");
+          const size_t Begin = RowStart.value_or(Start);
+          SmallString<32> Encoded;
+          MCDwarfLineAddr::encodeScaled(Params, OldDelta, Address, Encoded);
+          if (Data.slice(Begin, Ops.At) != Encoded.str())
+            return fail("noncanonical MC line row");
+          Encoded.clear();
+          MCDwarfLineAddr::encodeScaled(Params, NewDelta, Address, Encoded);
+          Resized.push_back({Begin, Ops.At, Encoded.str().str()});
+        } else if (Last) {
           int64_t V;
           if (AddOverflow(Last->Value, Change, V))
             return fail("advance_line operand overflow");
@@ -536,6 +558,7 @@ class Rewriter {
         After = Want;
       }
       Last.reset();
+      RowStart.reset();
       RepeatedAdvance = false;
       Address = 0;
       NonScaledAddress = false;

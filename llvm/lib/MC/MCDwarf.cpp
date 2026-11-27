@@ -744,14 +744,17 @@ static uint64_t SpecialAddr(MCDwarfLineTableParams Params, uint64_t op) {
 void MCDwarfLineAddr::encode(MCContext &Context, MCDwarfLineTableParams Params,
                              int64_t LineDelta, uint64_t AddrDelta,
                              SmallVectorImpl<char> &Out) {
+  encodeScaled(Params, LineDelta, ScaleAddrDelta(Context, AddrDelta), Out);
+}
+
+void MCDwarfLineAddr::encodeScaled(MCDwarfLineTableParams Params,
+                                   int64_t LineDelta, uint64_t AddrDelta,
+                                   SmallVectorImpl<char> &Out) {
   uint64_t Temp, Opcode;
   bool NeedCopy = false;
 
   // The maximum address skip amount that can be encoded with a special op.
   uint64_t MaxSpecialAddrDelta = SpecialAddr(Params, 255);
-
-  // Scale the address delta by the minimum instruction length.
-  AddrDelta = ScaleAddrDelta(Context, AddrDelta);
 
   // A LineDelta of INT64_MAX is a signal that this is actually a
   // DW_LNE_end_sequence. We cannot use special opcodes here, since we want the

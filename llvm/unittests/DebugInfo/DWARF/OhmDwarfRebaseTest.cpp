@@ -47,6 +47,7 @@ enum Case {
   NoRoom,
   InteriorRef,
   CrossFileMCForm,
+  NoncanonicalRow,
   ConstToSpecial,
   AdvanceToConst,
   NextRowZero,
@@ -144,15 +145,26 @@ std::unique_ptr<object::ObjectFile> fixture(SmallString<0> &Storage,
     bytes(Line, {3, static_cast<uint8_t>(Row - 1), 1, 3,
                  static_cast<uint8_t>(128 - Row - (Kind == NegativeSourceRow)),
                  1, 2, 1, 0, 1, 1});
-  } else if (Kind == CrossFileMCForm) {
+  } else if (Kind == CrossFileMCForm || Kind == NoncanonicalRow) {
     // File 1, line 20, then file 2, line 50. The native second delta
     // changes from +30 to +5 after inserting 25 lines in file 1.
-    bytes(Line, {3, 19, 1, 4, 2, 3, 30, 32, 2, 1, 0, 1, 1});
+    bytes(Line, {3, static_cast<uint8_t>(Row - 1), 1, 4, 2});
+    if (Kind == NoncanonicalRow)
+      bytes(Line, {3, 30, 2, 1, 1}); // Same deltas, separate advance_pc.
+    else if (Row == 20)
+      bytes(Line, {3, 30, 32});
+    else
+      bytes(Line, {37}); // Special +5 line, +1 address.
+    bytes(Line, {2, 1, 0, 1, 1});
   } else if (Kind == ConstToSpecial || Kind == AdvanceToConst) {
     // In both cases, moving file 1's line 20 to 26 reduces the next
     // line delta from +3 to -3, crossing one MC address threshold.
-    bytes(Line, {3, 19, 1, 4, 2});
-    if (Kind == ConstToSpecial)
+    bytes(Line, {3, static_cast<uint8_t>(Row - 1), 1, 4, 2});
+    if (Row == 26 && Kind == ConstToSpecial)
+      bytes(Line, {253}); // Special -3 line, +17 address.
+    else if (Row == 26)
+      bytes(Line, {8, 253}); // const_add_pc 17, then the same special.
+    else if (Kind == ConstToSpecial)
       bytes(Line, {8, 21});     // const_add_pc 17, special +3
     else
       bytes(Line, {2, 34, 21}); // advance_pc 34, special +3
@@ -402,19 +414,33 @@ TEST(OhmDwarfRebase, ResizingRequiresStableLayoutAndNoInteriorReferences) {
       consumeError(R.takeError());
   }
 }
-TEST(OhmDwarfRebase, RejectsCrossFileNativeOpcodeChange) {
-  SmallString<0> Old;
+TEST(OhmDwarfRebase, ReencodesCrossFileNativeOpcodeChanges) {
   for (Case Kind : {CrossFileMCForm, ConstToSpecial, AdvanceToConst}) {
-    Old.clear();
+    SmallString<0> Old, New;
+    unsigned Moved = Kind == CrossFileMCForm ? 45 : 26;
     ASSERT_TRUE(fixture(Old, 20, 20, 20, Kind));
-    auto R = ohm::rebaseDwarf4(
-        {Old, "cached"},
-        {{"/fixture/src/same.rs", {{20, Kind == CrossFileMCForm ? 45u : 26u}}}});
-    ASSERT_FALSE(bool(R));
-    EXPECT_NE(toString(R.takeError()).find("native MC line opcode form"),
-              std::string::npos);
+    ASSERT_TRUE(fixture(New, Moved, Moved, Moved, Kind));
+    auto Forward = ohm::rebaseDwarf4(
+        {Old, "cached"}, {{"/fixture/src/same.rs", {{20, Moved}}}});
+    ASSERT_TRUE(bool(Forward)) << toString(Forward.takeError());
+    EXPECT_EQ(New.str(), StringRef(Forward->Bytes.data(), Forward->Bytes.size()));
+    auto Reverse = ohm::rebaseDwarf4(
+        {New, "cached"}, {{"/fixture/src/same.rs", {{Moved, 20}}}});
+    ASSERT_TRUE(bool(Reverse)) << toString(Reverse.takeError());
+    EXPECT_EQ(Old.str(), StringRef(Reverse->Bytes.data(), Reverse->Bytes.size()));
   }
 }
+
+TEST(OhmDwarfRebase, RejectsNoncanonicalRowBeforeOpcodeChange) {
+  SmallString<0> Old;
+  ASSERT_TRUE(fixture(Old, 20, 20, 20, NoncanonicalRow));
+  auto R = ohm::rebaseDwarf4({Old, "cached"},
+                             {{"/fixture/src/same.rs", {{20, 45}}}});
+  ASSERT_FALSE(bool(R));
+  EXPECT_NE(toString(R.takeError()).find("noncanonical MC line row"),
+            std::string::npos);
+}
+
 TEST(OhmDwarfRebase, RejectsDuplicatePathAndJsonKeys) {
   for (
       StringRef Json :

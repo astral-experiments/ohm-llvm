@@ -619,7 +619,7 @@ ValueEnumerator::ValueEnumerator(const Module &M,
                                  ValueEnumerationHints Hints)
     : OmittedAsmLocation(Hints.OmittedAsmLocation),
       ShouldPreserveUseListOrder(ShouldPreserveUseListOrder) {
-  if (ShouldPreserveUseListOrder)
+  if (ShouldPreserveUseListOrder && !Hints.HasClosedUseOrder)
     UseListOrders = predictUseListOrder(M, Uses, Hints);
   MetadataMap.reserve(Hints.InstructionCount / 2);
   ValueMap.reserve(Hints.InstructionCount / 4);
