@@ -40,6 +40,7 @@ add_llvm_component_library(LLVMDebugInfoDWARF
   LINK_COMPONENTS
   BinaryFormat
   DebugInfoDWARFLowLevel
+  MC
   Object
   Support
   TargetParser

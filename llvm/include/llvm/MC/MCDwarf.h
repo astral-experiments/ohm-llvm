@@ -463,6 +463,11 @@ public:
                               int64_t LineDelta, uint64_t AddrDelta,
                               SmallVectorImpl<char> &OS);
 
+  /// Encode a row whose address delta is already in minimum instruction units.
+  LLVM_ABI static void encodeScaled(MCDwarfLineTableParams Params,
+                                    int64_t LineDelta, uint64_t AddrDelta,
+                                    SmallVectorImpl<char> &Out);
+
   /// Utility function to emit the encoding to a streamer.
   LLVM_ABI static void Emit(MCStreamer *MCOS, MCDwarfLineTableParams Params,
                             int64_t LineDelta, uint64_t AddrDelta);
