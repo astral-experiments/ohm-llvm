@@ -2307,7 +2307,11 @@ void DwarfDebug::beginInstruction(const MachineInstr *MI) {
                                           : Asm->OutStreamer->getContext()
                                                 .getCurrentDwarfLoc()
                                                 .getFileNum());
-    if (DL.getLine() && (DL.getLine() != OldLine || ForceIsStmt))
+    // The scope line recorded before the first instruction belongs to SP.
+    // Inlined code can use the same line number in a different source file.
+    const DIFile *OldFile = PrevInstLoc ? PrevInstLoc->getFile() : SP->getFile();
+    if (DL.getLine() &&
+        (DL.getLine() != OldLine || DL->getFile() != OldFile || ForceIsStmt))
       Flags |= DWARF2_FLAG_IS_STMT;
   }
 
@@ -2588,8 +2592,9 @@ void DwarfDebug::computeKeyInstructions(const MachineFunction *MF) {
       if (!Loc || !Loc->getLine())
         continue;
 
-      // Reset the Buoy to this instruction if it has a different line number.
-      if (!Buoy || Buoy->getDebugLoc().getLine() != Loc->getLine()) {
+      // Keep the statement on an instruction from the same source line.
+      if (!Buoy || Buoy->getDebugLoc().getLine() != Loc->getLine() ||
+          Buoy->getDebugLoc()->getFile() != Loc->getFile()) {
         Buoy = &MI;
         BuoyAtom = 0; // Set later when we know which atom the buoy is used by.
       }
@@ -2740,7 +2745,8 @@ void DwarfDebug::findForceIsStmtInstrs(const MachineFunction *MF) {
       ohm_line_record_pair_v1(MI->getDebugLoc()->getFile(),
                               MI->getDebugLoc()->getLine(), OutgoingFile,
                               OutgoingLine, 0);
-      if (MI->getDebugLoc()->getLine() == OutgoingLine)
+      if (MI->getDebugLoc()->getLine() == OutgoingLine &&
+          MI->getDebugLoc()->getFile() == OutgoingFile)
         return;
       PotentialIsStmtMBBInstrs.erase(MBBInstrIt);
       ForceIsStmtInstrs.insert(MI);
