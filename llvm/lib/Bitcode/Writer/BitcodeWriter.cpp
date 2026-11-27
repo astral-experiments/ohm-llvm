@@ -465,6 +465,19 @@ private:
                  SmallVectorImpl<unsigned> &Vals);
   void pushValueSigned(const Value *V, unsigned InstID,
                        SmallVectorImpl<uint64_t> &Vals);
+  void emitInstructionRecord(unsigned Code, SmallVectorImpl<unsigned> &Vals,
+                             unsigned Abbrev = 0) {
+    if (!LineCertificate) {
+      Stream.EmitRecord(Code, Vals, Abbrev);
+      return;
+    }
+    // We never deserialize this private stream. Preserve the position of
+    // the tuple using the unused function code zero and hash its contents
+    // separately, without variable-bit-rate encoding each operand.
+    assert(Code && "Function code zero is reserved for the certificate");
+    Stream.EmitRecord(0, ArrayRef<unsigned>());
+    LineCertificate->appendRecord(Code, Abbrev, Vals);
+  }
   void writeInstruction(const Instruction &I, unsigned InstID,
                         SmallVectorImpl<unsigned> &Vals);
   void writeFunctionLevelValueSymbolTable(const ValueSymbolTable &VST);
@@ -3740,7 +3753,7 @@ void ModuleBitcodeWriter::writeInstruction(const Instruction &I,
     break;
   }
 
-  Stream.EmitRecord(Code, Vals, AbbrevToUse);
+  emitInstructionRecord(Code, Vals, AbbrevToUse);
   Vals.clear();
 }
 
@@ -3927,8 +3940,8 @@ void ModuleBitcodeWriter::writeFunction(
           Vals.push_back(DL->isImplicitCode());
           Vals.push_back(DL->getAtomGroup());
           Vals.push_back(DL->getAtomRank());
-          Stream.EmitRecord(bitc::FUNC_CODE_DEBUG_LOC, Vals,
-                            FUNCTION_DEBUG_LOC_ABBREV);
+          emitInstructionRecord(bitc::FUNC_CODE_DEBUG_LOC, Vals,
+                                FUNCTION_DEBUG_LOC_ABBREV);
           Vals.clear();
           LastDL = DL;
         }

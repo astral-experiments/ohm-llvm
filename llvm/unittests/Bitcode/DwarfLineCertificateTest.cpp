@@ -13,6 +13,7 @@
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/IR/GlobalIFunc.h"
+#include "llvm/IR/InstrTypes.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/OptBisect.h"
@@ -80,6 +81,30 @@ TEST_F(DwarfLineCertificateTest, IncludesTerminalStorageSlice) {
   auto OtherPosition = certificate();
   ASSERT_TRUE(OtherPosition);
   EXPECT_NE(OtherPosition, WithSlice);
+}
+
+TEST_F(DwarfLineCertificateTest, BindsBufferedInstructionsAndTheirUseOrder) {
+  BasicBlock &Entry = M->getFunction("run")->getEntryBlock();
+  auto *One = ConstantInt::get(Type::getInt32Ty(C), 1);
+  auto Before = Entry.getTerminator()->getIterator();
+  auto *First = BinaryOperator::CreateAdd(One, One, "", Before);
+  auto *Add = First;
+  // Spill a full instruction-record buffer before the last add.
+  for (unsigned I = 0; I < 1024; ++I)
+    Add = BinaryOperator::CreateAdd(Add, First, "", Before);
+
+  auto Initial = certificate();
+  ASSERT_TRUE(Initial);
+  Add->setHasNoSignedWrap(true);
+  auto Changed = certificate();
+  ASSERT_TRUE(Changed);
+  EXPECT_NE(Initial, Changed);
+
+  // Reordering users leaves every instruction operand unchanged.
+  First->reverseUseList();
+  auto Reordered = certificate();
+  ASSERT_TRUE(Reordered);
+  EXPECT_NE(Changed, Reordered);
 }
 
 TEST_F(DwarfLineCertificateTest, ExactInputIncludesLocationsIdentifierAndLiveUses) {

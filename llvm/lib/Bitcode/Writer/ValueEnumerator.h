@@ -52,6 +52,7 @@ struct MachineUseState {
 struct ValueEnumerationHints {
   unsigned InstructionCount = 0;
   bool MayHaveMetadataOperands = true;
+  bool HasClosedUseOrder = false;
   unsigned OmittedAsmLocation = 0;
 };
 
